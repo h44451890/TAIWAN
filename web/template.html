@@ -2,10 +2,12 @@
 <html lang="zh-Hant-TW">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
 <title>台灣 1:1 · 國道台北段</title>
 <style>
-  html, body { margin: 0; height: 100%; overflow: hidden; background: #9fb1c4; font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif; color: #fff; }
+  html, body { margin: 0; height: 100%; overflow: hidden; touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; background: #9fb1c4; font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif; color: #fff; }
   #app canvas { display: block; }
   .hidden { display: none !important; }
   #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: #0f1714; z-index: 10; }
@@ -36,6 +38,54 @@
   #radio.on .info b::before { content: "● "; color: #ff4b3a; }
   #radio input { width: 80px; accent-color: #2f80ff; }
   @media (max-width: 900px) { #help { display: none; } #radio .info { min-width: 110px; } }
+  /* ---- 手機觸控 ---- */
+  #touch { position: fixed; inset: 0; pointer-events: none; z-index: 4; }
+  #touch .tb { position: absolute; pointer-events: auto; border-radius: 50%; border: 2px solid rgba(255,255,255,.55); background: rgba(10,14,20,.35);
+    color: #fff; font-size: 26px; font-weight: 800; display: flex; align-items: center; justify-content: center; backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px); touch-action: none; }
+  #touch .tb.on { background: rgba(47,128,255,.75); border-color: #fff; }
+  #touch .steer { width: 96px; height: 96px; bottom: calc(26px + env(safe-area-inset-bottom)); }
+  #t-left { left: calc(22px + env(safe-area-inset-left)); }
+  #t-right { left: calc(134px + env(safe-area-inset-left)); }
+  #t-gas { right: calc(22px + env(safe-area-inset-right)); bottom: calc(26px + env(safe-area-inset-bottom)); width: 104px; height: 128px; border-radius: 26px; font-size: 20px; }
+  #t-brake { right: calc(140px + env(safe-area-inset-right)); bottom: calc(26px + env(safe-area-inset-bottom)); width: 90px; height: 90px; border-radius: 22px; font-size: 18px; }
+  #touch .row { position: absolute; top: calc(10px + env(safe-area-inset-top)); right: calc(10px + env(safe-area-inset-right)); display: flex; gap: 8px; pointer-events: auto; }
+  #touch .row .tb { position: static; width: 46px; height: 46px; font-size: 13px; border-radius: 12px; }
+  body.touch #help, body.touch #credit { display: none; }
+  body.touch #minimap { width: 130px; height: 130px; left: 10px; top: 10px; }
+  body.touch #mode { top: 146px; left: 10px; width: 130px; font-size: 11px; }
+  body.touch #gps { top: 162px; left: 10px; width: 130px; }
+  body.touch #hud-road { top: 10px; left: 150px; transform: none; font-size: 14px; padding: 5px 12px; max-width: calc(100vw - 530px); min-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  body.touch #traffic { top: 46px; left: 150px; transform: none; font-size: 11px; padding: 3px 9px; max-width: calc(100vw - 530px); min-width: 120px; overflow: hidden; text-overflow: ellipsis; }
+  body.touch #hud-speed { right: auto; left: 50%; transform: translateX(-50%); bottom: calc(14px + env(safe-area-inset-bottom)); gap: 8px; }
+  body.touch #speed { font-size: 40px; } body.touch #limit { width: 40px; height: 40px; font-size: 15px; border-width: 5px; }
+  body.touch #gear { display: none; }
+  body.touch #radio { left: auto; right: calc(10px + env(safe-area-inset-right)); top: calc(64px + env(safe-area-inset-top)); bottom: auto; transform: none; padding: 5px 8px; gap: 6px; font-size: 11px; }
+  body.touch #radio .info, body.touch #radio input { display: none; }
+  body.touch #radio button { width: 30px; height: 30px; font-size: 11px; }
+  @media (orientation: portrait) {
+    body.touch #touch .row { flex-wrap: wrap; width: 160px; justify-content: flex-end; gap: 6px; }
+    body.touch #touch .row .tb { width: 48px; height: 40px; font-size: 12px; }
+    body.touch #touch .steer { width: 74px; height: 74px; }
+    body.touch #t-right { left: calc(106px + env(safe-area-inset-left)); }
+    body.touch #t-gas { width: 82px; height: 104px; }
+    body.touch #t-brake { right: calc(114px + env(safe-area-inset-right)); width: 70px; height: 70px; }
+    body.touch #hud-road, body.touch #traffic { left: 10px; max-width: calc(100vw - 190px); }
+    body.touch #hud-road { top: 190px; } body.touch #traffic { top: 226px; }
+    body.touch #radio { top: auto; bottom: calc(150px + env(safe-area-inset-bottom)); }
+    body.touch #hud-speed { bottom: calc(118px + env(safe-area-inset-bottom)); }
+  }
+  #rotate { display: none; }
+  @media (orientation: portrait) { body.touch #rotate { display: flex; position: fixed; left: 0; right: 0; bottom: 40%; justify-content: center; z-index: 6; pointer-events: none; }
+    body.touch #rotate span { background: rgba(0,0,0,.7); padding: 8px 14px; border-radius: 10px; font-size: 14px; } }
+  #menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(560px, 92vw); max-height: 80vh; overflow: auto; padding: 18px 20px; border-radius: 16px; background: rgba(12,16,22,.92); box-shadow: 0 10px 40px rgba(0,0,0,.6); z-index: 5; }
+  #menu h2 { margin: 4px 0 10px; font-size: 17px; }
+  #menu .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-bottom: 14px; }
+  #menu button { padding: 9px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08); color: #fff; font-size: 14px; cursor: pointer; text-align: left; }
+  #menu button:hover { background: rgba(255,255,255,.2); }
+  #menu button.on { background: #2f80ff; border-color: #2f80ff; }
+  #menu .close { float: right; text-align: center; width: 34px; }
+  #gps { position: fixed; left: 18px; top: 248px; width: 200px; text-align: center; font-size: 12px; text-shadow: 0 1px 4px rgba(0,0,0,.9); }
+  #gps:empty { display: none; }
 </style>
 </head>
 <body>
@@ -43,6 +93,13 @@
 <div id="loading"><h1>台灣 1:1</h1><p id="loading-msg">載入中…</p></div>
 <canvas id="minimap"></canvas>
 <div id="mode"></div>
+<div id="gps"></div>
+<div id="menu" class="hidden">
+  <button class="close" onclick="document.getElementById('menu').classList.add('hidden')">✕</button>
+  <h2>傳送到</h2><div class="grid" id="menu-places"></div>
+  <h2>換車</h2><div class="grid" id="menu-cars"></div>
+  <h2>手機定位同步</h2><div class="grid"><button id="menu-gps">📱 開始 / 停止同步 (L)</button></div>
+</div>
 <div id="hud-road"><span id="road"></span></div>
 <div id="traffic">路況</div>
 <div id="hud-speed"><div id="limit">100</div><div id="speedbox"><div id="speed">0</div><small>km/h</small><div id="gear"></div></div></div>
@@ -58,8 +115,22 @@
   <b>A D / ← →</b>轉向　<b>Shift</b>加速　<b>空白</b>手煞車<br>
   <b>V</b>第一 / 第三人稱　<b>C</b>空拍　<b>滑鼠拖曳</b>環視<br>
   <b>P</b>自動駕駛　<b>M</b>地圖縮放　<b>R</b>回到路上<br>
-  <b>F</b>電台開關　<b>Z / X</b>換台　<b>N</b>引擎音效　<b>H</b>隱藏說明
+  <b>F</b>電台開關　<b>Z / X</b>換台　<b>N</b>引擎音效<br>
+  <b>G</b>換車　<b>T</b>傳送 / 選單　<b>Q E</b>方向燈 (自動駕駛時路口轉彎)<br>
+  <b>L</b>手機定位同步　<b>H</b>隱藏說明
 </div>
+<div id="touch" class="hidden">
+  <div class="tb steer" id="t-left" data-key="KeyA">◀</div>
+  <div class="tb steer" id="t-right" data-key="KeyD">▶</div>
+  <div class="tb" id="t-brake" data-key="KeyS">煞車</div>
+  <div class="tb" id="t-gas" data-key="KeyW">油門</div>
+  <div class="row">
+    <div class="tb" data-tap="KeyQ">◀燈</div><div class="tb" data-tap="KeyE">燈▶</div>
+    <div class="tb" data-tap="KeyV">視角</div><div class="tb" data-tap="KeyP">自動</div>
+    <div class="tb" data-tap="KeyG">換車</div><div class="tb" data-tap="KeyT">選單</div>
+  </div>
+</div>
+<div id="rotate"><span>📱 橫向拿手機比較好玩</span></div>
 <div id="credit">© OpenStreetMap contributors（道路、建築）· Terrain: AWS Terrain Tiles · 路況/CMS: 交通部高速公路局 · 警察廣播電台 · three.js · hls.js</div>
 <script id="fwy-meta" type="application/json">{{META_JSON}}</script>
 <script id="fwy-data" type="application/octet-stream">{{DATA_B64}}</script>
@@ -68,6 +139,7 @@
 {{EXTRA}}
 <script>{{THREE_JS}}</script>
 <script>{{HLS_JS}}</script>
+<script>{{VEHICLES_JS}}</script>
 <script>{{APP_JS}}</script>
 <script>{{FEATURES_JS}}</script>
 </body>

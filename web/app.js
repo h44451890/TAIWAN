@@ -166,7 +166,9 @@ function terrainAt(x, y) {
 
 // ======================================================================= 渲染器
 const renderer = new T.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+// 手機 (觸控裝置) 省電模式: 解析度、陰影降低，建築只畫附近
+const MOBILE = params.get('touch') === '1' || (params.get('touch') !== '0' && window.matchMedia && matchMedia('(pointer: coarse)').matches);
+renderer.setPixelRatio(MOBILE ? Math.min(window.devicePixelRatio, 1) : Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = T.SRGBColorSpace;
 renderer.toneMapping = T.AgXToneMapping;          // 與 Blender 相同的 AgX
@@ -217,7 +219,7 @@ scene.fog = new T.FogExp2(HORIZON.clone(), 0.000045);
 
 const sun = new T.DirectionalLight(0xffffff, 3.2);   // 與 Blender 太陽強度相同
 sun.castShadow = true;
-sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.mapSize.set(MOBILE ? 1024 : 2048, MOBILE ? 1024 : 2048);
 const SC = sun.shadow.camera; SC.left = -90; SC.right = 90; SC.top = 90; SC.bottom = -90; SC.near = 1; SC.far = 1500;
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
@@ -569,7 +571,7 @@ function buildWorld() {
   }
   const world = new T.Group();
   for (const c of chunks.values()) {
-    for (const m of [c.road.mesh(matAsphalt, { cast: true }), c.city.mesh(matCityRoad), c.skirt.mesh(matConcrete, { cast: true }),
+    for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
                      c.barrier.mesh(matBarrier, { cast: true }), c.pier.mesh(matConcrete, { cast: true }),
                      c.tunnel.mesh(matTunnel, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }),
                      c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false })]) if (m) world.add(m);
@@ -593,12 +595,22 @@ function buildWorld() {
     }
     world.add(g.mesh(matTerrain));
   }
-  if (CITY) buildBuildings(world);
+  if (CITY && !params.has('nobld')) { buildBuildings(world); HOOKS.frame.push(cullBuildings); }   // nobld: 測試用，不建建築
   scene.add(world);
 }
 
 // ---- 3D 建築: 依 OSM 高度 / 樓層擠出；牆面 UV (沿周長 m, 高度 m, 總高) 給窗戶材質用
 const FACADE = [[0.45, 0.40, 0.32], [0.42, 0.42, 0.40], [0.55, 0.54, 0.50], [0.28, 0.19, 0.13], [0.30, 0.30, 0.29], [0.48, 0.37, 0.33], [0.25, 0.29, 0.33]];
+// 建築依距離顯示 (手機 1.6 km、電腦 4.5 km)；遠處被霧氣蓋住，不畫可以省很多效能
+const BLD_CHUNKS = [];
+let bldClock = 0;
+function cullBuildings(dt) {
+  bldClock -= dt;
+  if (bldClock > 0) return;
+  bldClock = 0.5;
+  const R = (MOBILE ? 1600 : 4500) + 700;
+  for (const ch of BLD_CHUNKS) { const vis = Math.hypot(ch.x - S.x, ch.y - S.y) < R; for (const m of ch.meshes) m.visible = vis; }
+}
 function buildBuildings(world) {
   const { bxy, bbase, bh, bcnt, bcol, nb } = CITY;
   const chunks = new Map(), CHB = 1000;
@@ -645,6 +657,7 @@ function buildBuildings(world) {
     r.setIndex(c.rp.length / 3 > 65535 ? new T.Uint32BufferAttribute(c.ri, 1) : new T.Uint16BufferAttribute(c.ri, 1));
     r.computeVertexNormals(); r.computeBoundingSphere();
     const rm = new T.Mesh(r, matRoof); rm.castShadow = true; rm.receiveShadow = true; rm.matrixAutoUpdate = false; world.add(rm);
+    BLD_CHUNKS.push({ x: c.wp[0], y: -c.wp[2], meshes: [m, rm] });
   }
 }
 
@@ -841,23 +854,100 @@ function buildCar() {
 }
 
 // ======================================================================= 車輛狀態與物理
-const car = buildCar();
+const PLAYER_TYPES = ['sedan', 'taxi', 'police', 'scooter', 'minibus', 'citybus', 'coach', 'boxtruck', 'bigtruck', 'semi'];
+const PLAYER_PAINT = { taxi: [0.8, 0.52, 0.02], police: [0.85, 0.85, 0.83], citybus: [0.8, 0.8, 0.78], coach: [0.8, 0.8, 0.78], minibus: [0.8, 0.8, 0.78] };
+let car = buildCar();
+let trailer = null;
 scene.add(car);
-const S = { x: 0, y: 0, z: 0, vz: 0, h: 0, v: 0, steer: 0, road: null, pitch: 0, roll: 0, braking: false };
-const WB = 2.8, MARGIN = 1.25;
+const S = { x: 0, y: 0, z: 0, vz: 0, h: 0, v: 0, steer: 0, road: null, pitch: 0, roll: 0, braking: false, vtype: 'sedan', vt: null };
+let WB = 2.8, MARGIN = 1.25;
 
-function spawn(wayIdx, idx) {
+/** 換車: 依車種重建玩家車模型與物理參數 (聯結車另建拖車) */
+function setVehicle(type) {
+  const TV = window.TWV && window.TWV.TYPES;
+  if (!TV || !TV[type]) return;
+  scene.remove(car);
+  if (trailer) { scene.remove(trailer.group); trailer = null; }
+  const r = window.TWV.build(type);
+  car = r.group;
+  car.userData = Object.assign({}, car.userData, r.ud);
+  const ud = car.userData;
+  ud.paint.color.setRGB(...(PLAYER_PAINT[type] || [0.55, 0.012, 0.018]));
+  if (ud.accent) ud.accent.color.setRGB(...(type === 'scooter' ? [0.05, 0.06, 0.15] : [0.6, 0.02, 0.02]));
+  scene.add(car);
+  const t = TV[type];
+  if (t.trailer) {
+    const tr = window.TWV.build(t.trailer.type);
+    tr.ud.accent.color.setRGB(0.05, 0.2, 0.45);
+    trailer = { group: tr.group, ud: tr.ud, h: S.h, cfg: t.trailer };
+    scene.add(tr.group);
+  }
+  S.vtype = type; S.vt = t; WB = t.wb; MARGIN = t.wid / 2 + 0.35;
+  camInit = false;
+}
+
+// ---- 車道 / 路網 (國道、快速道路、一般道路共用)
+/** 行進方向的車道數 (雙向一般道路只算一半) */
+const laneCount = (w) => (w.city && !w.oneway) ? Math.max(1, Math.floor(w.lanes / 2)) : w.lanes;
+/** 車道中心相對路線左法向的偏移。lane 0 = 最內側；雙向一般道路靠行進方向右側 */
+function laneOffDir(w, lane, dir = 1) {
+  const lc = laneCount(w);
+  lane = Math.min(Math.max(lane, 0), lc - 1);
+  if (w.city) {
+    if (!w.oneway) { const off = (lane + 0.5) * (w.width / 2 - 0.3) / lc; return dir > 0 ? -off : off; }
+    return (w.width / 2 - 0.3) - (lane + 0.5) * (w.width - 0.6) / w.lanes;
+  }
+  if (w.link && w.lanes === 1) return 0;
+  return w.hw - w.ls - LANE_W * (lane + 0.5);
+}
+/** 速限: OSM maxspeed，沒有就依道路等級 */
+const speedLimit = (w) => w.maxspeed || (w.city ? (w.cls === 5 ? 30 : 50) : w.trunk ? (w.link ? 50 : 80) : (w.link ? 60 : 100));
+/** 路口 (路段端點 node) 可以接續的路段與方向；雙向一般道路兩個方向都能走 */
+function nextOptions(w, node) {
+  const res = [];
+  for (const [k, i] of PT_INDEX.get(ptKey(w.P[node * 3], w.P[node * 3 + 1])) || []) {
+    if (k === w.k) continue;
+    const o = WAYS[k];
+    if (i < o.n - 1) res.push({ o, i, dir: 1, hx: o.ny[i], hy: -o.nx[i] });
+    if (o.city && !o.oneway && i > 0) res.push({ o, i, dir: -1, hx: -o.ny[i], hy: o.nx[i] });
+  }
+  return res;
+}
+/** 玩家自動駕駛選路: 國道優先同一條主線；一般道路直行，打方向燈就在路口轉彎 */
+function chooseNext(w, node, dir, signal) {
+  const hx = dir > 0 ? w.ny[node] : -w.ny[node], hy = dir > 0 ? -w.nx[node] : w.nx[node];
+  let best = null, bs = -1e9;
+  for (const o of nextOptions(w, node)) {
+    const dot = hx * o.hx + hy * o.hy, cross = hx * o.hy - hy * o.hx;
+    if (dot < (w.city || o.o.city ? -0.2 : 0.3)) continue;
+    let sc = dot * 2 + (o.o.ref && o.o.ref === w.ref ? 3 : 0) + (o.o.link && !w.link ? -2 : 0) + (w.link && !o.o.link ? 2 : 0)
+      + (!!o.o.city !== !!w.city ? -1 : 0) + (o.o.city && o.o.cls === 5 ? -1 : 0);
+    if (signal < 0 && cross > 0.3) sc += 6;
+    if (signal > 0 && cross < -0.3) sc += 6;
+    if (sc > bs) { bs = sc; best = o; }
+  }
+  return best;
+}
+const nextWay = (w) => { const o = chooseNext(w, w.n - 1, 1, 0); return o ? [o.o, o.i] : null; };
+
+function spawn(wayIdx, idx, dir = 1, lane = null) {
   const w = WAYS[wayIdx];
+  if (!w) return;
+  if (!w.city || w.oneway) dir = 1;
   idx = Math.min(Math.max(idx, 0), w.n - 2);
   const ax = w.P[idx * 3], ay = w.P[idx * 3 + 1], bx = w.P[idx * 3 + 3], by = w.P[idx * 3 + 4];
-  const off = w.hw - w.ls - LANE_W * (Math.floor(w.lanes / 2) + 0.5);
+  const lc = laneCount(w);
+  const off = laneOffDir(w, lane != null ? lane : (w.city ? lc - 1 : Math.floor(lc / 2)), dir);
   S.x = ax + w.nx[idx] * off; S.y = ay + w.ny[idx] * off; S.z = w.P[idx * 3 + 2] + 0.5;
-  S.h = Math.atan2(by - ay, bx - ax); S.v = 0; S.vz = 0; S.steer = 0;
-  S.road = roadAt(S.x, S.y, S.z, 0, 2);
+  S.h = Math.atan2(by - ay, bx - ax) + (dir < 0 ? Math.PI : 0); S.v = 0; S.vz = 0; S.steer = 0;
+  S.road = roadAt(S.x, S.y, S.z, 0, 2); S.zVis = null;
+  S.rt = null; S.apLane = null; S.apPending = null;
+  if (trailer) trailer.h = S.h;
+  if (typeof camInit !== 'undefined') camInit = false;
 }
 function defaultSpawn() {
   let best = null;
-  for (const w of WAYS) if (w.ref === '1' && !w.link && !w.bridge && !w.tunnel && (!best || w.s[w.n - 1] > best.s[best.n - 1])) best = w;
+  for (const w of WAYS) if (w.ref === '1' && !w.link && !w.bridge && !w.tunnel && !w.city && (!best || w.s[w.n - 1] > best.s[best.n - 1])) best = w;
   spawn(best.k, Math.floor(best.n * 0.2));
 }
 function respawnNearest() {
@@ -869,13 +959,16 @@ function respawnNearest() {
       if (d < bd) { bd = d; best = [w.k, i]; }
     }
   }
-  spawn(best[0], best[1]);
+  const w = WAYS[best[0]], i = best[1];
+  const dir = (w.city && !w.oneway && Math.cos(S.h) * w.ny[i] + Math.sin(S.h) * -w.nx[i] < 0) ? -1 : 1;
+  spawn(best[0], best[1], dir);
 }
 
 const keys = {};
 let camMode = params.get('cam') === '1' ? 1 : params.get('cam') === '2' ? 2 : 3, autopilot = params.has('demo'), mapScaleIdx = 0;
 const MAP_SCALES = [0.11, 0.055, 0.025];
 window.addEventListener('keydown', (e) => {
+  if (e.target && e.target.tagName === 'INPUT') return;
   keys[e.code] = true;
   if (e.code === 'KeyV') camMode = camMode === 3 ? 1 : 3;
   if (e.code === 'KeyC') camMode = camMode === 2 ? 3 : 2;   // 空拍視角
@@ -885,7 +978,9 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyM') mapScaleIdx = (mapScaleIdx + 1) % MAP_SCALES.length;
   if (e.code === 'KeyR') respawnNearest();
   if (e.code === 'KeyH') $('help').classList.toggle('hidden');
-  if (e.code === 'KeyQ' || e.code === 'KeyE') {   // 手動方向燈 Q 左、E 右 (再按一次關)
+  if (e.code === 'KeyG') setVehicle(PLAYER_TYPES[(PLAYER_TYPES.indexOf(S.vtype) + 1) % PLAYER_TYPES.length]);   // 換車
+  if (e.code === 'KeyT') toggleMenu();
+  if (e.code === 'KeyQ' || e.code === 'KeyE') {   // 手動方向燈 Q 左、E 右 (再按一次關)；自動駕駛時路口依方向燈轉彎
     const d = e.code === 'KeyQ' ? -1 : 1;
     S.signal = S.signal === d ? 0 : d; S.signalAuto = false; S.sigArmed = false;
   }
@@ -893,66 +988,66 @@ window.addEventListener('keydown', (e) => {
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
-// ---- 自動駕駛 (沿路網前進，保持中間車道)
-function nextWay(w) {
-  const lx = w.P[(w.n - 1) * 3], ly = w.P[(w.n - 1) * 3 + 1];
-  const tx = w.ny[w.n - 1], ty = -w.nx[w.n - 1];
-  const cands = PT_INDEX.get(ptKey(lx, ly)) || [];
-  let best = null, bs = -1e9;
-  for (const [k, i] of cands) {
-    if (k === w.k) continue;
-    const o = WAYS[k]; if (i >= o.n - 1) continue;
-    const ox = o.ny[i], oy = -o.nx[i];
-    const dot = tx * ox + ty * oy;
-    if (dot < 0.3) continue;
-    const score = dot * 2 + (o.ref === w.ref && o.ref ? 3 : 0) + (o.link ? -2 : 0) + (w.link && !o.link ? 2 : 0);
-    if (score > bs) { bs = score; best = [o, i]; }
-  }
-  return best;
-}
-/** 自動駕駛自己的路線 (路段 + 線段)：沿路網往前推進，分岔時走 nextWay (優先同一條國道主線)，
- *  不會因為分流處匝道路面重疊就被帶下交流道。 */
+// ---- 自動駕駛路線: { w 路段, i 線段, dir 行進方向 }，沿路網推進，雙向道路可反向行駛
 function updateRoute() {
-  if (!S.rt) { if (!S.road) return null; S.rt = { w: S.road.w, i: S.road.i }; }
-  let { w, i } = S.rt, guard = 0;
+  if (!S.rt) {
+    if (!S.road) return null;
+    const w = S.road.w;
+    const dir = (w.city && !w.oneway && Math.cos(S.h) * S.road.tx + Math.sin(S.h) * S.road.ty < 0) ? -1 : 1;
+    S.rt = { w, i: S.road.i, dir };
+  }
+  let { w, i, dir } = S.rt, guard = 0;
   while (guard++ < 60) {
-    if (i >= w.n - 1) { const nw = nextWay(w); if (!nw) { i = w.n - 2; break; } [w, i] = nw; continue; }
+    if (i < 0 || i > w.n - 2) {
+      const node = dir > 0 ? w.n - 1 : 0;
+      const nx = chooseNext(w, node, dir, S.signal || 0);
+      if (!nx) { i = Math.min(Math.max(i, 0), w.n - 2); break; }
+      w = nx.o; dir = nx.dir; i = dir > 0 ? nx.i : nx.i - 1;
+      if (S.signal && !S.signalAuto) { S.signal = 0; S.sigArmed = false; }   // 轉完彎熄燈
+      continue;
+    }
     const ax = w.P[i * 3], ay = w.P[i * 3 + 1], dx = w.P[i * 3 + 3] - ax, dy = w.P[i * 3 + 4] - ay;
     const t = ((S.x - ax) * dx + (S.y - ay) * dy) / (dx * dx + dy * dy || 1);
-    if (t > 1) { i++; continue; }
+    if (dir > 0 && t > 1) { i++; continue; }
+    if (dir < 0 && t < 0) { i--; continue; }
     const L = Math.hypot(dx, dy) || 1;
     const lat = ((S.x - ax) * -dy + (S.y - ay) * dx) / L;
-    if (Math.abs(lat) > w.hw + 6) { S.rt = null; return null; }   // 偏離路線太遠: 下一幀重新抓
-    S.rt = { w, i, t: Math.max(0, t), lat };
+    if (Math.abs(lat) > w.hw + 6) { S.rt = null; return null; }
+    S.rt = { w, i, dir, t: Math.min(Math.max(t, 0), 1), lat };
     return S.rt;
   }
-  S.rt = { w, i, t: 1, lat: 0 };
+  S.rt = { w, i, dir, t: dir > 0 ? 1 : 0, lat: 0 };
   return S.rt;
 }
-
 function lookAhead(dist) {
-  const rt = S.rt || S.road;
+  const rt = S.rt;
   if (!rt) return null;
-  let w = rt.w, i = rt.i, t = rt.t || 0, guard = 0;
-  let px = w.P[i * 3] + (w.P[i * 3 + 3] - w.P[i * 3]) * t, py = w.P[i * 3 + 1] + (w.P[i * 3 + 4] - w.P[i * 3 + 1]) * t;
-  while (dist > 0 && guard++ < 500) {
-    if (i >= w.n - 1) { const nw = nextWay(w); if (!nw) break; [w, i] = nw; continue; }
-    const bx = w.P[i * 3 + 3], by = w.P[i * 3 + 4];
-    const d = Math.hypot(bx - px, by - py);
+  let w = rt.w, dir = rt.dir, guard = 0;
+  const i0 = rt.i, t = rt.t || 0;
+  let px = w.P[i0 * 3] + (w.P[i0 * 3 + 3] - w.P[i0 * 3]) * t, py = w.P[i0 * 3 + 1] + (w.P[i0 * 3 + 4] - w.P[i0 * 3 + 1]) * t;
+  let v = dir > 0 ? i0 + 1 : i0, k = v;
+  while (dist > 0 && guard++ < 800) {
+    if (v < 0 || v > w.n - 1) {
+      const node = dir > 0 ? w.n - 1 : 0;
+      const nx = chooseNext(w, node, dir, S.signal || 0);
+      if (!nx) break;
+      w = nx.o; dir = nx.dir; v = nx.i + dir; continue;
+    }
+    const bx = w.P[v * 3], by = w.P[v * 3 + 1], d = Math.hypot(bx - px, by - py);
+    k = v;
     if (d >= dist) { px += (bx - px) / d * dist; py += (by - py) / d * dist; dist = 0; break; }
-    dist -= d; px = bx; py = by; i++;
+    dist -= d; px = bx; py = by; v += dir;
   }
-  const k = Math.min(i, w.n - 1);
-  const lane = S.apLane == null ? Math.floor(w.lanes / 2) : Math.min(S.apLane, w.lanes - 1);
-  const off = (w.link && w.lanes === 1 && !w.city) ? 0 : laneOff(w, lane);
-  return { x: px + w.nx[k] * off, y: py + w.ny[k] * off, w };
+  k = Math.min(Math.max(k, 0), w.n - 1);
+  const lc = laneCount(w);
+  const lane = S.apLane == null ? (w.city ? lc - 1 : Math.floor(lc / 2)) : Math.min(S.apLane, lc - 1);
+  const off = laneOffDir(w, lane, dir);
+  return { x: px + w.nx[k] * off, y: py + w.ny[k] * off, w, dir };
 }
-// 車道中心偏移 (左正)。一般道路: 雙向走右半邊、單行道走中間
-const laneOff = (w, lane) => w.city ? (w.oneway ? 0 : -w.width / 4) : w.hw - w.ls - LANE_W * (lane + 0.5);
-/** 速限: OSM maxspeed，沒有就依道路等級 */
-const speedLimit = (w) => w.maxspeed || (w.city ? (w.cls === 5 ? 30 : 50) : w.trunk ? (w.link ? 50 : 80) : (w.link ? 60 : 100));
 
 function update(dt) {
+  const vt = S.vt || (window.TWV && window.TWV.TYPES.sedan) || { acc: 1.5, vmax: 45, wb: 2.8, wid: 1.85 };
+  const big = vt.len > 6.5;
   let thr = 0, brk = 0, str = 0;
   if (keys.KeyW || keys.ArrowUp) thr = 1;
   if (keys.KeyS || keys.ArrowDown) brk = 1;
@@ -960,18 +1055,20 @@ function update(dt) {
   if (keys.KeyD || keys.ArrowRight) str -= 1;
   const boost = keys.ShiftLeft || keys.ShiftRight;
   if (thr || brk || str) autopilot = autopilot && !(thr || brk || str) ? false : autopilot;
-  const maxSteer = 0.55 / (1 + Math.abs(S.v) / 14);
+  const maxSteer = (big ? 0.6 : 0.55) / (1 + Math.abs(S.v) / 14);
   if (autopilot) {
     const rt = updateRoute();
     const w0 = rt ? rt.w : (S.road && S.road.w);
+    const dir = rt ? rt.dir : 1;
     const curLat = rt ? rt.lat : (S.road ? S.road.lat : 0);
     if (w0 && (S.apLane == null || S.apWay !== w0.k)) {
-      // 剛開啟自動駕駛: 取目前所在車道；換路段: 車道數變少就往內收
-      if (S.apLane == null) S.apLane = Math.round((w0.hw - w0.ls - curLat) / LANE_W - 0.5);
-      S.apLane = Math.min(Math.max(S.apLane, 0), w0.lanes - 1);
+      const lc = laneCount(w0);
+      if (S.apLane == null) S.apLane = w0.city ? lc - 1 : Math.round((w0.hw - w0.ls - curLat) / LANE_W - 0.5);
+      S.apLane = Math.min(Math.max(S.apLane, 0), lc - 1);
+      if ((vt.len > 9) && !w0.city) S.apLane = Math.max(S.apLane, lc - 2, 0);   // 大型車走外側
       S.apWay = w0.k;
     }
-    const la = lookAhead(10 + Math.abs(S.v) * 1.1);
+    const la = lookAhead(10 + Math.abs(S.v) * 1.1 + (big ? 4 : 0));
     if (la && w0) {
       const dx = la.x - S.x, dy = la.y - S.y, Ld = Math.hypot(dx, dy) || 1;
       const alpha = Math.atan2(dy, dx) - S.h;
@@ -979,41 +1076,42 @@ function update(dt) {
       str = Math.max(-1, Math.min(1, Math.atan2(2 * WB * Math.sin(sa), Ld) / maxSteer));
       const lim = (speedLimit(la.w) / 3.6) * (la.w.link ? 0.9 : 1);
       const curv = Math.abs(sa) / Ld; const vc = Math.sqrt(3.5 / Math.max(curv * 2, 1e-4));
-      const vt = Math.max(3, Math.min(lim, vc));
-      // IDM 跟車: 依前車距離與速度加減速 (不會追撞)
-      const shift = laneOff(w0, S.apLane) - curLat;
-      const ld = HOOKS.leader ? HOOKS.leader(shift) : { gap: 1e9, v: vt };
-      const v = Math.max(S.v, 0);
-      let acc = 1.6 * (1 - Math.pow(v / vt, 4));
+      const vtg = Math.max(3, Math.min(lim, vc, vt.vmax));
+      // IDM 跟車 (含路口讓車)
+      const lc = laneCount(w0);
+      const shift = dir * (laneOffDir(w0, S.apLane, dir) - curLat);
+      const ld = HOOKS.leader ? HOOKS.leader(shift) : { gap: 1e9, v: vtg };
+      const v = Math.max(S.v, 0), A = Math.min(1.6, vt.acc * 1.1);
+      let acc = A * (1 - Math.pow(v / vtg, 4));
       if (ld.gap < 1e8) {
-        const ss = 3 + Math.max(0, v * 1.4 + v * (v - ld.v) / (2 * Math.sqrt(1.6 * 2.5)));
-        acc -= 1.6 * (ss / Math.max(ld.gap, 0.1)) ** 2;
+        const ss = 3 + Math.max(0, v * 1.4 + v * (v - ld.v) / (2 * Math.sqrt(A * 2.5)));
+        acc -= A * (ss / Math.max(ld.gap, 0.1)) ** 2;
       }
       if (ld.gap < 2.5) acc = -10;
       if (acc >= 0) thr = Math.min(1, acc / 2.2); else brk = Math.min(1, -acc / 8);
-      // 換車道: 前車太慢就打方向燈、確認安全後切過去；路空時回到外側
+      // 換車道
       S.apCool = (S.apCool || 0) - dt;
+      const laneOkP = (ln) => ln >= 0 && ln < lc && !(vt.len > 9 && !w0.city && ln < lc - 2);
       if (S.apPending != null) {
         S.apSigT -= dt;
         if (S.apSigT <= 0) {
-          const ok = S.apPending >= 0 && S.apPending < w0.lanes && (!HOOKS.laneFree || HOOKS.laneFree(laneOff(w0, S.apPending) - curLat));
+          const ok = laneOkP(S.apPending) && (!HOOKS.laneFree || HOOKS.laneFree(dir * (laneOffDir(w0, S.apPending, dir) - curLat)));
           if (ok) { S.apLane = S.apPending; S.apChanges = (S.apChanges || 0) + 1; } else S.signal = 0;
           S.apPending = null;
         }
-      } else if (S.apCool <= 0 && w0.lanes > 1 && Math.abs(shift) < 0.4 && !w0.link && !w0.city) {
-        const blocked = ld.gap < 70 && ld.v < vt - 2;
+      } else if (S.apCool <= 0 && lc > 1 && Math.abs(shift) < 0.4 && !w0.link && S.vtype !== 'scooter') {
+        const blocked = ld.gap < 70 && ld.v < vtg - 2;
         const tries = blocked ? [S.apLane - 1, S.apLane + 1] : (ld.gap > 100 && Math.random() < dt * 0.1 ? [S.apLane + 1] : []);
         for (const ln of tries) {
-          if (ln < 0 || ln >= w0.lanes) continue;
-          if (!HOOKS.laneFree || HOOKS.laneFree(laneOff(w0, ln) - curLat)) {
+          if (!laneOkP(ln)) continue;
+          if (!HOOKS.laneFree || HOOKS.laneFree(dir * (laneOffDir(w0, ln, dir) - curLat))) {
             S.apPending = ln; S.apSigT = 1.3; S.signal = ln < S.apLane ? -1 : 1; S.signalAuto = true; S.apCool = 5;
             break;
           }
         }
         if (tries.length && S.apCool <= 0) S.apCool = 1.5;
       }
-      // 換道完成才熄燈: 用換道後的目標車道重新算橫向距離，到位後再多亮 0.4 秒
-      const shiftNow = laneOff(w0, S.apLane) - curLat;
+      const shiftNow = laneOffDir(w0, S.apLane, dir) - curLat;
       if (S.signalAuto && S.apPending == null) {
         if (Math.abs(shiftNow) < 0.3) { S.sigHold = (S.sigHold || 0) + dt; if (S.sigHold > 0.4) { S.signal = 0; S.signalAuto = false; S.sigHold = 0; } }
         else S.sigHold = 0;
@@ -1023,17 +1121,17 @@ function update(dt) {
     S.apLane = null; S.apPending = null; S.rt = null;
     if (S.signalAuto) { S.signal = 0; S.signalAuto = false; }
   }
-  // 手動方向燈: 方向盤轉過再回正後自動熄燈
-  if (S.signal && !S.signalAuto) {
+  // 手動方向燈: 方向盤轉過再回正後自動熄燈 (自動駕駛時保留到路口轉彎)
+  if (S.signal && !S.signalAuto && !autopilot) {
     if (Math.abs(S.steer) > 0.1) S.sigArmed = true;
     else if (S.sigArmed && Math.abs(S.steer) < 0.02) { S.signal = 0; S.sigArmed = false; }
   }
   S.thr = thr; S.brk = brk;
-  // 縱向
+  // 縱向 (依車種: 加速度、極速、煞車)
   let a = 0;
-  const vmax = boost ? 75 : 55;
-  if (thr) a += 5.5 * thr * (1 - Math.max(S.v, 0) / vmax);
-  if (brk) a += S.v > 0.5 ? -10 * brk : -3.5 * brk;
+  const vmax = vt.vmax * 1.2 * (boost ? 1.3 : 1);
+  if (thr) a += 5.5 * (vt.acc / 1.5) * thr * (1 - Math.max(S.v, 0) / vmax);
+  if (brk) a += S.v > 0.5 ? -(big ? 7 : 10) * brk : -3.5 * brk;
   if (keys.Space) a += S.v > 0 ? -8 : (S.v < 0 ? 8 : 0);
   a -= 0.00042 * S.v * Math.abs(S.v) + 0.12 * Math.sign(S.v);
   a -= 9.81 * Math.sin(S.pitch) * 0.9;
@@ -1043,16 +1141,17 @@ function update(dt) {
   // 轉向
   const tgt = str * maxSteer;
   S.steer += Math.max(-2.5 * dt, Math.min(2.5 * dt, tgt - S.steer));
-  S.h += S.v * Math.tan(S.steer) / WB * dt;
-  // 平面移動 + 護欄碰撞
+  const yawRate = S.v * Math.tan(S.steer) / WB;
+  S.h += yawRate * dt;
+  // 平面移動 + 路緣碰撞
   let nx = S.x + Math.cos(S.h) * S.v * dt, ny = S.y + Math.sin(S.h) * S.v * dt;
   let r = roadAt(nx, ny, S.z, MARGIN);
+  if (!r && S.road && S.road.w.city) r = roadAt(nx, ny, S.z, 0.3);   // 一般道路沒有護欄: 大車可以壓到路緣
   if (!r && S.road) {
-    // 撞到護欄: 沿路面方向滑動並減速
     const tx = S.road.tx, ty = S.road.ty;
     const sgn = Math.cos(S.h) * tx + Math.sin(S.h) * ty >= 0 ? 1 : -1;
-    const vt = S.v * (Math.cos(S.h) * tx * sgn + Math.sin(S.h) * ty * sgn);
-    S.v = vt * 0.92;
+    const vtan = S.v * (Math.cos(S.h) * tx * sgn + Math.sin(S.h) * ty * sgn);
+    S.v = vtan * 0.92;
     const th = Math.atan2(ty * sgn, tx * sgn);
     S.h += Math.atan2(Math.sin(th - S.h), Math.cos(th - S.h)) * 0.25;
     const lat = S.road.lat, push = -Math.sign(lat) * 0.05;
@@ -1063,33 +1162,55 @@ function update(dt) {
   if (r) { S.x = nx; S.y = ny; S.road = r; }
   // 垂直
   const g = S.road ? S.road.z : terrainAt(S.x, S.y);
-  // 路面接縫的小落差直接貼地 (不會變成小跳躍)；真的離地超過 0.4 m 才用重力落下
   if (S.z > g + 0.4) { S.vz -= 9.81 * dt; S.z += S.vz * dt; if (S.z < g) { S.z = g; S.vz = 0; } }
   else { S.z = g; S.vz = 0; }
-  // 顯示用高度: 臨界阻尼平滑，濾掉路面三角面與接縫造成的抖動
   if (S.zVis == null || Math.abs(S.zVis - S.z) > 3) S.zVis = S.z;
   S.zVis += (S.z - S.zVis) * (1 - Math.exp(-dt * 14));
-  // 車身姿態
+  // 車身姿態 (機車轉彎壓車)
   const fx = Math.cos(S.h), fy = Math.sin(S.h);
   const zs = (dx, dy) => { const q = roadAt(S.x + dx, S.y + dy, S.z + 0.5, 0, 1.0); return q ? q.z : S.z; };
-  const pitchT = Math.atan2(zs(fx * 1.4, fy * 1.4) - zs(-fx * 1.4, -fy * 1.4), 2.8);
-  const rollT = Math.atan2(zs(-fy * 0.8, fx * 0.8) - zs(fy * 0.8, -fx * 0.8), 1.6);
+  const hl = Math.min(WB / 2, 3);
+  const pitchT = Math.atan2(zs(fx * hl, fy * hl) - zs(-fx * hl, -fy * hl), 2 * hl);
+  const rollT = vt.lean ? Math.max(-0.5, Math.min(0.5, Math.atan(S.v * yawRate / 9.81)))
+    : Math.atan2(zs(-fy * 0.8, fx * 0.8) - zs(fy * 0.8, -fx * 0.8), 1.6);
   const k = 1 - Math.exp(-dt * 5);
   const clampA = (v) => Math.max(-0.2, Math.min(0.2, v));
-  S.pitch += (clampA(pitchT) - S.pitch) * k; S.roll += (clampA(rollT) - S.roll) * k;
+  S.pitch += (clampA(pitchT) - S.pitch) * k;
+  S.roll += ((vt.lean ? rollT : clampA(rollT)) - S.roll) * k;
+  // 聯結車拖車 (拖車方向往牽引點收斂)
+  if (trailer) {
+    const c = trailer.cfg;
+    trailer.h += S.v * Math.sin(S.h - trailer.h) / c.kingpin * dt;
+  }
 }
 
 function syncCar(dt) {
   car.position.set(S.x, S.zVis != null ? S.zVis : S.z, -S.y);
   car.rotation.set(S.roll, S.h, S.pitch, 'YZX');
-  for (const wh of car.userData.wheels) {
-    wh.spin.rotation.z -= S.v * dt / 0.33;
+  for (const wh of car.userData.wheels || []) {
+    wh.spin.rotation.z -= S.v * dt / (wh.r || 0.33);
     if (wh.front) wh.pivot.rotation.y = S.steer;
   }
   car.userData.tailMat.color.setRGB(S.braking ? 1 : 0.5, S.braking ? 0.02 : 0.005, S.braking ? 0.01 : 0.005);
   const on = blinkPhase();
   car.userData.sigLMat.color.copy(S.signal === -1 && on ? SIG_ON : SIG_OFF);
   car.userData.sigRMat.color.copy(S.signal === 1 && on ? SIG_ON : SIG_OFF);
+  if (car.userData.flashA && S.vtype === 'police') {
+    const f = (performance.now() % 500) < 250;
+    car.userData.flashA.color.setRGB(f ? 1 : 0.05, f ? 0.02 : 0.02, f ? 0.02 : 0.02);
+    car.userData.flashB.color.setRGB(f ? 0.05 : 0.05, f ? 0.02 : 0.15, f ? 0.02 : 1);
+  }
+  if (trailer) {
+    const c = trailer.cfg;
+    const hx = S.x - Math.cos(S.h) * c.hitch, hy = S.y - Math.sin(S.h) * c.hitch;
+    const tx = hx - Math.cos(trailer.h) * c.kingpin, ty = hy - Math.sin(trailer.h) * c.kingpin;
+    const q = roadAt(tx, ty, S.z + 1, 0, 2);
+    trailer.group.position.set(tx, q ? q.z : (S.zVis != null ? S.zVis : S.z), -ty);
+    trailer.group.rotation.set(0, trailer.h, S.pitch, 'YZX');
+    trailer.ud.tailMat.color.copy(car.userData.tailMat.color);
+    trailer.ud.sigLMat.color.copy(car.userData.sigLMat.color);
+    trailer.ud.sigRMat.color.copy(car.userData.sigRMat.color);
+  }
 }
 
 // ======================================================================= 攝影機
@@ -1100,38 +1221,63 @@ window.addEventListener('pointerup', () => { dragging = false; });
 window.addEventListener('pointermove', (e) => { if (dragging) { orbitYaw -= (e.clientX - lastX) * 0.006; lastX = e.clientX; } });
 
 function updateCamera(dt) {
+  const vt = S.vt || { cam: 1, eye: [0.1, 1.2, -0.37] };
   const fwd = new T.Vector3(Math.cos(S.h), 0, -Math.sin(S.h));
   const carP = new T.Vector3(S.x, S.zVis != null ? S.zVis : S.z, -S.y);
-  if (camMode === 2) {   // 空拍: 車後上方 140 m，看得到整片街道與房子
+  if (trailer) trailer.group.visible = camMode !== 1;
+  if (camMode === 2) {   // 空拍
     car.visible = true;
     const back = fwd.clone().applyAxisAngle(new T.Vector3(0, 1, 0), orbitYaw);
     const want = carP.clone().addScaledVector(back, -150).add(new T.Vector3(0, 140, 0));
     if (!camInit) { camPos.copy(want); camInit = true; }
     camPos.lerp(want, 1 - Math.exp(-dt * 3));
     camera.position.copy(camPos); camera.lookAt(carP.clone().addScaledVector(fwd, 60));
-  } else if (camMode === 1) {
+  } else if (camMode === 1) {   // 第一人稱: 只看到前方的路
     car.visible = false;
     camera.near = 0.1;
-    const eye = new T.Vector3(0.1, 1.2, -0.37).applyEuler(car.rotation).add(carP);
-    const dir = new T.Vector3(1, -0.03, 0).applyEuler(car.rotation);
+    const eye = new T.Vector3(...vt.eye).applyEuler(car.rotation).add(carP);
+    const dir = new T.Vector3(1, -0.03, 0).applyEuler(new T.Euler(0, S.h, S.pitch, 'YZX'));
     camera.position.copy(eye);
     camera.lookAt(eye.clone().add(dir));
     camInit = false;
   } else {
     car.visible = true;
     if (!dragging) orbitYaw *= Math.exp(-dt * 1.5);
+    const cm = vt.cam || 1;
     const back = fwd.clone().applyAxisAngle(new T.Vector3(0, 1, 0), orbitYaw);
-    const want = carP.clone().addScaledVector(back, -8.5).add(new T.Vector3(0, 3.0, 0));
-    const look = carP.clone().addScaledVector(fwd, 2.5).add(new T.Vector3(0, 1.0, 0));
+    const want = carP.clone().addScaledVector(back, -8.5 * cm - (trailer ? 8 : 0)).add(new T.Vector3(0, 3.0 * Math.pow(cm, 0.8), 0));
+    const look = carP.clone().addScaledVector(fwd, 2.5 * cm).add(new T.Vector3(0, 1.0 * Math.pow(cm, 0.8), 0));
     if (!camInit) { camPos.copy(want); camLook.copy(look); camInit = true; }
-    const k = 1 - Math.exp(-dt * 7);
-    camPos.lerp(want, k); camLook.lerp(look, 1 - Math.exp(-dt * 12));
+    camPos.lerp(want, 1 - Math.exp(-dt * 7)); camLook.lerp(look, 1 - Math.exp(-dt * 12));
     camera.position.copy(camPos); camera.lookAt(camLook);
   }
   camera.updateProjectionMatrix();
-  // 陰影跟著車子
   sun.target.position.copy(carP);
   sun.position.copy(carP).addScaledVector(SUN_DIR, 600);
+}
+
+// ======================================================================= 選單: 傳送 / 換車 (T)
+let SPAWNS = [];
+function toggleMenu(force) {
+  const el = $('menu');
+  if (!el) return;
+  const show = force != null ? force : el.classList.contains('hidden');
+  el.classList.toggle('hidden', !show);
+  if (show) {
+    const list = $('menu-places'), cars = $('menu-cars');
+    list.innerHTML = ''; cars.innerHTML = '';
+    for (const sp of SPAWNS) {
+      const b = document.createElement('button'); b.textContent = sp.name;
+      b.onclick = () => { spawn(sp.way, sp.idx, sp.dir || 1); toggleMenu(false); };
+      list.appendChild(b);
+    }
+    for (const t of PLAYER_TYPES) {
+      const b = document.createElement('button'); b.textContent = window.TWV ? window.TWV.TYPES[t].name : t;
+      if (t === S.vtype) b.classList.add('on');
+      b.onclick = () => { setVehicle(t); toggleMenu(false); };
+      cars.appendChild(b);
+    }
+  }
 }
 
 // ======================================================================= 小地圖 (左上圓形)
@@ -1193,7 +1339,8 @@ function updateHud() {
   const lim = w ? speedLimit(w) : 100;
   hudLimit.textContent = lim;
   hudRoad.textContent = roadLabel(w);
-  hudMode.textContent = (camMode === 1 ? '第一人稱' : camMode === 2 ? '空拍' : '第三人稱') + (autopilot ? ' · 自動駕駛' : '');
+  hudMode.textContent = (S.vt ? S.vt.name + ' · ' : '') + (camMode === 1 ? '第一人稱' : camMode === 2 ? '空拍' : '第三人稱') + (autopilot ? ' · 自動駕駛' : '');
+  if (S.vtype === 'scooter' && w && !w.city) hudRoad.textContent = '⚠ 機車禁止行駛國道 / 快速道路';
 }
 
 // ======================================================================= 主迴圈
@@ -1205,6 +1352,7 @@ window.addEventListener('resize', () => {
 // ---- 給擴充模組 (features.js: 車流、電台、看板) 用的介面
 const HOOKS = { init: [], update: [], frame: [], minimap: [], wayColor: null };
 window.TW = { T, scene, camera, renderer, WAYS, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
+  laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: META.origin_twd97, MOBILE,
   get camMode() { return camMode; } };
 
 setStatus('建立國道與地形…');
@@ -1215,6 +1363,13 @@ setTimeout(() => {
   try { const el = $('extra-live'); if (el) sp = JSON.parse(el.textContent).spawn; } catch (e) { sp = null; }
   if (params.has('spawn')) sp = params.get('spawn').split(',').map(Number);
   if (sp) spawn(sp[0], sp[1]); else defaultSpawn();
+  // 傳送選單地點
+  if (sp) SPAWNS.push({ name: '國1 汐五高架下（東湖→內湖）', way: sp[0], idx: sp[1], dir: 1 });
+  try {
+    const cm = JSON.parse($('city-meta').textContent);
+    for (const [name, kind, wi, pi, dir] of cm.spawns || []) SPAWNS.push({ name, way: kind === 'city' ? NFWY + wi : wi, idx: pi, dir });
+  } catch (e) { /* 沒有一般道路資料 */ }
+  if (params.has('vehicle')) setVehicle(params.get('vehicle'));
   for (const f of HOOKS.init) f();
   if (params.has('t')) { // 測試用: 先跑幾秒
     autopilot = true; S.v = 25;
@@ -1223,13 +1378,15 @@ setTimeout(() => {
     autopilot = params.has('demo') || params.has('keep');
     console.log('[test] simulated', params.get('t'), 's; speed', (S.v * 3.6).toFixed(0), 'km/h; lane', S.apLane,
       '; player bumps', window.TWX ? TWX.stats.bumps : '-', '; AI overlaps', window.TWX ? TWX.overlaps() : '-',
-      '; AI lane changes', window.TWX ? TWX.stats.laneChanges : '-', '; player lane changes', S.apChanges || 0);
+      '; AI lane changes', window.TWX ? TWX.stats.laneChanges : '-', '; player lane changes', S.apChanges || 0,
+      '; pos', S.x.toFixed(1), S.y.toFixed(1), S.z.toFixed(1), 'zVis', S.zVis, '; road', S.road ? (S.road.w.name || S.road.w.k) : null,
+      '; lead', HOOKS.leader ? JSON.stringify(HOOKS.leader(0)) : '-', '; city turns', window.TWX ? TWX.stats.turns : '-', '; nan', window.TWX ? TWX.stats.nan : '-');
   }
   syncCar(0); updateCamera(1);
   $('loading').classList.add('hidden');
   let last = performance.now(), frame = 0;
   function loop(now) {
-    const dt = Math.min((now - last) / 1000, 0.05); last = now;
+    const dt = Math.min((now - last) / 1000, params.has("realtime") ? 1.0 : 0.05); last = now;   // realtime: 背景展示用，依真實時間推進
     const sub = Math.max(1, Math.ceil(dt / (1 / 120)));
     for (let i = 0; i < sub; i++) update(dt / sub);
     for (const f of HOOKS.update) f(dt);

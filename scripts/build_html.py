@@ -44,6 +44,7 @@ def main():
                       if os.path.exists(os.path.join(DATA, "city_meta.json")) else "{}"),
         "CITY_B64": (base64.b64encode(open(os.path.join(DATA, "city.bin"), "rb").read()).decode("ascii")
                      if os.path.exists(os.path.join(DATA, "city.bin")) else ""),
+        "VEHICLES_JS": safe(open(os.path.join(WEB, "vehicles.js"), encoding="utf-8").read(), "vehicles.js"),
         "HLS_JS": safe(open(os.path.join(WEB, "vendor", "hls.light.min.js"), encoding="utf-8").read(), "hls.js"),
         "FEATURES_JS": safe(open(os.path.join(WEB, "features.js"), encoding="utf-8").read(), "features.js"),
     }

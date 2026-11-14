@@ -35,6 +35,14 @@ def main():
     dem = DEM(os.path.join(DATA, "terrain"), TERRAIN_ZOOM)
     GZ = np.maximum(dem.sample(lat, lon), 0.0).reshape(GX.shape)
     H, W = GZ.shape
+    # 盆地裡的高程資料含建物高度 (街廓變成小山): 低地用 5x5 最小值濾波 + 平滑估地面，壓掉高出地面 1.5 m 以上的凸起
+    ero = GZ.copy()
+    for di in range(-2, 3):
+        for dj in range(-2, 3):
+            ero = np.minimum(ero, np.roll(np.roll(GZ, di, 0), dj, 1))
+    sm = sum(np.roll(np.roll(ero, di, 0), dj, 1) for di in range(-2, 3) for dj in range(-2, 3)) / 25.0
+    wgt = np.clip((60.0 - GZ) / 30.0, 0.0, 1.0)          # 30 m 以下完全處理，60 m 以上 (山區) 不動
+    GZ = GZ - wgt * np.maximum(GZ - (sm + 1.5), 0.0)
 
     # ---- 依路面整平 (地面路段: 路面下 0.7 m；橋下: 至少低於橋面 3 m)
     gp, bp = [], []

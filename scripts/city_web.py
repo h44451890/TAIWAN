@@ -181,6 +181,10 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
             tags = el.get("tags", {})
             if len(g) < 4 or tags.get("building") in SKIP_BUILDING or any(p is None for p in g):
                 continue
+            # 地下街、地下停車場、捷運站等地底建築不蓋在地面上
+            if (str(tags.get("layer", "0")).startswith("-") or tags.get("location") in ("underground", "indoor")
+                    or (str(tags.get("building:levels", "")).strip() == "0" and not tags.get("height"))):
+                continue
             lat = np.array([p["lat"] for p in g]); lon = np.array([p["lon"] for p in g])
             if abs(lat[0] - lat[-1]) < 1e-9 and abs(lon[0] - lon[-1]) < 1e-9:
                 lat, lon = lat[:-1], lon[:-1]
@@ -241,7 +245,39 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
     bcol = np.array([b[4] for b in blds], np.uint8)
     blob = b"".join([counts.tobytes(), xy0.tobytes(), bxy0.tobytes(), bbase.tobytes(), bh.tobytes(),
                      roff.tobytes(), rz.tobytes(), boff.tobytes(), bcnt.tobytes(), bcol.tobytes()])
-    meta = dict(nways=len(roads), npts=int(len(pts)), nb=len(blds), nbv=int(nbv),
+    # ---- 傳送地點: [名稱, 種類, 路段索引, 點索引, 方向]
+    SPOTS = [("台北101 · 信義路", 25.0334, 121.5638, "city", None), ("台北車站 · 忠孝西路", 25.0463, 121.5168, "city", None),
+             ("西門町 · 中華路", 25.0425, 121.5073, "city", None), ("大直 · 北安路", 25.0807, 121.5470, "city", None),
+             ("板橋車站 · 縣民大道", 25.0140, 121.4640, "city", None), ("新店 · 北新路", 24.9790, 121.5410, "city", None),
+             ("建國高架", 25.0420, 121.5370, "fwy", "建國"), ("市民大道高架", 25.0448, 121.5300, "fwy", "市民大道"),
+             ("環東大道", 25.0560, 121.6000, "fwy", "環東"), ("台64 八里新店線", 25.0050, 121.4900, "fwy", "八里新店"),
+             ("水源快速道路", 25.0170, 121.5200, "fwy", "水源"), ("國3 碧潭橋", 24.9588, 121.5394, "fwy", "碧潭")]
+    spawns = []
+    for name, la, lo, kind, key in SPOTS:
+        tx, ty = local_xy(np.array([la]), np.array([lo]))
+        tx, ty = float(tx[0]), float(ty[0])
+        best = None
+        if kind == "city":
+            for k, r in enumerate(roads):
+                if r["cls"] not in (2, 3) or r["bridge"] or len(r["P"]) < 3:
+                    continue
+                d = np.hypot(r["P"][:, 0] - tx, r["P"][:, 1] - ty)
+                i = int(d.argmin())
+                if best is None or d[i] < best[0]:
+                    best = (d[i], k, min(max(i, 0), len(r["P"]) - 2))
+        else:
+            for k, w in enumerate(fwy_ways):
+                if not w["name"] or key not in w["name"] or str(w["highway"]).endswith("_link") or w["tunnel"]:
+                    continue
+                P = np.array(w["pts"])
+                d = np.hypot(P[:, 0] - tx, P[:, 1] - ty)
+                i = int(d.argmin())
+                if best is None or d[i] < best[0]:
+                    best = (d[i], k, min(max(i, 0), len(P) - 2))
+        if best and best[0] < 1500:
+            spawns.append([name, kind, best[1], best[2], 1])
+    meta_spawns = spawns
+    meta = dict(nways=len(roads), npts=int(len(pts)), nb=len(blds), nbv=int(nbv), spawns=meta_spawns,
                 ways=[[r["cls"], r["lanes"], int(r["oneway"]), round(r["width"], 2), int(r["bridge"]), r["name"]] for r in roads])
     print(f"city roads {len(roads)} ({len(pts)} pts, {joined} ends joined to freeway), buildings {len(blds)} ({nbv} verts), blob {len(blob) / 1e6:.2f} MB")
     return blob, meta
