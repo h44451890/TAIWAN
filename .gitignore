@@ -1,0 +1,4 @@
+*.blend1
+data/z_debug*
+__pycache__/
+*.pyc

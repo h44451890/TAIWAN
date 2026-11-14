@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>台灣 1:1 · 國道台北段</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9fb1c4; font-family: "Microsoft JhengHei", "PingFang TC", "Noto Sans TC", sans-serif; color: #fff; }
+  #app canvas { display: block; }
+  .hidden { display: none !important; }
+  #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; background: #0f1714; z-index: 10; }
+  #loading h1 { margin: 0; font-size: 42px; letter-spacing: 6px; }
+  #loading p { margin: 0; opacity: .75; }
+  #minimap { position: fixed; left: 18px; top: 18px; width: 200px; height: 200px; border-radius: 50%; box-shadow: 0 6px 24px rgba(0,0,0,.45); }
+  #hud-road { position: fixed; top: 18px; left: 50%; transform: translateX(-50%); padding: 8px 18px; border-radius: 10px; background: rgba(11,96,52,.92); border: 2px solid #fff; font-size: 18px; font-weight: 700; white-space: nowrap; box-shadow: 0 4px 16px rgba(0,0,0,.35); }
+  #hud-road:empty { display: none; }
+  #hud-speed { position: fixed; right: 22px; bottom: 22px; display: flex; align-items: flex-end; gap: 14px; }
+  #speedbox { text-align: right; text-shadow: 0 2px 8px rgba(0,0,0,.6); }
+  #speed { font-size: 64px; font-weight: 800; line-height: 1; font-variant-numeric: tabular-nums; }
+  #speedbox small { font-size: 16px; opacity: .85; }
+  #limit { width: 58px; height: 58px; border-radius: 50%; background: #fff; border: 7px solid #d6201c; color: #111; display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 800; box-sizing: border-box; }
+  #mode { position: fixed; left: 18px; top: 228px; width: 200px; text-align: center; font-size: 13px; text-shadow: 0 1px 4px rgba(0,0,0,.8); }
+  #help { position: fixed; left: 18px; bottom: 18px; padding: 10px 14px; border-radius: 10px; background: rgba(0,0,0,.55); font-size: 13px; line-height: 1.7; }
+  #help b { display: inline-block; min-width: 54px; color: #ffd84d; }
+  #credit { position: fixed; right: 8px; top: 6px; font-size: 10px; opacity: .7; text-shadow: 0 1px 3px #000; }
+  #traffic { position: fixed; top: 66px; left: 50%; transform: translateX(-50%); padding: 5px 14px; border-radius: 8px; background: rgba(0,0,0,.6); border: 2px solid #8a939b; font-size: 14px; white-space: nowrap; }
+  #traffic small { opacity: .7; }
+  #gear { font-size: 13px; opacity: .85; margin-top: 2px; }
+  #radio { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-radius: 14px; background: rgba(10,14,20,.72); box-shadow: 0 4px 18px rgba(0,0,0,.4); font-size: 14px; }
+  #radio button { width: 34px; height: 34px; border-radius: 50%; border: 0; background: rgba(255,255,255,.14); color: #fff; font-size: 14px; cursor: pointer; }
+  #radio button:hover { background: rgba(255,255,255,.28); }
+  #radio #radio-play { width: 40px; height: 40px; background: #2f80ff; font-size: 15px; }
+  #radio .info { min-width: 150px; line-height: 1.25; }
+  #radio .info b { display: block; font-size: 15px; }
+  #radio .info span { font-size: 12px; opacity: .75; }
+  #radio.on .info b::before { content: "● "; color: #ff4b3a; }
+  #radio input { width: 80px; accent-color: #2f80ff; }
+  @media (max-width: 900px) { #help { display: none; } #radio .info { min-width: 110px; } }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="loading"><h1>台灣 1:1</h1><p id="loading-msg">載入中…</p></div>
+<canvas id="minimap"></canvas>
+<div id="mode"></div>
+<div id="hud-road"><span id="road"></span></div>
+<div id="traffic">路況</div>
+<div id="hud-speed"><div id="limit">100</div><div id="speedbox"><div id="speed">0</div><small>km/h</small><div id="gear"></div></div></div>
+<div id="radio">
+  <button id="radio-prev" title="上一台 (Z)">◀</button>
+  <button id="radio-play" title="播放 / 暫停 (F)">▶</button>
+  <button id="radio-next" title="下一台 (X)">▶▶</button>
+  <div class="info"><b id="radio-name">全國治安交通網</b><span id="radio-freq">104.9 MHz</span> · <span id="radio-status"></span></div>
+  <input id="radio-vol" type="range" min="0" max="1" step="0.05" value="0.8" title="電台音量">
+</div>
+<div id="help">
+  <b>W / ↑</b>油門　<b>S / ↓</b>煞車・倒車<br>
+  <b>A D / ← →</b>轉向　<b>Shift</b>加速　<b>空白</b>手煞車<br>
+  <b>V</b>第一 / 第三人稱　<b>C</b>空拍　<b>滑鼠拖曳</b>環視<br>
+  <b>P</b>自動駕駛　<b>M</b>地圖縮放　<b>R</b>回到路上<br>
+  <b>F</b>電台開關　<b>Z / X</b>換台　<b>N</b>引擎音效　<b>H</b>隱藏說明
+</div>
+<div id="credit">© OpenStreetMap contributors（道路、建築）· Terrain: AWS Terrain Tiles · 路況/CMS: 交通部高速公路局 · 警察廣播電台 · three.js · hls.js</div>
+<script id="fwy-meta" type="application/json">{{META_JSON}}</script>
+<script id="fwy-data" type="application/octet-stream">{{DATA_B64}}</script>
+<script id="city-meta" type="application/json">{{CITY_META}}</script>
+<script id="city-data" type="application/octet-stream">{{CITY_B64}}</script>
+{{EXTRA}}
+<script>{{THREE_JS}}</script>
+<script>{{HLS_JS}}</script>
+<script>{{APP_JS}}</script>
+<script>{{FEATURES_JS}}</script>
+</body>
+</html>
