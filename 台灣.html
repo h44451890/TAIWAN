@@ -2816,23 +2816,23 @@ const sound = (() => {
   function init() {
     if (ac) return;
     ac = new (window.AudioContext || window.webkitAudioContext)();
-    const master = ac.createGain(); master.gain.value = 0.55; master.connect(ac.destination);
+    const master = ac.createGain(); master.gain.value = 0.45; master.connect(ac.destination);
     const comp = ac.createDynamicsCompressor(); comp.connect(master);
-    // 引擎: 點火頻率鋸齒波 + 半頻方波 + 二倍頻，經過失真與低通
-    const o1 = ac.createOscillator(); o1.type = 'sawtooth';
-    const o2 = ac.createOscillator(); o2.type = 'square';
+    // 引擎: 點火頻率正弦 + 半頻三角波 (低沉) + 少量二倍頻，輕微飽和後經柔和低通
+    const o1 = ac.createOscillator(); o1.type = 'sine';
+    const o2 = ac.createOscillator(); o2.type = 'triangle';
     const o3 = ac.createOscillator(); o3.type = 'sine';
-    const g1 = ac.createGain(); g1.gain.value = 0.5; const g2 = ac.createGain(); g2.gain.value = 0.32; const g3 = ac.createGain(); g3.gain.value = 0.25;
+    const g1 = ac.createGain(); g1.gain.value = 0.55; const g2 = ac.createGain(); g2.gain.value = 0.45; const g3 = ac.createGain(); g3.gain.value = 0.08;
     const shaper = ac.createWaveShaper();
-    const curve = new Float32Array(1024); for (let i = 0; i < 1024; i++) { const x = i / 512 - 1; curve[i] = Math.tanh(x * 2.2); }
+    const curve = new Float32Array(1024); for (let i = 0; i < 1024; i++) { const x = i / 512 - 1; curve[i] = Math.tanh(x * 1.2); }
     shaper.curve = curve;
-    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 3;
+    const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.Q.value = 0.7;
     const eng = ac.createGain(); eng.gain.value = 0;
     o1.connect(g1); o2.connect(g2); o3.connect(g3); g1.connect(shaper); g2.connect(shaper); g3.connect(shaper); shaper.connect(lp); lp.connect(eng); eng.connect(comp);
     // 進氣 / 排氣嘶聲
     const nb = noiseBuffer();
     const mkNoise = () => { const s = ac.createBufferSource(); s.buffer = nb; s.loop = true; s.start(); return s; };
-    const intake = ac.createBiquadFilter(); intake.type = 'bandpass'; intake.Q.value = 1.2;
+    const intake = ac.createBiquadFilter(); intake.type = 'bandpass'; intake.Q.value = 0.8;
     const intakeG = ac.createGain(); intakeG.gain.value = 0;
     mkNoise().connect(intake); intake.connect(intakeG); intakeG.connect(comp);
     // 風切 + 胎噪
@@ -2854,7 +2854,7 @@ const sound = (() => {
     // 自動變速
     const rpmOf = (g) => v / (2 * Math.PI * WHEEL_R) * 60 * RATIOS[g] * FINAL;
     let rpm = rpmOf(gear);
-    const up = 3000 + thr * 3200;
+    const up = 2600 + thr * 2400;
     if (rpm > up && gear < 6) { gear++; shiftDip = 0.12; }
     else if (gear > 1 && rpmOf(gear - 1) < up * 0.62) { gear--; shiftDip = 0.08; }
     rpm = Math.max(800 + thr * 400, rpmOf(gear));
@@ -2863,14 +2863,14 @@ const sound = (() => {
     nodes.o1.frequency.setTargetAtTime(fire, t, 0.03);
     nodes.o2.frequency.setTargetAtTime(fire / 2, t, 0.03);
     nodes.o3.frequency.setTargetAtTime(fire * 2, t, 0.03);
-    nodes.lp.frequency.setTargetAtTime(260 + thr * 2200 + rpm * 0.35, t, 0.05);
-    const eg = enabled ? (0.10 + thr * 0.32) * (shiftDip > 0 ? 0.35 : 1) : 0;
-    nodes.eng.gain.setTargetAtTime(eg, t, shiftDip > 0 ? 0.01 : 0.06);
-    nodes.intake.frequency.setTargetAtTime(500 + rpm * 0.5, t, 0.05);
-    nodes.intakeG.gain.setTargetAtTime(enabled ? thr * 0.05 * (rpm / 6000) : 0, t, 0.08);
+    nodes.lp.frequency.setTargetAtTime(180 + thr * 700 + rpm * 0.08, t, 0.08);
+    const eg = enabled ? (0.07 + thr * 0.13) * (shiftDip > 0 ? 0.55 : 1) : 0;
+    nodes.eng.gain.setTargetAtTime(eg, t, shiftDip > 0 ? 0.03 : 0.12);
+    nodes.intake.frequency.setTargetAtTime(300 + rpm * 0.12, t, 0.08);
+    nodes.intakeG.gain.setTargetAtTime(enabled ? thr * 0.015 * (rpm / 6000) : 0, t, 0.08);
     nodes.windG.gain.setTargetAtTime(enabled ? Math.min(0.5, (v / 40) ** 2 * 0.22) : 0, t, 0.2);
     const latAcc = Math.abs(S.v * S.v * Math.tan(S.steer || 0) / 2.8);
-    nodes.sqG.gain.setTargetAtTime(enabled && latAcc > 6.5 ? Math.min(0.25, (latAcc - 6.5) * 0.05) : 0, t, 0.05);
+    nodes.sqG.gain.setTargetAtTime(enabled && latAcc > 6.5 ? Math.min(0.12, (latAcc - 6.5) * 0.03) : 0, t, 0.05);
     if (gearEl) gearEl.textContent = (S.v < -0.3 ? 'R' : gear) + ' 檔 · ' + Math.round(rpm) + ' rpm';
   }
   function knock(v, axle) {   // 伸縮縫「叩」: 低沉撞擊 + 金屬聲，車速越快越大聲
