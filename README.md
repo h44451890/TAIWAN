@@ -29,6 +29,8 @@
 
 ## 功能
 - **路面**：車道數取自 OSM `lanes`，每線 3.75 m；標線為內側黃實線、外側白實線、白虛線（畫 4 m 空 6 m）。
+- **瀝青材質**：Poly Haven「Asphalt 04」實景掃描貼圖（CC0，顏色 + 法線 + 粗糙度，一張 4.04 m），以世界座標貼上並疊加旋轉取樣與大範圍明暗避免重複感；國道車道有輪跡與油漬。
+- **交流道指示牌**：每個匝道分岔點前約 230 m 一座綠色門架（`scripts/build_signs.py`，OSM 出口編號、`destination`、`destination:en`、`destination:ref`）。左邊直行方向（下兩個交流道 + ↑），右邊出口（路線盾牌、中英文地名 + ↗），上方黃底出口編號。
 - **起點**：國1 南下、汐五高架底下（東湖 → 內湖），前方就是 15.8K 的 CMS 看板。
 - **雙向分離**：OSM 的雙向中心線常比真實車寬還近，前處理會偵測同一層對向車道的重疊，把兩側往外推開，留出中央分隔帶，推移量沿路網平滑過渡。
 - **立體交叉淨空**：上層橋面至少比下層路面高 6.5 m，只檢查真正交叉或上下疊在一起的路段，並排或相連的路段不算。
@@ -65,6 +67,8 @@
 | `scripts/build_freeway_blender.py` | 建 Blender 場景 |
 | `scripts/export_web.py` | 輸出網頁用二進位資料 |
 | `scripts/build_live.py` | 路況、CMS、門架對應到路段（`--offline` 用現有快照） |
+| `scripts/build_signs.py` | 交流道出口指示牌資料（`web/extra/signs.json`） |
+| `web/tex/` | 路面貼圖（Poly Haven CC0） |
 | `scripts/tile_web.py` | 把網頁資料切成 3.84 km 分區（`tiles/index.json`、`tiles/t/` 地形、`tiles/d/` 路段 + 橋墩 + 建築） |
 | `scripts/build_html.py` | 打包 `台灣.html`（分區全部內嵌）與 `index.html`（分區另外下載） |
 | `tiles/` | 分區資料（由 `tile_web.py` 產生） |
@@ -77,6 +81,7 @@ python scripts/prep_freeway.py
 "/c/Program Files/Blender Foundation/Blender 5.2/blender.exe" --background --factory-startup --python scripts/build_freeway_blender.py
 python scripts/export_web.py
 python scripts/build_live.py
+python scripts/build_signs.py
 python scripts/tile_web.py
 python scripts/build_html.py
 ```
@@ -92,4 +97,4 @@ TWD97 TM2（EPSG:3826）減去原點 `(305500, 2769200)`，原點也存在 Blend
 - AI 車只走主線（遇到只能接匝道的地方才會上匝道），還不會主動下交流道。
 - 地形解析度約 19 m，可換成內政部 20 m DEM。
 
-資料來源：© OpenStreetMap contributors（ODbL）；地形：AWS Terrain Tiles；路況 / CMS / ETC：交通部高速公路局；電台：警察廣播電台；three.js、hls.js（MIT / Apache-2.0）。
+資料來源：© OpenStreetMap contributors（ODbL）；地形：AWS Terrain Tiles；路面貼圖：Poly Haven（CC0）；路況 / CMS / ETC：交通部高速公路局；電台：警察廣播電台；three.js、hls.js（MIT / Apache-2.0）。

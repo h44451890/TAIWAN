@@ -824,6 +824,191 @@ function buildEtc(g) {
   TW.scene.add(root);
 }
 
+// ======================================================================= 交流道出口指示牌 (照實景: 綠底白字門架)
+// 資料: scripts/build_signs.py -> extra-signs。左邊直行 (下兩個交流道 + ↑)，右邊出口 (路線盾牌、地名、英文 + ↗)，出口牌上方黃底出口編號
+const GUIDES = (() => { const el = $('extra-signs'); try { return el ? JSON.parse(el.textContent) : []; } catch (e) { return []; } })().map((g) => ({ ...g, model: null }));
+const SGN = { green: '#0a6b3b', px: 96, zh: 0.85, en: 0.31, sh: 0.78, arrow: 0.75, pad: 0.38, gap: 0.65 };
+const ZH_FONT = '"Microsoft JhengHei","PingFang TC","Noto Sans TC","Noto Sans CJK TC","Heiti TC",sans-serif';
+const EN_FONT = 'Arial,"Helvetica Neue",sans-serif';
+const zhFont = (m) => '700 ' + Math.round(m * SGN.px) + 'px ' + ZH_FONT;
+const enFont = (m) => '700 ' + Math.round(m * SGN.px) + 'px ' + EN_FONT;
+const mctx = document.createElement('canvas').getContext('2d');
+/** 文字寬度 (公尺)；中文字距拉開一點 (標誌字距寬) */
+function textW(text, font, spacing = 0) { mctx.font = font; return mctx.measureText(text).width / SGN.px + spacing * Math.max(0, [...text].length - 1); }
+function drawSpaced(x, text, cx, y, spacing) {
+  const chars = [...text];
+  if (!spacing || chars.length < 2) { x.fillText(text, cx, y); return; }
+  const ws = chars.map((c) => x.measureText(c).width), sp = spacing * SGN.px;
+  let px = cx - (ws.reduce((a, b) => a + b, 0) + sp * (chars.length - 1)) / 2;
+  const al = x.textAlign; x.textAlign = 'left';
+  chars.forEach((c, i) => { x.fillText(c, px, y); px += ws[i] + sp; });
+  x.textAlign = al;
+}
+const shieldKind = (ref) => {
+  const n = parseInt(ref, 10);
+  if (/^(1|2|3|3甲|4|5|6|8|10)$/.test(ref)) return 'nat';          // 國道
+  if (/^台/.test(ref) || (n >= 61 && n <= 88)) return 'prov';        // 東西向快速公路 / 省道
+  return 'county';
+};
+const shieldW = (ref) => (ref.replace(/^台/, '').length > 2 ? 0.95 : 0.7);
+function drawShield(x, ref, cx, top) {
+  const P = SGN.px, h = SGN.sh * P, w = shieldW(ref) * P, num = ref.replace(/^台/, ''), kind = shieldKind(ref);
+  x.save();
+  x.beginPath();
+  if (kind === 'nat') {          // 梅花形
+    const r = h * 0.26, cy = top + h * 0.53;
+    for (let k = 0; k < 5; k++) { const a = -Math.PI / 2 + k * Math.PI * 2 / 5; x.moveTo(cx + Math.cos(a) * h * 0.24 + r, cy + Math.sin(a) * h * 0.24); x.arc(cx + Math.cos(a) * h * 0.24, cy + Math.sin(a) * h * 0.24, r, 0, Math.PI * 2); }
+    x.moveTo(cx + h * 0.3, cy); x.arc(cx, cy, h * 0.3, 0, Math.PI * 2);
+    x.fillStyle = '#ffffff'; x.fill();
+    x.beginPath();
+    for (let k = 0; k < 5; k++) { const a = -Math.PI / 2 + k * Math.PI * 2 / 5; x.moveTo(cx + Math.cos(a) * h * 0.24 + r * 0.8, cy + Math.sin(a) * h * 0.24); x.arc(cx + Math.cos(a) * h * 0.24, cy + Math.sin(a) * h * 0.24, r * 0.8, 0, Math.PI * 2); }
+    x.moveTo(cx + h * 0.27, cy); x.arc(cx, cy, h * 0.27, 0, Math.PI * 2);
+    x.fillStyle = '#1d4f9c'; x.fill();
+    x.fillStyle = '#ffffff';
+  } else if (kind === 'prov') {  // 盾形 (照片的 64、65)
+    const l = cx - w / 2, r = cx + w / 2, b = top + h;
+    x.moveTo(l, top + h * 0.12); x.quadraticCurveTo(cx - w * 0.25, top - h * 0.02, cx, top + h * 0.1); x.quadraticCurveTo(cx + w * 0.25, top - h * 0.02, r, top + h * 0.12);
+    x.lineTo(r, top + h * 0.55); x.quadraticCurveTo(r, b - h * 0.12, cx, b); x.quadraticCurveTo(l, b - h * 0.12, l, top + h * 0.55); x.closePath();
+    x.fillStyle = '#ffffff'; x.fill();
+    x.lineWidth = h * 0.09; x.strokeStyle = '#c8202a'; x.save(); x.clip(); x.stroke(); x.restore();
+    x.fillStyle = '#c8202a';
+    x.fillRect(l, top + h * 0.2, w, h * 0.6); x.fill();
+    x.fillStyle = '#ffffff';
+  } else {                       // 縣道: 白底黑字
+    x.rect(cx - w / 2, top + h * 0.1, w, h * 0.8); x.fillStyle = '#ffffff'; x.fill(); x.fillStyle = '#111111';
+  }
+  x.font = '700 ' + Math.round(h * (num.length > 2 ? 0.36 : 0.44)) + 'px ' + EN_FONT;
+  x.textAlign = 'center'; x.textBaseline = 'middle';
+  x.fillText(num, cx, top + h * 0.53);
+  x.restore();
+}
+/** 箭頭: ang 0 = ↑，正 = 往右斜 */
+function drawArrow(x, cx, cy, size, ang) {
+  const P = size * SGN.px;
+  x.save(); x.translate(cx, cy); x.rotate(ang);
+  x.fillStyle = '#ffffff'; x.beginPath();
+  x.moveTo(0, -P * 0.5); x.lineTo(P * 0.32, -P * 0.12); x.lineTo(P * 0.1, -P * 0.12); x.lineTo(P * 0.1, P * 0.5);
+  x.lineTo(-P * 0.1, P * 0.5); x.lineTo(-P * 0.1, -P * 0.12); x.lineTo(-P * 0.32, -P * 0.12); x.closePath(); x.fill();
+  x.restore();
+}
+function panelBase(wM, hM, bg = SGN.green, border = '#ffffff') {
+  const P = SGN.px, cv = document.createElement('canvas');
+  cv.width = Math.ceil(wM * P); cv.height = Math.ceil(hM * P);
+  const x = cv.getContext('2d');
+  const rr = (i, r) => { x.beginPath(); x.roundRect(i, i, cv.width - 2 * i, cv.height - 2 * i, r); };
+  x.fillStyle = bg; rr(0, 0.12 * P); x.fill();
+  x.lineWidth = 0.05 * P; x.strokeStyle = border; rr(0.08 * P, 0.07 * P); x.stroke();
+  x.textAlign = 'center'; x.textBaseline = 'alphabetic';
+  return { cv, x, w: wM, h: hM };
+}
+const ZH_SP = 0.2;   // 中文字距 (m)
+/** 出口牌: 每個目的地一欄 (盾牌 / 中文 / 英文)，欄間白色分隔線，箭頭在出口那一側的下方 */
+function exitPanel(gd) {
+  const S = SGN, n = gd.dz.length, perCol = gd.shields.length === n;
+  const cols = gd.dz.map((zh, i) => {
+    const zw = textW(zh, zhFont(S.zh), ZH_SP), ew = gd.den[i] ? textW(gd.den[i], enFont(S.en)) : 0;
+    const sw = perCol ? shieldW(gd.shields[i]) : 0;
+    return { zh, en: gd.den[i] || '', sh: perCol ? gd.shields[i] : null, w: Math.max(zw, ew, sw, 1.0) };
+  });
+  const groupSh = !perCol && gd.shields.length ? gd.shields : null;
+  const hasSh = perCol || !!groupSh;
+  const W = S.pad * 2 + cols.reduce((a, c) => a + c.w, 0) + S.gap * (n - 1) + (n === 1 ? 0.6 : 0);
+  const H = S.pad + (hasSh ? S.sh + 0.12 : 0) + S.zh + 0.1 + S.en + 0.16 + S.arrow + S.pad * 0.7;
+  const p = panelBase(W, H), x = p.x, P = S.px;
+  let cx = S.pad + (n === 1 ? 0.3 : 0);
+  const yZh = (S.pad + (hasSh ? S.sh + 0.12 : 0) + S.zh * 0.9) * P, yEn = yZh + (0.1 + S.en) * P;
+  cols.forEach((c, i) => {
+    const mid = (cx + c.w / 2) * P;
+    if (c.sh) drawShield(x, c.sh, mid, S.pad * P);
+    x.fillStyle = '#ffffff';
+    x.font = zhFont(S.zh); drawSpaced(x, c.zh, mid, yZh, ZH_SP);
+    if (c.en) { x.font = enFont(S.en); x.fillText(c.en, mid, yEn); }
+    if (i < n - 1) { x.fillStyle = '#ffffff'; x.fillRect((cx + c.w + S.gap / 2) * P - 0.025 * P, (S.pad + (hasSh ? S.sh * 0.5 : 0)) * P, 0.05 * P, (S.zh + S.en + 0.25) * P); }
+    cx += c.w + S.gap;
+  });
+  if (groupSh) {
+    let tw = groupSh.reduce((a, r) => a + shieldW(r) + 0.15, -0.15), sx = (W - tw) / 2;
+    for (const r of groupSh) { drawShield(x, r, (sx + shieldW(r) / 2) * P, S.pad * P); sx += shieldW(r) + 0.15; }
+  }
+  const ay = H - S.pad * 0.7 - S.arrow / 2, R = gd.side !== 'L';
+  drawArrow(x, (R ? W - S.pad - 0.5 : S.pad + 0.5) * P, ay * P, S.arrow, R ? Math.PI / 4 : -Math.PI / 4);
+  return p;
+}
+function thruPanel([zh, en]) {
+  const S = SGN;
+  const W = S.pad * 2 + Math.max(textW(zh, zhFont(S.zh), ZH_SP), en ? textW(en, enFont(S.en)) : 0, 1.2);
+  const H = S.pad + S.zh + 0.1 + S.en + 0.16 + S.arrow + S.pad * 0.7;
+  const p = panelBase(W, H), x = p.x, P = S.px;
+  const yZh = (S.pad + S.zh * 0.9) * P;
+  x.fillStyle = '#ffffff'; x.font = zhFont(S.zh); drawSpaced(x, zh, W / 2 * P, yZh, ZH_SP);
+  if (en) { x.font = enFont(S.en); x.fillText(en, W / 2 * P, yZh + (0.1 + S.en) * P); }
+  drawArrow(x, W / 2 * P, (H - S.pad * 0.7 - S.arrow / 2) * P, S.arrow, 0);
+  return p;
+}
+function exitTab(gd) {
+  const text = gd.ref + ' ' + gd.name, S = SGN, h = 0.55;
+  mctx.font = '700 ' + Math.round(0.4 * S.px) + 'px ' + ZH_FONT;
+  const W = mctx.measureText(text).width / S.px + 0.36;
+  const p = panelBase(W, h, '#f2b705', '#f2b705'), x = p.x;
+  x.fillStyle = '#111111'; x.font = mctx.font; x.textBaseline = 'middle'; x.fillText(text, W / 2 * S.px, h / 2 * S.px + 1);
+  return p;
+}
+function signMat(cv) {
+  const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; t.anisotropy = 8;
+  // 反光標誌: 有日照明暗，再加一點自發光讓背光面也讀得到
+  return new T.MeshStandardMaterial({ map: t, emissiveMap: t, emissive: new T.Color(0.32, 0.32, 0.32), roughness: 0.55, metalness: 0 });
+}
+const backMat = new T.MeshStandardMaterial({ color: new T.Color(0.42, 0.44, 0.46), metalness: 0.6, roughness: 0.5 });
+function buildGuide(gd) {
+  const w = TW.wayByGid(gd.gid), hw = w.hw;
+  const XL = -(hw + 0.6), XR = hw + 0.9, H = 6.1, TH = 1.0;
+  const root = new T.Group();
+  root.add(mergedGroup(trussGroup(XL, XR, H, TH)));
+  const ex = exitPanel(gd), th = gd.thru.map(thruPanel), tab = gd.ref ? exitTab(gd) : null;
+  const avail = XR - XL - 1.2;   // 兩根立柱之間 (含路肩上方)
+  const total = ex.w + th.reduce((a, p) => a + p.w + 0.5, 0);
+  const k = Math.min(1, avail / total);
+  const yB = H - 0.3, Z = 0.56, R = gd.side !== 'L';
+  const put = (p, cx, y0) => {
+    const m = new T.Mesh(new T.PlaneGeometry(p.w * k, p.h * k), signMat(p.cv));
+    m.position.set(cx, y0 + p.h * k / 2, Z); root.add(m);
+    const b = new T.Mesh(new T.BoxGeometry(p.w * k, p.h * k, 0.06), backMat);
+    b.position.set(cx, y0 + p.h * k / 2, Z - 0.04); root.add(b);
+  };
+  const exCx = R ? XR - 0.6 - ex.w * k / 2 : XL + 0.6 + ex.w * k / 2;
+  put(ex, exCx, yB);
+  if (tab) put(tab, R ? exCx + ex.w * k / 2 - tab.w * k / 2 : exCx - ex.w * k / 2 + tab.w * k / 2, yB + ex.h * k + 0.04);
+  let cur = R ? XL + 0.6 : XR - 0.6;
+  for (const p of (R ? th : th.slice().reverse())) {
+    const cx = R ? cur + p.w * k / 2 : cur - p.w * k / 2;
+    put(p, cx, yB);   // 下緣對齊 (照實景)
+    cur += (R ? 1 : -1) * (p.w + 0.5) * k;
+  }
+  placeOnWay(root, w, gd.idx);
+  TW.scene.add(root);
+  return root;
+}
+function disposeGuide(gd) {
+  if (!gd.model) return;
+  TW.scene.remove(gd.model);
+  gd.model.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material && o.material.map) { o.material.map.dispose(); o.material.dispose(); } });
+  gd.model = null;
+}
+let guideClock = 0;
+function updateGuides(dt) {
+  guideClock -= dt;
+  if (guideClock > 0) return;
+  guideClock = 0.5;
+  let built = 0;
+  for (const gd of GUIDES) {
+    const w = TW.wayByGid(gd.gid);
+    if (!w) { disposeGuide(gd); continue; }
+    const d = Math.hypot(w.P[gd.idx * 3] - S.x, w.P[gd.idx * 3 + 1] - S.y);
+    if (!gd.model && d < 1500 && built < 2) { gd.model = buildGuide(gd); built++; }
+    else if (gd.model && d > 2300) disposeGuide(gd);
+  }
+}
+
 // ======================================================================= 警廣電台 (hls.js)
 const radio = (() => {
   const R = LIVE.radio, st = R.stations;
@@ -1105,7 +1290,7 @@ TW.HOOKS.tile.push((rec) => {
   for (const k of rec.ways) for (const g of ETC_BY_GID.get(WAYS[k].gid) || []) buildEtc(g);
 });
 TW.HOOKS.joint = (v, axle) => { stats.joints = (stats.joints || 0) + 1; sound.knock(v, axle); };
-TW.HOOKS.frame.push((dt) => { updateSigns(dt); sound.update(dt); sound.blinker(); updateTrafficHud(dt); gpsSync.frame(dt); });
+TW.HOOKS.frame.push((dt) => { updateSigns(dt); updateGuides(dt); sound.update(dt); sound.blinker(); updateTrafficHud(dt); gpsSync.frame(dt); });
 // 除錯/測試: AI 車之間互相重疊的對數
 function overlaps() {
   let n = 0;
@@ -1118,5 +1303,5 @@ function overlaps() {
   }
   return n;
 }
-window.TWX = { cars, signs, wayTraffic, radio, sound, stats, overlaps, gpsSync };
+window.TWX = { cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync };
 })();

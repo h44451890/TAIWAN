@@ -57,6 +57,13 @@ def main():
                 key = os.path.splitext(f)[0]
                 extra += f'<script id="extra-{key}" type="application/json">' + \
                     open(p, encoding="utf-8").read().replace("</", "<\\/") + "</script>\n"
+    # 貼圖 (web/tex/*.jpg) 以 base64 內嵌: <script id="tex-檔名">
+    tex_dir = os.path.join(WEB, "tex")
+    if os.path.isdir(tex_dir):
+        for f in sorted(os.listdir(tex_dir)):
+            if f.endswith(".jpg"):
+                b64 = base64.b64encode(open(os.path.join(tex_dir, f), "rb").read()).decode("ascii")
+                extra += f'<script id="tex-{f[:-4]}" type="text/plain">{b64}</script>\n'
     base = tpl.replace("{{EXTRA}}", extra)
     for k, v in parts.items():
         base = base.replace("{{" + k + "}}", v)

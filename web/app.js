@@ -248,11 +248,14 @@ const GLSL_NOISE = `
   float fwyFbm(vec3 p, int oct){ float a=0.5, s=0.0, t=0.0; for(int i=0;i<8;i++){ if(i>=oct) break; s+=a*fwyVNoise(p); t+=a; p*=2.02; a*=0.5; } return s/t; }
 `;
 
-function patch(mat, { vert = '', vmain = '', frag = '', color = '' }) {
+function patch(mat, { vert = '', vmain = '', frag = '', color = '', rough = '', normal = '', uniforms = null }) {
   // 每個材質注入的程式碼不同，必須有自己的快取 key；否則 three.js 會讓它們共用第一個編譯好的著色器
-  const key = 'fwy:' + vert + '|' + vmain + '|' + frag + '|' + color;
+  const key = 'fwy:' + vert + '|' + vmain + '|' + frag + '|' + color + '|' + rough + '|' + normal;
   mat.customProgramCacheKey = () => key;
   mat.onBeforeCompile = (sh) => {
+    if (uniforms) Object.assign(sh.uniforms, uniforms);
+    if (rough) sh.fragmentShader = sh.fragmentShader.replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + rough);
+    if (normal) sh.fragmentShader = sh.fragmentShader.replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + normal);
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vObj;\n' + vert)
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObj = vec3(position.x, -position.z, position.y);\n' + vmain);
@@ -263,11 +266,45 @@ function patch(mat, { vert = '', vmain = '', frag = '', color = '' }) {
   return mat;
 }
 
+// 真實瀝青: Poly Haven「Asphalt 04」實景掃描 (CC0，一張 4.04 m)；顏色、法線、粗糙度三張貼圖
+// 用世界座標貼 (不靠 UV)，再疊一層旋轉 + 縮放的取樣與大範圍明暗，看不出重複
+function texFrom(id, srgb) {
+  const el = $(id);
+  const img = new Image();
+  const t = new T.Texture(img);
+  t.wrapS = t.wrapT = T.RepeatWrapping;
+  t.colorSpace = srgb ? T.SRGBColorSpace : T.NoColorSpace;
+  t.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+  img.onload = () => { t.needsUpdate = true; };
+  if (el) img.src = 'data:image/jpeg;base64,' + el.textContent.trim();
+  return t;
+}
+const ASPH_U = {
+  tAsD: { value: texFrom('tex-asphalt_diff', true) },
+  tAsN: { value: texFrom('tex-asphalt_nor_gl', false) },
+  tAsR: { value: texFrom('tex-asphalt_rough', false) },
+};
+const ASPH_DECL = `uniform sampler2D tAsD; uniform sampler2D tAsN; uniform sampler2D tAsR; float gMark; vec2 gUv1; vec2 gUv2; float gMix;
+  void asphUv(vec3 p) {
+    gUv1 = p.xy / 4.04;
+    gUv2 = mat2(0.866, -0.5, 0.5, 0.866) * p.xy / 5.3 + vec2(0.37, 0.71);
+    gMix = smoothstep(0.35, 0.65, fwyFbm(p * 0.035, 3));
+  }
+  vec3 asphColor() { return mix(texture2D(tAsD, gUv1).rgb, texture2D(tAsD, gUv2).rgb, gMix); }`;
+// 法線: 路面接近水平，把貼圖的切線方向擾動 (資料 x 東、y 北 -> three x、-z) 加到幾何法線上
+const ASPH_NORMAL = `{
+  vec3 tn = mix(texture2D(tAsN, gUv1).rgb, texture2D(tAsN, gUv2).rgb, gMix) * 2.0 - 1.0;
+  vec3 dw = vec3(tn.x, 0.0, -tn.y) * (0.75 * (1.0 - gMark));
+  normal = normalize(normal + mat3(viewMatrix) * dw);
+}`;
+const ASPH_ROUGH = `roughnessFactor = mix(mix(0.72, 0.98, mix(texture2D(tAsR, gUv1).r, texture2D(tAsR, gUv2).r, gMix)), 0.55, gMark);`;
+
 // 瀝青路面 + 標線 (內側黃實線、外側白實線、車道白虛線 畫4m空6m, 線寬15cm)
 const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness: 0 }), {
   vert: 'attribute vec2 aUv; attribute float aLs; attribute float aLanes; varying vec2 vRUv; varying float vLs; varying float vLanes;',
   vmain: 'vRUv = aUv; vLs = aLs; vLanes = aLanes;',
-  frag: 'varying vec2 vRUv; varying float vLs; varying float vLanes;',
+  frag: 'varying vec2 vRUv; varying float vLs; varying float vLanes;' + ASPH_DECL,
+  uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
   color: `{
     float k = (vRUv.x - vLs) / ${LANE_W.toFixed(2)};
     float kr = floor(k + 0.5);
@@ -282,9 +319,17 @@ const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness
     float dash = 1.0 - smoothstep(0.4 - fv, 0.4 + fv, ph);
     float white = onLine * max(isRight, inner * dash);
     float yellow = onLine * isLeft;
-    vec3 base = mix(vec3(0.035,0.035,0.037), vec3(0.075,0.073,0.07), fwyFbm(vObj*0.8, 6));
+    asphUv(vObj);
+    vec3 base = asphColor() * (0.62 + 0.22 * fwyFbm(vObj * 0.012, 3));
+    // 輪跡: 每個車道中心左右約 0.85 m 被輪胎磨得較暗、較平滑；車道中央有一點油漬
+    float lo = abs(fract(k) - 0.5) * ${LANE_W.toFixed(2)};
+    float inLane = step(0.0, k) * step(k, vLanes);
+    float wheel = (1.0 - smoothstep(0.25, 0.5, abs(lo - 0.85))) * inLane;
+    float oil = (1.0 - smoothstep(0.0, 0.35, lo)) * inLane;
+    base *= 1.0 - 0.10 * wheel - 0.06 * oil * fwyFbm(vObj * 0.6, 3);
     vec3 c = mix(base, vec3(0.8,0.8,0.78), white);
     c = mix(c, vec3(0.85,0.6,0.05), yellow);
+    gMark = max(white, yellow);
     diffuseColor.rgb = c;
   }`,
 });
@@ -319,10 +364,13 @@ const matBarrier = patch(new T.MeshStandardMaterial({ roughness: 0.92, metalness
 const matCityRoad = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalness: 0 }), {
   vert: 'attribute vec2 aUv; attribute float aLs; attribute float aLanes; varying vec2 vRUv; varying float vW; varying float vCode;',
   vmain: 'vRUv = aUv; vW = aLs; vCode = aLanes;',
-  frag: 'varying vec2 vRUv; varying float vW; varying float vCode;',
+  frag: 'varying vec2 vRUv; varying float vW; varying float vCode;' + ASPH_DECL,
+  uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
   color: `{
     float u = vRUv.x, W = vW, fw = max(fwidth(u), 1e-4);
-    vec3 c = mix(vec3(0.05, 0.05, 0.052), vec3(0.095, 0.092, 0.088), fwyFbm(vObj * 0.7, 5));
+    asphUv(vObj);
+    gMark = 0.0;
+    vec3 c = asphColor() * (0.55 + 0.25 * fwyFbm(vObj * 0.015, 3));   // 市區路面較舊、補丁多
     if (abs(vCode) > 0.5) {
       float two = step(vCode, -0.5), L = abs(vCode);
       float edge = min(abs(u - 0.3), abs(u - (W - 0.3)));
@@ -337,6 +385,7 @@ const matCityRoad = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalnes
       if (two > 0.5) { float cd = abs(abs(u - W * 0.5) - 0.12); yellow = 1.0 - smoothstep(0.05, 0.05 + fw, cd); }
       c = mix(c, vec3(0.75, 0.75, 0.72), white);
       c = mix(c, vec3(0.85, 0.6, 0.05), yellow);
+      gMark = max(white, yellow);
     }
     diffuseColor.rgb = c;
   }`,
