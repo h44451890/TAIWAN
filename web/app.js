@@ -1197,6 +1197,9 @@ function respawnNearest() {
 const keys = {};
 let camMode = params.get('cam') === '1' ? 1 : params.get('cam') === '2' ? 2 : 3, autopilot = params.has('demo'), mapScaleIdx = 0;
 const MAP_SCALES = [0.11, 0.055, 0.025];
+let laneCenter = true;   // 車道置中輔助 (K 切換)
+try { if (localStorage.getItem('tw_lc') === '0') laneCenter = false; } catch (_) {}
+if (params.get('lc') === '0') laneCenter = false; else if (params.get('lc') === '1') laneCenter = true;
 window.addEventListener('keydown', (e) => {
   if (e.target && e.target.tagName === 'INPUT') return;
   keys[e.code] = true;
@@ -1205,6 +1208,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Digit1') camMode = 1;
   if (e.code === 'Digit3') camMode = 3;
   if (e.code === 'KeyP') autopilot = !autopilot;
+  if (e.code === 'KeyK') { laneCenter = !laneCenter; S.lcLane = null; try { localStorage.setItem('tw_lc', laneCenter ? '1' : '0'); } catch (_) {} }
   if (e.code === 'KeyM') mapScaleIdx = (mapScaleIdx + 1) % MAP_SCALES.length;
   if (e.code === 'KeyR') respawnNearest();
   if (e.code === 'KeyH') $('help').classList.toggle('hidden');
@@ -1286,6 +1290,63 @@ function lookAhead(dist) {
   return { x: px + w.nx[k] * off, y: py + w.ny[k] * off, w, dir };
 }
 
+/** 車道置中: 手動駕駛沒打方向盤時，把車子帶回最近的車道中心 (純追蹤法，只沿目前路段往前看)。
+ *  回傳 -1..1 的轉向量，沒作用時回傳 null。打方向燈、車速太低、偏離太多或角度太大都會暫停。 */
+function laneCenterSteer(maxSteer) {
+  const r = S.road;
+  S.lcOn = false;
+  if (!r || S.v < 6 || (S.signal && !S.signalAuto)) { S.lcLane = null; return null; }
+  const w = r.w, cd = Math.cos(S.h) * r.tx + Math.sin(S.h) * r.ty;
+  if (Math.abs(cd) < 0.82) { S.lcLane = null; return null; }      // 夾角 > 35°: 路口轉彎中
+  const dir = cd > 0 ? 1 : -1;
+  if (!w.city && dir < 0) return null;                            // 逆向不輔助
+  const lc = laneCount(w);
+  if (S.lcLane == null || S.lcWay !== w.k || S.lcDir !== dir) {
+    let b = 0, bd = 1e9;
+    for (let ln = 0; ln < lc; ln++) { const d = Math.abs(laneOffDir(w, ln, dir) - r.lat); if (d < bd) { bd = d; b = ln; } }
+    S.lcLane = b; S.lcWay = w.k; S.lcDir = dir;
+  }
+  const off = laneOffDir(w, Math.min(S.lcLane, lc - 1), dir);
+  if (Math.abs(off - r.lat) > LANE_W * 0.9) { S.lcLane = null; return null; }   // 方向盤放開後還在滑: 下一格重選最近車道
+  // 從投影點沿車道往前 L 公尺；到路段端點就接到「車道對得上」的下一段 (車道縮減就併到相鄰車道、在出口車道就跟著匝道)，接不上才沿切線延伸
+  let P = w.P, cw = w, cdir = dir, coff = off, hops = 0;
+  const i = r.i;
+  let px = P[i * 3] + (P[i * 3 + 3] - P[i * 3]) * r.t, py = P[i * 3 + 1] + (P[i * 3 + 4] - P[i * 3 + 1]) * r.t;
+  let dist = 7 + S.v * 0.9, v = dir > 0 ? i + 1 : i, k = v, tx = r.tx * dir, ty = r.ty * dir, guard = 0;
+  while (dist > 0 && guard++ < 400) {
+    if (v < 0 || v > cw.n - 1) {
+      if (hops++ >= 3) break;
+      const node = cdir > 0 ? cw.n - 1 : 0;
+      const ex = P[node * 3] + cw.nx[node] * coff, ey = P[node * 3 + 1] + cw.ny[node] * coff;
+      let best = null, bq = 0, bd = 2.5;
+      for (const o of nextOptions(cw, node)) {
+        if (tx * o.hx + ty * o.hy < 0.7) continue;                 // 只跟直行方向，轉彎交給駕駛
+        const lcO = laneCount(o.o);
+        for (let q = 0; q < lcO; q++) {
+          const lo = laneOffDir(o.o, q, o.dir);
+          const d = Math.hypot(o.o.P[o.i * 3] + o.o.nx[o.i] * lo - ex, o.o.P[o.i * 3 + 1] + o.o.ny[o.i] * lo - ey);
+          if (d < bd) { bd = d; best = o; bq = q; }
+        }
+      }
+      if (!best) break;
+      cw = best.o; cdir = best.dir; P = cw.P; coff = laneOffDir(cw, bq, cdir); v = best.i + cdir;
+      continue;
+    }
+    const bx = P[v * 3], by = P[v * 3 + 1], d = Math.hypot(bx - px, by - py);
+    k = v;
+    if (d > 1e-3) { tx = (bx - px) / d; ty = (by - py) / d; }
+    if (d >= dist) { px += tx * dist; py += ty * dist; dist = 0; break; }
+    dist -= d; px = bx; py = by; v += cdir;
+  }
+  if (dist > 0) { px += tx * dist; py += ty * dist; }
+  k = Math.min(Math.max(k, 0), cw.n - 1);
+  const gx = px + cw.nx[k] * coff, gy = py + cw.ny[k] * coff;
+  const dx = gx - S.x, dy = gy - S.y, Ld = Math.hypot(dx, dy) || 1;
+  const al = Math.atan2(Math.sin(Math.atan2(dy, dx) - S.h), Math.cos(Math.atan2(dy, dx) - S.h));
+  S.lcOn = true;
+  return Math.max(-0.8, Math.min(0.8, Math.atan2(2 * WB * Math.sin(al), Ld) / maxSteer));
+}
+
 function update(dt) {
   const vt = S.vt || (window.TWV && window.TWV.TYPES.sedan) || { acc: 1.5, vmax: 45, wb: 2.8, wid: 1.85 };
   const big = vt.len > 6.5;
@@ -1298,6 +1359,7 @@ function update(dt) {
   if (thr || brk || str) autopilot = autopilot && !(thr || brk || str) ? false : autopilot;
   const maxSteer = (big ? 0.6 : 0.55) / (1 + Math.abs(S.v) / 14);
   if (autopilot) {
+    S.lcOn = false;
     const rt = updateRoute();
     const w0 = rt ? rt.w : (S.road && S.road.w);
     const dir = rt ? rt.dir : 1;
@@ -1388,6 +1450,9 @@ function update(dt) {
   } else {
     S.apLane = null; S.apPending = null; S.rt = null;
     if (S.signalAuto) { S.signal = 0; S.signalAuto = false; }
+    if (str) { S.lcLane = null; S.lcOn = false; }
+    else if (laneCenter) { const c = laneCenterSteer(maxSteer); if (c != null) str = c; }
+    else S.lcOn = false;
   }
   // 手動方向燈: 方向盤轉過再回正後自動熄燈 (自動駕駛時保留到路口轉彎)
   if (S.signal && !S.signalAuto && !autopilot) {
@@ -1630,7 +1695,7 @@ function updateHud() {
   const lim = w ? speedLimit(w) : 100;
   hudLimit.textContent = lim;
   hudRoad.textContent = roadLabel(w);
-  hudMode.textContent = (S.vt ? S.vt.name + ' · ' : '') + (camMode === 1 ? '第一人稱' : camMode === 2 ? '空拍' : '第三人稱') + (autopilot ? ' · 自動駕駛' : '');
+  hudMode.textContent = (S.vt ? S.vt.name + ' · ' : '') + (camMode === 1 ? '第一人稱' : camMode === 2 ? '空拍' : '第三人稱') + (autopilot ? ' · 自動駕駛' : laneCenter ? (S.lcOn ? ' · 車道置中' : ' · 車道置中 (待命)') : '');
   if (S.vtype === 'scooter' && w && !w.city) hudRoad.textContent = '⚠ 機車禁止行駛國道 / 快速道路';
 }
 
@@ -1663,16 +1728,29 @@ setTimeout(async () => {
   if (params.has('vehicle')) setVehicle(params.get('vehicle'));
   for (const f of HOOKS.init) f();
   if (params.has('t')) { // 測試用: 先跑幾秒
-    autopilot = true; S.v = 25;
+    const LCT = params.has('lctest');   // 車道置中測試: 手動只踩油門，每 20 秒打一下方向盤
+    autopilot = !LCT; S.v = 25;
+    let lcMax = 0, lcSum = 0, lcN = 0, lcOff = 0;
     const n = +params.get('t') * 30;
     for (let i = 0; i < n; i++) {
       if (i % 15 === 0) streamTick({ build: false });   // 內嵌分區: 同步載入資料 (不建模型)
+      if (LCT) {
+        const vT = S.road && S.road.w.city ? 11 : 24; if (i === 0) S.v = vT; keys.KeyW = S.v < vT; keys.KeyS = S.v > vT + 3; const pl = (i % 600) >= 300 && (i % 600) < 306; keys.KeyA = pl && (i % 1200) < 600; keys.KeyD = pl && (i % 1200) >= 600;
+        const r = S.road;
+        if (r && S.lcOn && S.lcLane != null && (i % 600) > 420) {
+          const e = Math.abs(laneOffDir(r.w, S.lcLane, S.lcDir) - r.lat); lcMax = Math.max(lcMax, e); lcSum += e; lcN++;
+        }
+        if (!S.lcOn) lcOff++;
+        if (params.has('lcdbg') && i % 30 === 0 && r) console.log('[lcd]', (i / 30).toFixed(0), 'k', r.w.k, r.w.link ? 'link' : '', 'lanes', laneCount(r.w), 'hw', r.w.hw.toFixed(1), 'lat', r.lat.toFixed(2), 'cd', (Math.cos(S.h) * r.tx + Math.sin(S.h) * r.ty).toFixed(3), 'sig', S.signal, 'v', S.v.toFixed(1), 'on', S.lcOn, 'ln', S.lcLane, 'str', S.steer.toFixed(3));
+        if (i % 300 === 0) console.log('[lc]', (i / 30).toFixed(0) + 's', r ? (r.w.name || r.w.k) : '-', 'v', (S.v * 3.6).toFixed(0), 'on', S.lcOn, 'lane', S.lcLane, 'err', r && S.lcLane != null ? (laneOffDir(r.w, S.lcLane, S.lcDir || 1) - r.lat).toFixed(2) : '-');
+      }
       update(1 / 30); for (const f of HOOKS.update) f(1 / 30);
       if (params.has('trace') && i % 150 === 0 && S.rt) console.log('[trace]', (i / 30).toFixed(0) + 's', S.rt.w.k, S.rt.w.ref, S.rt.w.name, S.rt.w.link ? 'link' : '', 'dir', S.rt.dir, 'i', S.rt.i, '/', S.rt.w.n, 'v', (S.v * 3.6).toFixed(0),
         window.TWX ? (() => { let b = null, bd = 1e9; for (const c of TWX.cars) if (c.alive) { const d = Math.hypot(c.x - S.x, c.y - S.y); if (d < bd) { bd = d; b = c; } }
           return b ? `| nearest AI ${b.type} d=${bd.toFixed(1)} v=${(b.v * 3.6).toFixed(0)} w=${b.w.k} s=${b.s.toFixed(0)}/${b.w.s[b.w.n - 1].toFixed(0)} dir=${b.dir} dead=${b.deadEnd} plan=${b.plan ? (b.plan.none ? 'none' : b.plan.o.k) : '-'} dh=${(((b.h - S.h) * 180 / Math.PI) % 360).toFixed(0)}` : ''; })() : '');
     }
     autopilot = params.has('demo') || params.has('keep');
+    if (LCT) { keys.KeyW = keys.KeyA = keys.KeyD = keys.KeyS = false; console.log('[lc] settled err max', lcMax.toFixed(2), 'mean', (lcSum / Math.max(lcN, 1)).toFixed(2), 'off frames', lcOff, '/', n); }
     console.log('[test] simulated', params.get('t'), 's; speed', (S.v * 3.6).toFixed(0), 'km/h; lane', S.apLane,
       '; player bumps', window.TWX ? TWX.stats.bumps : '-', '; AI overlaps', window.TWX ? TWX.overlaps() : '-',
       '; AI lane changes', window.TWX ? TWX.stats.laneChanges : '-', '; player lane changes', S.apChanges || 0,
