@@ -1,4 +1,8 @@
-"""把引擎、資料、程式打包成單一檔案 台灣.html (離線可用)。"""
+"""把引擎、資料、程式打包成網頁。
+
+- 台灣.html : 單一檔案，分區資料全部內嵌 (離線、直接雙擊開都能玩)
+- index.html: GitHub Pages / 本機伺服器版，分區資料放在 tiles/，開到哪載到哪 (要先跑 scripts/tile_web.py)
+"""
 import base64
 import os
 import re
@@ -33,17 +37,12 @@ def safe(js, label):
 
 def main():
     tpl = open(os.path.join(WEB, "template.html"), encoding="utf-8").read()
-    meta = open(os.path.join(DATA, "web_meta.json"), encoding="utf-8").read().replace("</", "<\\/")
-    data = base64.b64encode(open(os.path.join(DATA, "web_data.bin"), "rb").read()).decode("ascii")
+    tiles = os.path.join(ROOT, "tiles")
+    index = open(os.path.join(tiles, "index.json"), encoding="utf-8").read().replace("</", "<\/")
     parts = {
-        "META_JSON": meta,
-        "DATA_B64": data,
         "THREE_JS": safe(three_classic(), "three.js"),
         "APP_JS": safe(open(os.path.join(WEB, "app.js"), encoding="utf-8").read(), "app.js"),
-        "CITY_META": (open(os.path.join(DATA, "city_meta.json"), encoding="utf-8").read().replace("</", "<\/")
-                      if os.path.exists(os.path.join(DATA, "city_meta.json")) else "{}"),
-        "CITY_B64": (base64.b64encode(open(os.path.join(DATA, "city.bin"), "rb").read()).decode("ascii")
-                     if os.path.exists(os.path.join(DATA, "city.bin")) else ""),
+        "TILE_INDEX": index,
         "VEHICLES_JS": safe(open(os.path.join(WEB, "vehicles.js"), encoding="utf-8").read(), "vehicles.js"),
         "HLS_JS": safe(open(os.path.join(WEB, "vendor", "hls.light.min.js"), encoding="utf-8").read(), "hls.js"),
         "FEATURES_JS": safe(open(os.path.join(WEB, "features.js"), encoding="utf-8").read(), "features.js"),
@@ -58,12 +57,20 @@ def main():
                 key = os.path.splitext(f)[0]
                 extra += f'<script id="extra-{key}" type="application/json">' + \
                     open(p, encoding="utf-8").read().replace("</", "<\\/") + "</script>\n"
-    out = tpl.replace("{{EXTRA}}", extra)
+    base = tpl.replace("{{EXTRA}}", extra)
     for k, v in parts.items():
-        out = out.replace("{{" + k + "}}", v)
-    path = os.path.join(ROOT, "台灣.html")
-    open(path, "w", encoding="utf-8").write(out)
-    print(f"wrote {path} ({len(out.encode('utf-8')) / 1e6:.2f} MB)")
+        base = base.replace("{{" + k + "}}", v)
+    inline = []
+    for kind in ("t", "d"):
+        d = os.path.join(tiles, kind)
+        for f in sorted(os.listdir(d)):
+            b64 = base64.b64encode(open(os.path.join(d, f), "rb").read()).decode("ascii")
+            inline.append(f'<script id="tile-{kind}-{f[:-4]}" type="application/octet-stream">{b64}</script>')
+    for name, tl in (("台灣.html", "\n".join(inline)), ("index.html", "")):
+        out = base.replace("{{TILES_INLINE}}", tl)
+        path = os.path.join(ROOT, name)
+        open(path, "w", encoding="utf-8").write(out)
+        print(f"wrote {path} ({len(out.encode('utf-8')) / 1e6:.2f} MB)")
 
 
 if __name__ == "__main__":

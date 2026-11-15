@@ -1,7 +1,10 @@
 # 台灣 1:1 — 國道台北段
 
 用 OpenStreetMap 路線 + 開放地形資料生成 1:1（1 單位 = 1 公尺）的國道模型，
-有 Blender 版，也有可以直接開車的單一網頁 **`台灣.html`**（不用網路也能開；電台與即時路況需要網路）。
+有 Blender 版，也有可以直接開車的網頁：
+- **`台灣.html`**：單一檔案，地圖全部內嵌，雙擊就能玩（不用網路；電台與即時路況需要網路）。
+- **`index.html`**（GitHub Pages）：地圖切成分區放在 `tiles/`，開到哪載到哪，第一次開只要下載約 1.3 MB 加上附近的分區。
+- 本機：執行 `python scripts/phone_location.py`，瀏覽器開 http://127.0.0.1:8765/ （同時提供即時路況與手機定位同步）。
 
 ## 台灣.html 操作
 | 按鍵 | 功能 |
@@ -22,7 +25,7 @@
 | L | 手機定位同步（見 [docs/phone-location.md](docs/phone-location.md)） |
 | H | 隱藏說明 |
 
-網址參數（測試用）：`?cam=1` 第一人稱、`?demo` 開啟自動駕駛、`?cars=150` AI 車輛數、`?spawn=路段,點` 指定出生點、`?api=https://.../api` 指定路況後端。
+網址參數（測試用）：`?cam=1` 第一人稱、`?demo` 開啟自動駕駛、`?cars=150` AI 車輛數、`?spawn=路段gid,點` 或 `?at=x,y` 指定出生點、`?meshr=7000` 模型載入半徑 (m)、`?api=https://.../api` 指定路況後端。
 
 ## 功能
 - **路面**：車道數取自 OSM `lanes`，每線 3.75 m；標線為內側黃實線、外側白實線、白虛線（畫 4 m 空 6 m）。
@@ -62,7 +65,9 @@
 | `scripts/build_freeway_blender.py` | 建 Blender 場景 |
 | `scripts/export_web.py` | 輸出網頁用二進位資料 |
 | `scripts/build_live.py` | 路況、CMS、門架對應到路段（`--offline` 用現有快照） |
-| `scripts/build_html.py` | 打包 `台灣.html` |
+| `scripts/tile_web.py` | 把網頁資料切成 3.84 km 分區（`tiles/index.json`、`tiles/t/` 地形、`tiles/d/` 路段 + 橋墩 + 建築） |
+| `scripts/build_html.py` | 打包 `台灣.html`（分區全部內嵌）與 `index.html`（分區另外下載） |
+| `tiles/` | 分區資料（由 `tile_web.py` 產生） |
 | `web/app.js`、`web/features.js`、`web/template.html` | 網頁原始碼 |
 
 ## 重新產生
@@ -72,8 +77,12 @@ python scripts/prep_freeway.py
 "/c/Program Files/Blender Foundation/Blender 5.2/blender.exe" --background --factory-startup --python scripts/build_freeway_blender.py
 python scripts/export_web.py
 python scripts/build_live.py
+python scripts/tile_web.py
 python scripts/build_html.py
 ```
+
+## 分區載入
+地圖以 TWD97 本地座標切成 3840 m（128 格 × 30 m）的正方形分區。每個路段、建築依中點歸屬一個分區（路段不切開，全域編號 gid 不變，live.json 照用）。遊戲在車子周圍下載資料、鄰近 8 區都到齊才建模型，遠了就丟掉模型（資料保留）。電腦版模型半徑 7 km、地形 18 km；手機版 4.2 km、9 km。
 
 ## 座標
 TWD97 TM2（EPSG:3826）減去原點 `(305500, 2769200)`，原點也存在 Blender 場景自訂屬性 `origin_twd97`。

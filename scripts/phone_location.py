@@ -19,6 +19,7 @@ iPhone:        透過 pymobiledevice3 的 developer dvt simulate-location (第�
 import argparse
 import json
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,7 @@ STATE = {"target": None, "sent": None, "sent_at": 0.0, "device": None, "error": 
 LOCK = threading.Lock()
 ARGS = None
 APPIUM = "io.appium.settings"
+SITE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 台灣資料夾 (遊戲網頁與 tiles/)
 
 # ---------------------------------------------------------------- 即時路況 / CMS 代理 (高公局沒開 CORS，瀏覽器不能直接抓)
 # 回傳格式與 Smart-Nav-Map 的 api/freeway-speed.js、api/cms.js 相同，遊戲兩邊都能用。
@@ -251,10 +253,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "data": data})
             except Exception as ex:  # noqa: BLE001
                 return self._json(502, {"ok": False, "error": "無法取得高公局資料: " + str(ex)[:150]})
-        with LOCK:
-            st = dict(STATE)
-        self._json(200, {"ok": True, "phone": ARGS.phone, "dryRun": ARGS.dry_run, "device": st["device"], "error": st["error"],
-                         "target": st["target"], "sent": st["sent"], "count": st["count"]})
+        if self.path.startswith("/status"):
+            with LOCK:
+                st = dict(STATE)
+            return self._json(200, {"ok": True, "phone": ARGS.phone, "dryRun": ARGS.dry_run, "device": st["device"], "error": st["error"],
+                                    "target": st["target"], "sent": st["sent"], "count": st["count"]})
+        self._static()
+
+    def _static(self):
+        """遊戲本體: / -> index.html (分區串流版)、/台灣.html、/tiles/... (只開放這些)"""
+        from urllib.parse import unquote, urlsplit
+        rel = unquote(urlsplit(self.path).path).lstrip("/") or "index.html"
+        full = os.path.normpath(os.path.join(SITE, rel))
+        ok = (rel in ("index.html", "台灣.html") or rel.startswith("tiles/")) and full.startswith(SITE + os.sep) and os.path.isfile(full)
+        if not ok:
+            return self._json(404, {"ok": False, "error": "not found"})
+        ctype = {".html": "text/html; charset=utf-8", ".json": "application/json; charset=utf-8"}.get(os.path.splitext(full)[1], "application/octet-stream")
+        body = open(full, "rb").read()
+        self.send_response(200)
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):  # noqa: N802
         n = int(self.headers.get("Content-Length") or 0)
@@ -309,9 +331,11 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="不連手機，只印出座標")
     ARGS = ap.parse_args()
     threading.Thread(target=worker, daemon=True).start()
+    ThreadingHTTPServer.request_queue_size = 128   # 遊戲一次會要幾十個分區
     srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     mode = "dry-run，不連手機" if ARGS.dry_run else ("Android / adb: " + ARGS.adb if ARGS.phone == "android" else "iPhone / pymobiledevice3")
     print(f"手機定位同步橋接程式已啟動: http://{ARGS.host}:{ARGS.port}  ({mode})")
+    print(f"遊戲 (分區串流版): http://127.0.0.1:{ARGS.port}/")
     print("在遊戲裡按 L 開始同步；按 Ctrl+C 結束 (會自動清除手機模擬定位)")
     try:
         srv.serve_forever()

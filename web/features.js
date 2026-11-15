@@ -29,7 +29,7 @@ const WAYMAP = LIVE.wayMap;
 let SECTIONS = LIVE.sections;
 const fmtTime = (s) => { const m = /T(\d\d:\d\d)/.exec(s || ''); return m ? m[1] : ''; };
 let trafficSource = '快照 ' + fmtTime(LIVE.updateTime);
-const wayTraffic = new Array(WAYS.length).fill(null);
+const wayTraffic = [];   // 依 w.k；分區載入時補上
 const LV_COLOR = ['#8a939b', '#2fbf5b', '#b9d63a', '#f2b632', '#f07c2a', '#e0302a'];
 const LV_NAME = ['無資料', '順暢', '車多', '車多', '壅塞', '嚴重壅塞'];
 const levelOf = (t) => {
@@ -37,14 +37,18 @@ const levelOf = (t) => {
   if (t.level) return Math.min(5, Math.max(1, t.level));
   return t.speed >= 80 ? 1 : t.speed >= 60 ? 2 : t.speed >= 40 ? 3 : t.speed >= 20 ? 4 : 5;
 };
-function recomputeTraffic() {
-  const idx = {};
-  for (const x of SECTIONS) (idx[x.road + '|' + x.dir] = idx[x.road + '|' + x.dir] || []).push(x);
-  for (let k = 0; k < WAYS.length; k++) {
+let SEC_IDX = {};
+function indexSections() {
+  SEC_IDX = {};
+  for (const x of SECTIONS) (SEC_IDX[x.road + '|' + x.dir] = SEC_IDX[x.road + '|' + x.dir] || []).push(x);
+}
+/** ks: 要重算的路段 (預設全部已載入的路段)。wayMap 以全域編號 gid 對應 */
+function recomputeTraffic(ks) {
+  for (const k of ks || WAYS.keys()) {
     wayTraffic[k] = null;
-    const mp = WAYMAP[k];
+    const mp = WAYMAP[WAYS[k].gid];
     if (!mp) continue;
-    const arr = idx[mp[0] + '|' + mp[1]] || (mp[0].indexOf('汐止五股') >= 0 ? idx['國道1號|' + mp[1]] : null);
+    const arr = SEC_IDX[mp[0] + '|' + mp[1]] || (mp[0].indexOf('汐止五股') >= 0 ? SEC_IDX['國道1號|' + mp[1]] : null);
     if (!arr) continue;
     let best = null, bd = 1e18;
     for (const x of arr) {
@@ -55,7 +59,7 @@ function recomputeTraffic() {
     if (best && bd < 1500) wayTraffic[k] = best;
   }
 }
-recomputeTraffic();
+indexSections();
 TW.HOOKS.wayColor = (w) => {
   if (w.link) return null;
   const lv = levelOf(wayTraffic[w.k]);
@@ -77,7 +81,7 @@ async function pollSpeed() {
     if (j && j.ok && j.data && Array.isArray(j.data.items)) {
       SECTIONS = j.data.items.filter((x) => ROADS.has(x.road));
       trafficSource = '即時 ' + fmtTime(j.data.updateTime) + '（' + src + '）';
-      recomputeTraffic();
+      indexSections(); recomputeTraffic();
       for (const c of cars) if (c.alive) c.v0 = desiredSpeed(c);
       wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);   // 國道路況時時更新: 最多 30 秒抓一次
     }
@@ -260,22 +264,30 @@ function choosePlan(c) {
   return { ...best, vturn: dot > 0.94 ? 99 : dot > 0.5 ? 9 : 6, turn: dot > 0.94 ? 0 : (cross > 0 ? -1 : 1) };
 }
 
-// 生成點
-const SAMPLES_FWY = [], SAMPLES_CITY = [];
-for (const w of WAYS) {
-  if (w.n < 2 || wayLen(w) < 20) continue;
-  if (w.city) { if (w.cls <= 5) for (let s = 8; s < wayLen(w) - 5; s += w.cls === 5 ? 60 : 30) { poseAt(w, s, 0); SAMPLES_CITY.push([w.k, s, POSE.x, POSE.y]); } }
-  else if (!w.link) for (let s = 10; s < wayLen(w) - 5; s += 40) { poseAt(w, s, 0); SAMPLES_FWY.push([w.k, s, POSE.x, POSE.y]); }
+// 生成點 (每個分區一組，分區載入時建立)
+const SAMPLES = new Map();   // 分區 key -> { fwy: [[k, s, x, y]], city: [...] }
+function addSamples(rec) {
+  const e = { fwy: [], city: [] };
+  for (const k of rec.ways) {
+    const w = WAYS[k];
+    if (w.n < 2 || wayLen(w) < 20) continue;
+    if (w.city) { if (w.cls <= 5) for (let s = 8; s < wayLen(w) - 5; s += w.cls === 5 ? 60 : 30) { poseAt(w, s, 0); e.city.push([w.k, s, POSE.x, POSE.y]); } }
+    else if (!w.link) for (let s = 10; s < wayLen(w) - 5; s += 40) { poseAt(w, s, 0); e.fwy.push([w.k, s, POSE.x, POSE.y]); }
+  }
+  SAMPLES.set(rec.key, e);
 }
 const typeCount = {};
 let nextId = 1;
 
 function trySpawn(c, pool, minR, maxR) {
-  const SAMP = pool === 'city' ? SAMPLES_CITY : SAMPLES_FWY;
   const cand = [];
-  for (const sm of SAMP) {
-    const d2 = (sm[2] - S.x) ** 2 + (sm[3] - S.y) ** 2;
-    if (d2 > minR * minR && d2 < maxR * maxR) cand.push(sm);
+  for (const [key] of TW.tilesNear(S.x, S.y, maxR + 2600)) {   // 路段依中點歸屬分區，最長約 5 km
+    const e = SAMPLES.get(key);
+    if (!e) continue;
+    for (const sm of (pool === 'city' ? e.city : e.fwy)) {
+      const d2 = (sm[2] - S.x) ** 2 + (sm[3] - S.y) ** 2;
+      if (d2 > minR * minR && d2 < maxR * maxR) cand.push(sm);
+    }
   }
   if (!cand.length) return false;
   for (let attempt = 0; attempt < 16; attempt++) {
@@ -711,7 +723,7 @@ function mergedGroup(tmp) {
 // ---- CMS: 接近才建模型 (LED 貼圖較大)
 const signs = LIVE.cms.map((c) => ({ ...c, pages: (c.pages || []).map((p) => ({ text: cleanText(p.text), type: String(p.type || '') })).filter((p) => p.text), model: null, page: 0 }));
 function buildSign(sg) {
-  const w = WAYS[sg.way], hw = w.hw;
+  const w = TW.wayByGid(sg.way), hw = w.hw;
   const XL = -(hw + 0.6), XR = hw + 0.9, H = 7, TH = 1.1;
   const root = new T.Group();
   const truss = trussGroup(XL, XR, H, TH);
@@ -751,7 +763,9 @@ function updateSigns(dt) {
     signClock = 0.5;
     let built = 0;
     for (const sg of signs) {
-      const w = WAYS[sg.way], x = w.P[sg.idx * 3], y = w.P[sg.idx * 3 + 1];
+      const w = TW.wayByGid(sg.way);
+      if (!w) { if (sg.model) disposeSign(sg); continue; }   // 那一區還沒載入
+      const x = w.P[sg.idx * 3], y = w.P[sg.idx * 3 + 1];
       const d = Math.hypot(x - S.x, y - S.y);
       if (!sg.model && d < 1600 && sg.pages.length && built < 3) { sg.model = buildSign(sg); built++; }
       else if (sg.model && d > 2600) disposeSign(sg);
@@ -791,7 +805,7 @@ async function pollCms() {
 
 // ---- ETC 門架: 全部建 (合併後每座 2~3 個繪製呼叫)
 function buildEtc(g) {
-  const w = WAYS[g.way], hw = w.hw;
+  const w = TW.wayByGid(g.way), hw = w.hw;
   const XL = -(hw + 0.6), XR = hw + 0.9, H = 6.4, TH = 1.0;
   const truss = trussGroup(XL, XR, H, TH);
   // 每車道一組偵測器 (天線箱 + 攝影機)
@@ -979,7 +993,7 @@ function updateTrafficHud(dt) {
   if (hudClock > 0) return;
   hudClock = 0.3;
   const w = S.road && S.road.w;
-  const t = w ? wayTraffic[w.k] : null, mp = w ? WAYMAP[w.k] : null;
+  const t = w ? wayTraffic[w.k] : null, mp = w ? WAYMAP[w.gid] : null;
   if (!t) { trafficEl.textContent = w && w.link ? '匝道 · 路況 ' + trafficSource : '路況 ' + trafficSource; trafficEl.style.borderColor = LV_COLOR[0]; return; }
   const lv = levelOf(t);
   trafficEl.innerHTML = `<b style="color:${LV_COLOR[lv]}">${t.speed > 0 ? t.speed + ' km/h · ' : ''}${LV_NAME[lv]}</b>　${DIR_NAME[mp[1]] || ''} ${t.from} → ${t.to}　<small>${trafficSource}</small>`;
@@ -1077,12 +1091,19 @@ const gpsSync = (() => {
 // ======================================================================= 掛上主程式
 TW.HOOKS.init.push(() => {
   initTraffic();
-  for (const g of LIVE.etc) buildEtc(g);
   pollSpeed(); pollCms();
   if (TW.params.get('radio') === 'auto') radio.toggle(); // 測試用
   if (TW.params.has('gpsauto')) gpsSync.toggle();      // 測試用
 });
 TW.HOOKS.update.push((dt) => { updateTraffic(dt); });
+// 分區載入: 生成點、路況、ETC 門架 (門架所在路段載入時才建)
+const ETC_BY_GID = new Map();
+for (const g of LIVE.etc) { if (!ETC_BY_GID.has(g.way)) ETC_BY_GID.set(g.way, []); ETC_BY_GID.get(g.way).push(g); }
+TW.HOOKS.tile.push((rec) => {
+  addSamples(rec);
+  recomputeTraffic(rec.ways);
+  for (const k of rec.ways) for (const g of ETC_BY_GID.get(WAYS[k].gid) || []) buildEtc(g);
+});
 TW.HOOKS.joint = (v, axle) => { stats.joints = (stats.joints || 0) + 1; sound.knock(v, axle); };
 TW.HOOKS.frame.push((dt) => { updateSigns(dt); sound.update(dt); sound.blinker(); updateTrafficHud(dt); gpsSync.frame(dt); });
 // 除錯/測試: AI 車之間互相重疊的對數

@@ -9,127 +9,138 @@ const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 const setStatus = (s) => { const el = $('loading-msg'); if (el) el.textContent = s; };
 
-// ======================================================================= 資料
-function b64buf(id) {
-  const s = $(id).textContent.trim();
-  const bin = atob(s);
+// ======================================================================= 資料 (分區載入)
+// tiles/index.json: 全域資訊；tiles/t/*.bin: 地形；tiles/d/*.bin: 路段 + 橋墩 + 建築 (scripts/tile_web.py)
+// 單檔 台灣.html 把分區內嵌成 <script id="tile-d-x_y">；GitHub Pages 版 (index.html) 用到才下載
+function b64buf(str) {
+  const bin = atob(str.trim());
   const u = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
   return u.buffer;
 }
-const META = JSON.parse($('fwy-meta').textContent);
-const BUF = b64buf('fwy-data');
-const NW = META.nways, NP = META.npts, TG = META.terrain;
-let off = 0;
-const counts = new Int32Array(BUF, off, NW); off += NW * 4;
-const PTS = new Float32Array(BUF, off, NP * 3); off += NP * 12;
-const UNDER = new Float32Array(BUF, off, NP); off += NP * 4;
-const NPIER = META.npiers || 0;
-const PIERS = new Float32Array(BUF, off, NPIER * 9); off += NPIER * 36;   // x, y, tx, ty, 左偏移, 地面, 柱頂, 帽梁左, 帽梁右
-const HZ = new Int16Array(BUF, off, TG.w * TG.h); off += TG.w * TG.h * 2;
-const EMASK = new Uint8Array(BUF, off, NP);                                 // bit0 左路緣、bit1 右路緣落在別條路面上
+const INDEX = JSON.parse($('tile-index').textContent);
+const TS = INDEX.ts, TC = INDEX.tc, TSTEP = INDEX.step, TN = TC + 3;   // 地形分區含 1 格外框
+const TGI = INDEX.terrain;                                               // 全域地形格點範圍 (J = x / 30, I = y / 30)
+const TILE_BASE = (params.get('tiles') || 'tiles/').replace(/\/?$/, '/');
+const tkey = (tx, ty) => tx + '_' + ty;
+/** 內嵌的分區直接解碼 (同步)，否則下載 (回傳 Promise) */
+function tileBuf(kind, key) {
+  const el = document.getElementById('tile-' + kind + '-' + key);
+  if (el) { const b = b64buf(el.textContent); el.remove(); return b; }
+  return limitedFetch(TILE_BASE + kind + '/' + key + '.bin');
+}
+// 同時最多 8 個下載 (一次要幾十區時，不會塞爆伺服器)
+let fetching = 0;
+const fetchQueue = [];
+function limitedFetch(url) {
+  return new Promise((resolve, reject) => {
+    const run = () => {
+      fetching++;
+      fetch(url).then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+        .then(resolve, reject).finally(() => { fetching--; if (fetchQueue.length) fetchQueue.shift()(); });
+    };
+    if (fetching < 8) run(); else fetchQueue.push(run);
+  });
+}
 
 const LANE_W = 3.75;
-const WAYS = [];
+const WAYS = [];            // 依載入順序；w.k = 索引，w.gid = 全域編號 (live.json、傳送地點用)
+const GID = new Map();
+const wayByGid = (g) => { const k = GID.get(g); return k == null ? null : WAYS[k]; };
+const ptKey = (x, y) => Math.round(x * 10) + ',' + Math.round(y * 10);
+const PT_INDEX = new Map(); // 座標 -> [[way, idx], ...]
+// 空間索引 (路段線段)
+const CELL = 40;
+const GRID = new Map();
+const cellKey = (cx, cy) => cx * 100003 + cy;
+function indexWay(w) {
+  for (let i = 0; i < w.n; i++) {
+    const key = ptKey(w.P[i * 3], w.P[i * 3 + 1]);
+    let a = PT_INDEX.get(key); if (!a) PT_INDEX.set(key, a = []); a.push([w.k, i]);
+  }
+  for (let i = 0; i < w.n - 1; i++) {
+    const ax = w.P[i * 3], ay = w.P[i * 3 + 1], bx = w.P[i * 3 + 3], by = w.P[i * 3 + 4];
+    const r = w.hw + 2;
+    const cx0 = Math.floor((Math.min(ax, bx) - r) / CELL), cx1 = Math.floor((Math.max(ax, bx) + r) / CELL);
+    const cy0 = Math.floor((Math.min(ay, by) - r) / CELL), cy1 = Math.floor((Math.max(ay, by) + r) / CELL);
+    for (let cx = cx0; cx <= cx1; cx++) for (let cy = cy0; cy <= cy1; cy++) {
+      const key = cellKey(cx, cy);
+      let a = GRID.get(key); if (!a) GRID.set(key, a = []); a.push(w.k, i);
+    }
+  }
+}
 function makeWay(w) {
   const n = w.n = w.P.length / 3;
   w.k = WAYS.length; w.hw = w.width / 2;
   if (!w.U) w.U = new Float32Array(n);
   if (!w.M) w.M = new Uint8Array(n);
-  {
-    // 左法向與累積距離
-    w.nx = new Float32Array(n); w.ny = new Float32Array(n); w.s = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const a = Math.max(i - 1, 0), b = Math.min(i + 1, n - 1);
-      const dx = w.P[b * 3] - w.P[a * 3], dy = w.P[b * 3 + 1] - w.P[a * 3 + 1];
-      const L = Math.hypot(dx, dy) || 1;
-      w.nx[i] = -dy / L; w.ny[i] = dx / L;
-      if (i > 0) {
-        const ex = w.P[i * 3] - w.P[i * 3 - 3], ey = w.P[i * 3 + 1] - w.P[i * 3 - 2], ez = w.P[i * 3 + 2] - w.P[i * 3 - 1];
-        w.s[i] = w.s[i - 1] + Math.hypot(ex, ey, ez);
-      }
+  // 左法向與累積距離
+  w.nx = new Float32Array(n); w.ny = new Float32Array(n); w.s = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = Math.max(i - 1, 0), b = Math.min(i + 1, n - 1);
+    const dx = w.P[b * 3] - w.P[a * 3], dy = w.P[b * 3 + 1] - w.P[a * 3 + 1];
+    const L = Math.hypot(dx, dy) || 1;
+    w.nx[i] = -dy / L; w.ny[i] = dx / L;
+    if (i > 0) {
+      const ex = w.P[i * 3] - w.P[i * 3 - 3], ey = w.P[i * 3 + 1] - w.P[i * 3 - 2], ez = w.P[i * 3 + 2] - w.P[i * 3 - 1];
+      w.s[i] = w.s[i - 1] + Math.hypot(ex, ey, ez);
     }
-    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
-    for (let i = 0; i < n; i++) {
-      const x = w.P[i * 3], y = w.P[i * 3 + 1];
-      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-    }
-    w.bb = [x0 - w.hw, y0 - w.hw, x1 + w.hw, y1 + w.hw];
-    WAYS.push(w);
   }
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (let i = 0; i < n; i++) {
+    const x = w.P[i * 3], y = w.P[i * 3 + 1];
+    if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  w.bb = [x0 - w.hw, y0 - w.hw, x1 + w.hw, y1 + w.hw];
+  WAYS.push(w);
+  GID.set(w.gid, w.k);
+  indexWay(w);
   return w;
 }
-{
+/** 細節分區 -> 路段 (加入 WAYS)、橋墩、建築。格式見 scripts/tile_web.py pack_detail */
+function ingestDetail(buf) {
+  const jl = new DataView(buf).getUint32(0, true);
+  const hd = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, jl)));
+  let o = 4 + jl;
+  const f32 = (n) => { const a = new Float32Array(buf, o, n); o += n * 4; return a; };
+  const i16 = (n) => { const a = new Int16Array(buf, o, n); o += n * 2; return a; };
+  const ncw = hd.cw.length;
+  const fP = f32(hd.np * 3), fU = f32(hd.np), piers = f32(hd.npier * 9), rxy0 = f32(ncw * 2);
+  const bxy0 = f32(hd.nb * 2), bbase = f32(hd.nb), bh = f32(hd.nb);
+  const roff = i16(hd.cnp * 2), rz = i16(hd.cnp), boff = i16(hd.nbv * 2);
+  const bcnt = new Uint16Array(buf, o, hd.nb); o += hd.nb * 2;
+  const emask = new Uint8Array(buf, o, hd.np); o += hd.np;   // bit0 左路緣、bit1 右路緣落在別條路面上
+  const bcol = new Uint8Array(buf, o, hd.nb);
+  const ways = [];
   let p = 0;
-  for (let k = 0; k < NW; k++) {
-    const m = META.ways[k], n = counts[k];
-    makeWay({
-      ref: m[0], name: m[1], lanes: m[2], ls: m[3], rs: m[4], width: m[5],
-      bridge: !!(m[6] & 1), tunnel: !!(m[6] & 2), link: !!(m[6] & 4), oneway: !!(m[6] & 8),
-      maxspeed: m[7], trunk: !!m[8], cls: m[8] ? 1 : 0,
-      P: PTS.subarray(p * 3, (p + n) * 3), U: UNDER.subarray(p, p + n), M: EMASK.subarray(p, p + n),
-    });
+  for (let q = 0; q < hd.fw.length; q++) {   // 國道 / 快速道路
+    const m = hd.fw[q], n = hd.fc[q];
+    ways.push(makeWay({
+      gid: m[0], ref: m[1], name: m[2], lanes: m[3], ls: m[4], rs: m[5], width: m[6],
+      bridge: !!(m[7] & 1), tunnel: !!(m[7] & 2), link: !!(m[7] & 4), oneway: !!(m[7] & 8),
+      maxspeed: m[8], trunk: !!m[9], cls: m[9] ? 1 : 0,
+      P: fP.subarray(p * 3, (p + n) * 3), U: fU.subarray(p, p + n), M: emask.subarray(p, p + n),
+    }).k);
     p += n;
   }
-}
-// ---- 一般道路 + 3D 建築 (city_web.py)
-const NFWY = WAYS.length;
-let CITY = null;
-{
-  const metaEl = $('city-meta');
-  if (metaEl && metaEl.textContent.trim().length > 2) {
-    const cm = JSON.parse(metaEl.textContent), cb = b64buf('city-data');
-    let o = 0;
-    const cc = new Int32Array(cb, o, cm.nways); o += cm.nways * 4;
-    const rxy0 = new Float32Array(cb, o, cm.nways * 2); o += cm.nways * 8;
-    const bxy0 = new Float32Array(cb, o, cm.nb * 2); o += cm.nb * 8;
-    const bbase = new Float32Array(cb, o, cm.nb); o += cm.nb * 4;
-    const bh = new Float32Array(cb, o, cm.nb); o += cm.nb * 4;
-    const roff = new Int16Array(cb, o, cm.npts * 2); o += cm.npts * 4;
-    const rz = new Int16Array(cb, o, cm.npts); o += cm.npts * 2;
-    const boff = new Int16Array(cb, o, cm.nbv * 2); o += cm.nbv * 4;
-    // 還原道路點 [x, y, z]
-    const cp = new Float32Array(cm.npts * 3);
-    for (let k = 0, v = 0; k < cm.nways; k++) for (let i = 0; i < cc[k]; i++, v++) {
-      cp[v * 3] = rxy0[k * 2] + roff[v * 2] * 0.1; cp[v * 3 + 1] = rxy0[k * 2 + 1] + roff[v * 2 + 1] * 0.1; cp[v * 3 + 2] = rz[v] * 0.1;
-    }
-    const bcnt = new Uint16Array(cb, o, cm.nb); o += cm.nb * 2;
-    const bcol = new Uint8Array(cb, o, cm.nb);
-    // 還原建築頂點 (第一點 + 0.1 m 相對座標)
-    const bxy = new Float32Array(cm.nbv * 2);
-    for (let b = 0, v = 0; b < cm.nb; b++) for (let i = 0; i < bcnt[b]; i++, v++) {
-      bxy[v * 2] = bxy0[b * 2] + boff[v * 2] * 0.1; bxy[v * 2 + 1] = bxy0[b * 2 + 1] + boff[v * 2 + 1] * 0.1;
-    }
-    CITY = { bxy, bbase, bh, bcnt, bcol, nb: cm.nb };
-    let p = 0;
-    for (let k = 0; k < cm.nways; k++) {
-      const m = cm.ways[k], n = cc[k];
-      makeWay({ ref: '', name: m[5], cls: m[0], lanes: m[1], oneway: !!m[2], width: m[3], bridge: !!m[4], tunnel: false,
-        link: m[0] === 6, ls: 0.3, rs: 0.3, maxspeed: 0, city: true, P: cp.subarray(p * 3, (p + n) * 3) });
-      p += n;
-    }
+  // 一般道路: 第一點 + 0.1 m 相對座標
+  const cp = new Float32Array(hd.cnp * 3);
+  for (let k = 0, v = 0; k < ncw; k++) for (let i = 0; i < hd.cc[k]; i++, v++) {
+    cp[v * 3] = rxy0[k * 2] + roff[v * 2] * 0.1; cp[v * 3 + 1] = rxy0[k * 2 + 1] + roff[v * 2 + 1] * 0.1; cp[v * 3 + 2] = rz[v] * 0.1;
   }
-}
-const ptKey = (x, y) => Math.round(x * 10) + ',' + Math.round(y * 10);
-const PT_INDEX = new Map(); // 座標 -> [[way, idx], ...]
-for (const w of WAYS) for (let i = 0; i < w.n; i++) {
-  const key = ptKey(w.P[i * 3], w.P[i * 3 + 1]);
-  let a = PT_INDEX.get(key); if (!a) PT_INDEX.set(key, a = []); a.push([w.k, i]);
-}
-
-// 空間索引 (路段線段)
-const CELL = 40;
-const GRID = new Map();
-const cellKey = (cx, cy) => cx * 100003 + cy;
-for (const w of WAYS) for (let i = 0; i < w.n - 1; i++) {
-  const ax = w.P[i * 3], ay = w.P[i * 3 + 1], bx = w.P[i * 3 + 3], by = w.P[i * 3 + 4];
-  const r = w.hw + 2;
-  const cx0 = Math.floor((Math.min(ax, bx) - r) / CELL), cx1 = Math.floor((Math.max(ax, bx) + r) / CELL);
-  const cy0 = Math.floor((Math.min(ay, by) - r) / CELL), cy1 = Math.floor((Math.max(ay, by) + r) / CELL);
-  for (let cx = cx0; cx <= cx1; cx++) for (let cy = cy0; cy <= cy1; cy++) {
-    const key = cellKey(cx, cy);
-    let a = GRID.get(key); if (!a) GRID.set(key, a = []); a.push(w.k, i);
+  p = 0;
+  for (let q = 0; q < ncw; q++) {
+    const m = hd.cw[q], n = hd.cc[q];
+    ways.push(makeWay({ gid: m[0], ref: '', name: m[6], cls: m[1], lanes: m[2], oneway: !!m[3], width: m[4], bridge: !!m[5], tunnel: false,
+      link: m[1] === 6, ls: 0.3, rs: 0.3, maxspeed: 0, city: true, P: cp.subarray(p * 3, (p + n) * 3) }).k);
+    p += n;
   }
+  // 建築頂點 (第一點 + 0.1 m 相對座標)
+  const bxy = new Float32Array(hd.nbv * 2);
+  for (let b = 0, v = 0; b < hd.nb; b++) for (let i = 0; i < bcnt[b]; i++, v++) {
+    bxy[v * 2] = bxy0[b * 2] + boff[v * 2] * 0.1; bxy[v * 2 + 1] = bxy0[b * 2 + 1] + boff[v * 2 + 1] * 0.1;
+  }
+  return { ways, piers, bld: hd.nb ? { bxy, bbase, bh, bcnt, bcol, nb: hd.nb } : null };
 }
 
 /** 找 (x,y) 處、高度不高於 zRef+climb 的最高路面。margin: 距路緣保留寬度 */
@@ -156,12 +167,16 @@ function roadAt(x, y, zRef, margin, climb = 1.3) {
   return best;
 }
 
+const TERR = new Map();       // 地形分區 key -> Int16Array (TN x TN, 0.1 m)
 function terrainAt(x, y) {
-  const fj = (x - TG.x0) / TG.step, fi = (y - TG.y0) / TG.step;
-  const j = Math.min(Math.max(Math.floor(fj), 0), TG.w - 2), i = Math.min(Math.max(Math.floor(fi), 0), TG.h - 2);
-  const u = fj - j, v = fi - i, W = TG.w;
-  const h = (ii, jj) => HZ[ii * W + jj] * 0.1;
-  return (1 - v) * ((1 - u) * h(i, j) + u * h(i, j + 1)) + v * ((1 - u) * h(i + 1, j) + u * h(i + 1, j + 1));
+  const J = Math.min(Math.max(x / TSTEP, TGI.J0), TGI.J0 + TGI.w - 1.001), I = Math.min(Math.max(y / TSTEP, TGI.I0), TGI.I0 + TGI.h - 1.001);
+  const j = Math.floor(J), i = Math.floor(I), u = J - j, v = I - i;
+  const tx = Math.floor(j / TC), ty = Math.floor(i / TC);
+  const a = TERR.get(tkey(tx, ty));
+  if (!a) return 0;
+  const lj = j - tx * TC + 1, li = i - ty * TC + 1;
+  const h = (ii, jj) => a[ii * TN + jj] * 0.1;
+  return (1 - v) * ((1 - u) * h(li, lj) + u * h(li, lj + 1)) + v * ((1 - u) * h(li + 1, lj) + u * h(li + 1, lj + 1));
 }
 
 // ======================================================================= 渲染器
@@ -464,32 +479,43 @@ function addJoint(x, y, tx, ty, hw, z) {
       let a = JGRID.get(k); if (!a) JGRID.set(k, a = []); a.push(j);
     }
 }
-function buildJoints(world) {
-  const steel = new GB(), rubber = new GB(), seen = new Set();
+const JSEEN = new Set();
+/** 分區的伸縮縫 (需要鄰區資料: 橋頭判斷、橋墩上方路面) -> [[x, y, z, tx, ty, hw]] */
+function computeJoints(rec) {
+  const out = [];
   const mk = (x, y, z, tx, ty, hw) => {
     const key = Math.round(x) + ',' + Math.round(y) + ',' + Math.round(z);
-    if (seen.has(key)) return;
-    seen.add(key);
+    if (JSEEN.has(key)) return;
+    JSEEN.add(key);
+    out.push([x, y, z, tx, ty, hw]);
+    addJoint(x, y, tx, ty, hw, z);
+  };
+  const A = rec.piers;
+  for (let k = 0; k < A.length / 9; k++) {   // 橋墩上方
+    const x = A[k * 9], y = A[k * 9 + 1], tx = A[k * 9 + 2], ty = A[k * 9 + 3], top = A[k * 9 + 6];
+    const r = roadAt(x, y, top + 2.5, 0, 1.0);
+    if (r && Math.abs(r.z - (top + 2.2)) < 1.5) mk(x, y, r.z, tx, ty, r.w.hw);
+  }
+  for (const k of rec.ways) {             // 橋頭 (橋接地面路段處)
+    const w = WAYS[k];
+    if (!w.bridge || w.city) continue;
+    for (const i of [0, w.n - 1]) {
+      const others = PT_INDEX.get(ptKey(w.P[i * 3], w.P[i * 3 + 1])) || [];
+      if (!others.some(([o]) => o !== w.k && !WAYS[o].bridge)) continue;
+      mk(w.P[i * 3], w.P[i * 3 + 1], w.P[i * 3 + 2], w.ny[i], -w.nx[i], w.hw);
+    }
+  }
+  return out;
+}
+function jointMeshes(list, group) {
+  const steel = new GB(), rubber = new GB();
+  for (const [x, y, z, tx, ty, hw] of list) {
     const span = hw - 0.25;
     box(steel, x + tx * 0.17, y + ty * 0.17, tx, ty, 0.12, span, z - 0.03, z + 0.012);
     box(steel, x - tx * 0.17, y - ty * 0.17, tx, ty, 0.12, span, z - 0.03, z + 0.012);
     box(rubber, x, y, tx, ty, 0.05, span, z - 0.03, z + 0.004);
-    addJoint(x, y, tx, ty, hw, z);
-  };
-  for (let k = 0; k < NPIER; k++) {   // 橋墩上方
-    const x = PIERS[k * 9], y = PIERS[k * 9 + 1], tx = PIERS[k * 9 + 2], ty = PIERS[k * 9 + 3], top = PIERS[k * 9 + 6];
-    const r = roadAt(x, y, top + 2.5, 0, 1.0);
-    if (r && Math.abs(r.z - (top + 2.2)) < 1.5) mk(x, y, r.z, tx, ty, r.w.hw);
   }
-  for (const w of WAYS) {             // 橋頭 (橋接地面路段處)
-    if (!w.bridge || w.city) continue;
-    for (const i of [0, w.n - 1]) {
-      const others = PT_INDEX.get(ptKey(w.P[i * 3], w.P[i * 3 + 1])) || [];
-      if (!others.some(([k]) => k !== w.k && !WAYS[k].bridge)) continue;
-      mk(w.P[i * 3], w.P[i * 3 + 1], w.P[i * 3 + 2], w.ny[i], -w.nx[i], w.hw);
-    }
-  }
-  for (const m of [steel.mesh(matJointSteel), rubber.mesh(matJointRubber)]) if (m) world.add(m);
+  for (const m of [steel.mesh(matJointSteel), rubber.mesh(matJointRubber)]) if (m) group.add(m);
 }
 /** 車軸從 (ax,ay) 移到 (bx,by) 時有沒有壓過伸縮縫 */
 function crossedJoint(ax, ay, bx, by, z) {
@@ -524,8 +550,8 @@ function box(g, cx, cy, tx, ty, hx, hy, z0, z1) {
 }
 
 /** 橋墩 (前處理已避開下層道路): 柱子可能往側邊偏移，帽梁延伸過去撐住橋面 */
-function addPier(g, k) {
-  const q = PIERS.subarray(k * 9, k * 9 + 9);
+function addPier(g, A, k) {
+  const q = A.subarray(k * 9, k * 9 + 9);
   const [x, y, tx, ty, offL, zg, top, capL, capR] = q;
   const nx = -ty, ny = tx;
   box(g, x + nx * offL, y + ny * offL, tx, ty, 1.0, 1.25, zg - 1.0, top - 1.4);            // 柱
@@ -533,11 +559,8 @@ function addPier(g, k) {
   box(g, x + nx * mid, y + ny * mid, tx, ty, 0.9, (capR - capL) / 2, top - 1.4, top);      // 帽梁
 }
 
-const TUNNEL_ENDS = new Set();
-for (const w of WAYS) if (w.tunnel) for (const i of [0, w.n - 1]) {
-  const shared = (PT_INDEX.get(ptKey(w.P[i * 3], w.P[i * 3 + 1])) || []).some(([k]) => k !== w.k && WAYS[k].tunnel);
-  if (!shared) TUNNEL_ENDS.add(w.k + ':' + i);
-}
+/** 隧道口: 端點沒有接另一段隧道 */
+const isTunnelEnd = (w, i) => !(PT_INDEX.get(ptKey(w.P[i * 3], w.P[i * 3 + 1])) || []).some(([k]) => k !== w.k && WAYS[k].tunnel);
 
 function addTunnel(c, w) {
   const { P, nx, ny, n, hw } = w;
@@ -553,7 +576,7 @@ function addTunnel(c, w) {
   const L = c.tlight, l0 = L.n;
   for (let i = 0; i < n; i++) for (const o of [0.25, -0.25]) L.v(P[i * 3] + nx[i] * o, P[i * 3 + 1] + ny[i] * o, P[i * 3 + 2] + H - 0.45);
   for (let i = 0; i < n - 1; i++) { const a = l0 + i * 2; L.q(a, a + 2, a + 3, a + 1); }
-  for (const i of [0, n - 1]) if (TUNNEL_ENDS.has(w.k + ':' + i)) c.portals.push([w, i]);
+  for (const i of [0, n - 1]) if (isTunnelEnd(w, i)) c.portals.push([w, i]);
 }
 
 function portalMesh(w, i) {
@@ -610,67 +633,166 @@ function addCityRoad(c, w) {
   }
 }
 
-function buildWorld() {
-  const chunks = new Map();
-  const CH = 2000;
-  for (const w of WAYS) {
-    const mi = Math.floor(w.n / 2);
-    const key = Math.floor(w.P[mi * 3] / CH) + ',' + Math.floor(w.P[mi * 3 + 1] / CH);
-    let c = chunks.get(key);
-    if (!c) chunks.set(key, c = newChunk());
-    if (w.city) addCityRoad(c, w); else addRoad(c, w);
-  }
-  for (let k = 0; k < NPIER; k++) {
-    const key = Math.floor(PIERS[k * 9] / CH) + ',' + Math.floor(PIERS[k * 9 + 1] / CH);
-    let c = chunks.get(key);
-    if (!c) chunks.set(key, c = newChunk());
-    addPier(c.pier, k);
-  }
-  const world = new T.Group();
-  for (const c of chunks.values()) {
-    for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
-                     c.barrier.mesh(matBarrier, { cast: true }), c.pier.mesh(matConcrete, { cast: true }),
-                     c.tunnel.mesh(matTunnel, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }),
-                     c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false })]) if (m) world.add(m);
-    for (const [w, i] of c.portals) world.add(portalMesh(w, i));
-  }
-  // 地形 (分塊，法向由高度場計算以免接縫)
-  const W = TG.w, H = TG.h, st = TG.step, TS = 100;
-  const hh = (i, j) => HZ[Math.min(Math.max(i, 0), H - 1) * W + Math.min(Math.max(j, 0), W - 1)] * 0.1;
-  for (let ti = 0; ti < H - 1; ti += TS) for (let tj = 0; tj < W - 1; tj += TS) {
-    const i1 = Math.min(ti + TS, H - 1), j1 = Math.min(tj + TS, W - 1);
-    const g = new GB(); g.nrm = [];
-    const cols = j1 - tj + 1;
-    for (let i = ti; i <= i1; i++) for (let j = tj; j <= j1; j++) {
-      g.v(TG.x0 + j * st, TG.y0 + i * st, hh(i, j));
-      const hx = (hh(i, j + 1) - hh(i, j - 1)) / (2 * st), hy = (hh(i + 1, j) - hh(i - 1, j)) / (2 * st);
-      const L = Math.hypot(hx, hy, 1);
-      g.nrm.push(-hx / L, 1 / L, hy / L);
-    }
-    for (let i = 0; i < i1 - ti; i++) for (let j = 0; j < j1 - tj; j++) {
-      const a = i * cols + j; g.q(a, a + 1, a + cols + 1, a + cols);
-    }
-    world.add(g.mesh(matTerrain));
-  }
-  buildJoints(world);
-  if (CITY && !params.has('nobld')) { buildBuildings(world); HOOKS.frame.push(cullBuildings); }   // nobld: 測試用，不建建築
-  scene.add(world);
+// ======================================================================= 分區串流
+// 車子附近: 先下載資料 (DATA_R)，鄰近 8 區的資料都到了才建模型 (MESH_R)，遠了丟掉模型 (資料留著，回來不用重下載)
+const MESH_R = +(params.get('meshr') || (MOBILE ? 4200 : 7000));
+const DATA_R = MESH_R + TS * 1.45;            // 模型區的鄰區一定已經有資料
+const TERR_R = +(params.get('terrr') || (MOBILE ? 9000 : 18000));
+const TILES = new Map();                       // 細節分區 key -> { key, tx, ty, state, ways, piers, bld, linked, joints, group, bldChunks }
+const TERR_REC = new Map();                    // 地形分區 key -> { state, mesh }
+let inflight = 0;
+const worldGroup = new T.Group();
+scene.add(worldGroup);
+function tileDist(tx, ty, x, y) {
+  const cx = Math.min(Math.max(x, tx * TS), (tx + 1) * TS), cy = Math.min(Math.max(y, ty * TS), (ty + 1) * TS);
+  return Math.hypot(x - cx, y - cy);
 }
+/** 半徑 R 內的分區 [[key, tx, ty, 距離]]，由近到遠 */
+function tilesNear(x, y, R) {
+  const out = [];
+  for (let tx = Math.floor((x - R) / TS); tx <= Math.floor((x + R) / TS); tx++)
+    for (let ty = Math.floor((y - R) / TS); ty <= Math.floor((y + R) / TS); ty++) {
+      const d = tileDist(tx, ty, x, y);
+      if (d <= R) out.push([tkey(tx, ty), tx, ty, d]);
+    }
+  return out.sort((a, b) => a[3] - b[3]);
+}
+function whenBuf(kind, key, onOk, onErr) {
+  let b;
+  try { b = tileBuf(kind, key); } catch (e) { onErr(e); return null; }
+  if (b instanceof ArrayBuffer) { onOk(b); return null; }
+  inflight++;
+  return b.then(onOk, onErr).finally(() => { inflight--; });
+}
+function requestDetail(key, tx, ty) {
+  if (TILES.has(key) || !INDEX.detail[key]) return null;
+  const rec = { key, tx, ty, state: 'loading', ways: [], piers: new Float32Array(0), bld: null, linked: false, joints: [], group: null, bldChunks: [] };
+  TILES.set(key, rec);
+  return whenBuf('d', key, (buf) => {
+    Object.assign(rec, ingestDetail(buf));
+    rec.state = 'data';
+    for (const f of HOOKS.tile) f(rec);
+  }, (e) => { console.warn('分區載入失敗', key, e); setTimeout(() => TILES.delete(key), 3000); });
+}
+function requestTerrain(key) {
+  if (TERR_REC.has(key) || !INDEX.tiles_t[key]) return null;
+  const rec = { state: 'loading', mesh: null };
+  TERR_REC.set(key, rec);
+  return whenBuf('t', key, (buf) => { TERR.set(key, new Int16Array(buf)); rec.state = 'data'; },
+    (e) => { console.warn('地形載入失敗', key, e); setTimeout(() => TERR_REC.delete(key), 3000); });
+}
+function neighborsReady(rec) {
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    const k = tkey(rec.tx + dx, rec.ty + dy);
+    if (!INDEX.detail[k]) continue;
+    const r = TILES.get(k);
+    if (!r || r.state !== 'data') return false;
+  }
+  return true;
+}
+function buildTile(rec) {
+  const c = newChunk(), g = new T.Group();
+  for (const k of rec.ways) { const w = WAYS[k]; if (w.city) addCityRoad(c, w); else addRoad(c, w); }
+  for (let k = 0; k < rec.piers.length / 9; k++) addPier(c.pier, rec.piers, k);
+  for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
+                   c.barrier.mesh(matBarrier, { cast: true }), c.pier.mesh(matConcrete, { cast: true }),
+                   c.tunnel.mesh(matTunnel, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }),
+                   c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false })]) if (m) g.add(m);
+  for (const [w, i] of c.portals) g.add(portalMesh(w, i));
+  jointMeshes(rec.joints, g);
+  rec.bldChunks = (rec.bld && !params.has('nobld')) ? buildBuildings(rec.bld, g) : [];   // nobld: 測試用，不建建築
+  worldGroup.add(g);
+  rec.group = g;
+}
+function disposeGroup(g) {
+  if (g.parent) g.parent.remove(g);
+  g.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+}
+/** 地形分區 (法向由含外框的高度場計算，分區之間沒有接縫) */
+function buildTerrainMesh(key, tx, ty) {
+  const a = TERR.get(key);
+  const ja = Math.max(tx * TC, TGI.J0), jb = Math.min(tx * TC + TC, TGI.J0 + TGI.w - 1);
+  const ia = Math.max(ty * TC, TGI.I0), ib = Math.min(ty * TC + TC, TGI.I0 + TGI.h - 1);
+  if (!a || jb <= ja || ib <= ia) return null;
+  const hh = (I, J) => a[(I - ty * TC + 1) * TN + (J - tx * TC + 1)] * 0.1;
+  const g = new GB(); g.nrm = [];
+  const cols = jb - ja + 1;
+  for (let I = ia; I <= ib; I++) for (let J = ja; J <= jb; J++) {
+    g.v(J * TSTEP, I * TSTEP, hh(I, J));
+    const hx = (hh(I, J + 1) - hh(I, J - 1)) / (2 * TSTEP), hy = (hh(I + 1, J) - hh(I - 1, J)) / (2 * TSTEP);
+    const L = Math.hypot(hx, hy, 1);
+    g.nrm.push(-hx / L, 1 / L, hy / L);
+  }
+  for (let i = 0; i < ib - ia; i++) for (let j = 0; j < jb - ja; j++) {
+    const q = i * cols + j; g.q(q, q + 1, q + cols + 1, q + cols);
+  }
+  return g.mesh(matTerrain);
+}
+/** opts: x,y (預設車子位置)；all: 不限同時下載數；build: 'all' 全部建 / false 不建 / 預設每次 1 區 */
+function streamTick(opts = {}) {
+  const x = opts.x != null ? opts.x : S.x, y = opts.y != null ? opts.y : S.y;
+  const proms = [];
+  const near = tilesNear(x, y, DATA_R);
+  for (const [key, tx, ty] of near) {
+    if (inflight >= 6 && !opts.all) break;
+    const pr = requestDetail(key, tx, ty); if (pr) proms.push(pr);
+  }
+  const nearT = tilesNear(x, y, TERR_R);
+  for (const [key] of nearT) {
+    if (inflight >= 8 && !opts.all) break;
+    const pr = requestTerrain(key); if (pr) proms.push(pr);
+  }
+  let budget = opts.build === 'all' ? 1e9 : opts.build === false ? 0 : 1;
+  for (const [key, , , d] of near) {
+    const rec = TILES.get(key);
+    if (!rec || rec.state !== 'data') continue;
+    if (!rec.linked && neighborsReady(rec)) { rec.joints = computeJoints(rec); rec.linked = true; }
+    if (budget > 0 && rec.linked && !rec.group && d <= MESH_R) { buildTile(rec); budget--; }
+  }
+  let tb = opts.build === 'all' ? 1e9 : opts.build === false ? 0 : 3;
+  for (const [key, tx, ty] of nearT) {
+    const r = TERR_REC.get(key);
+    if (tb > 0 && r && r.state === 'data' && !r.mesh) {
+      const m = buildTerrainMesh(key, tx, ty);
+      r.mesh = m || 'none'; if (m) worldGroup.add(m);
+      tb--;
+    }
+  }
+  // 丟掉遠處的模型
+  for (const rec of TILES.values()) if (rec.group && tileDist(rec.tx, rec.ty, x, y) > MESH_R + 1500) { disposeGroup(rec.group); rec.group = null; rec.bldChunks = []; }
+  for (const [key, r] of TERR_REC) if (r.mesh && r.mesh !== 'none') {
+    const [tx, ty] = key.split('_').map(Number);
+    if (tileDist(tx, ty, x, y) > TERR_R + 2500) { disposeGroup(r.mesh); r.mesh = null; }
+  }
+  return proms;
+}
+/** 等 (x,y) 附近的資料到齊、模型建好 (起點與傳送用) */
+async function ensureArea(x, y, msg) {
+  for (let guard = 0; guard < 10; guard++) {
+    const proms = streamTick({ x, y, all: true, build: false });
+    if (!proms.length) break;
+    if (msg) setStatus(msg);
+    await Promise.all(proms);
+  }
+  streamTick({ x, y, build: 'all' });
+}
+let streamClock = 0;
+function streamFrame(dt) { streamClock -= dt; if (streamClock > 0) return; streamClock = 0.25; streamTick(); }
 
 // ---- 3D 建築: 依 OSM 高度 / 樓層擠出；牆面 UV (沿周長 m, 高度 m, 總高) 給窗戶材質用
 const FACADE = [[0.45, 0.40, 0.32], [0.42, 0.42, 0.40], [0.55, 0.54, 0.50], [0.28, 0.19, 0.13], [0.30, 0.30, 0.29], [0.48, 0.37, 0.33], [0.25, 0.29, 0.33]];
 // 建築依距離顯示 (手機 1.6 km、電腦 4.5 km)；遠處被霧氣蓋住，不畫可以省很多效能
-const BLD_CHUNKS = [];
 let bldClock = 0;
 function cullBuildings(dt) {
   bldClock -= dt;
   if (bldClock > 0) return;
   bldClock = 0.5;
   const R = (MOBILE ? 1600 : 4500) + 700;
-  for (const ch of BLD_CHUNKS) { const vis = Math.hypot(ch.x - S.x, ch.y - S.y) < R; for (const m of ch.meshes) m.visible = vis; }
+  for (const rec of TILES.values()) for (const ch of rec.bldChunks) { const vis = Math.hypot(ch.x - S.x, ch.y - S.y) < R; for (const m of ch.meshes) m.visible = vis; }
 }
-function buildBuildings(world) {
-  const { bxy, bbase, bh, bcnt, bcol, nb } = CITY;
+function buildBuildings(bld, world) {
+  const { bxy, bbase, bh, bcnt, bcol, nb } = bld;
+  const out = [];
   const chunks = new Map(), CHB = 1000;
   let o = 0;
   for (let b = 0; b < nb; b++) {
@@ -715,8 +837,9 @@ function buildBuildings(world) {
     r.setIndex(c.rp.length / 3 > 65535 ? new T.Uint32BufferAttribute(c.ri, 1) : new T.Uint16BufferAttribute(c.ri, 1));
     r.computeVertexNormals(); r.computeBoundingSphere();
     const rm = new T.Mesh(r, matRoof); rm.castShadow = true; rm.receiveShadow = true; rm.matrixAutoUpdate = false; world.add(rm);
-    BLD_CHUNKS.push({ x: c.wp[0], y: -c.wp[2], meshes: [m, rm] });
+    out.push({ x: c.wp[0], y: -c.wp[2], meshes: [m, rm] });
   }
+  return out;
 }
 
 // ======================================================================= 精細車輛
@@ -969,7 +1092,7 @@ function nextOptions(w, node) {
     if (i < o.n - 1) res.push({ o, i, dir: 1, hx: o.ny[i], hy: -o.nx[i] });
     if (o.city && !o.oneway && i > 0) res.push({ o, i, dir: -1, hx: -o.ny[i], hy: o.nx[i] });
   }
-  return res;
+  return res.sort((a, b) => a.o.gid - b.o.gid);   // 依全域編號排序: 選路結果不受分區載入順序影響
 }
 /** 玩家自動駕駛選路: 國道優先同一條主線；一般道路直行，打方向燈就在路口轉彎 */
 function chooseNext(w, node, dir, signal) {
@@ -1077,6 +1200,17 @@ function updateRoute() {
   S.rt = { w, i, dir, t: dir > 0 ? 1 : 0, lat: 0 };
   return S.rt;
 }
+/** 自動駕駛路線上的下一段路: 距離路段終點 dist 以內才回傳 { w, dir, d } */
+function routeNext(dist) {
+  const rt = S.rt;
+  if (!rt) return null;
+  const w = rt.w, dir = rt.dir, i = rt.i;
+  const sNow = w.s[i] + (w.s[i + 1] - w.s[i]) * (rt.t || 0);
+  const d = dir > 0 ? w.s[w.n - 1] - sNow : sNow;
+  if (d > dist) return null;
+  const nx = chooseNext(w, dir > 0 ? w.n - 1 : 0, dir, S.signal || 0);
+  return nx ? { w: nx.o, dir: nx.dir, d } : null;
+}
 function lookAhead(dist) {
   const rt = S.rt;
   if (!rt) return null;
@@ -1122,6 +1256,12 @@ function update(dt) {
     if (w0 && (S.apLane == null || S.apWay !== w0.k)) {
       const lc = laneCount(w0);
       if (S.apLane == null) S.apLane = w0.city ? lc - 1 : Math.round((w0.hw - w0.ls - curLat) / LANE_W - 0.5);
+      else if (!w0.city) {
+        let b = 0, bd = 1e9;
+        for (let ln = 0; ln < lc; ln++) { const d = Math.abs(laneOffDir(w0, ln, dir) - curLat); if (d < bd) { bd = d; b = ln; } }
+        S.apLane = b;
+        if (S.apPending != null) { S.apPending = null; if (S.signalAuto) { S.signal = 0; S.signalAuto = false; } }
+      }
       S.apLane = Math.min(Math.max(S.apLane, 0), lc - 1);
       if ((vt.len > 9) && !w0.city) S.apLane = Math.max(S.apLane, lc - 2, 0);   // 大型車走外側
       S.apWay = w0.k;
@@ -1150,6 +1290,27 @@ function update(dt) {
       // 換車道
       S.apCool = (S.apCool || 0) - dt;
       const laneOkP = (ln) => ln >= 0 && ln < lc && !(vt.len > 9 && !w0.city && ln < lc - 2);
+      // 前方路段的車道對不上 (車道縮減、主線分岔): 提早往接得上的車道併，等不到空檔就減速
+      const nxt = (!w0.city && !w0.link) ? routeNext(Math.max(150, v * 8)) : null;
+      let fitsNext = () => true, must = null;
+      if (nxt && !nxt.w.city) {
+        const lcN = laneCount(nxt.w);
+        fitsNext = (ln) => {
+          const off = laneOffDir(w0, ln, dir);
+          for (let q = 0; q < lcN; q++) if (Math.abs(laneOffDir(nxt.w, q, nxt.dir) - off) < 1.2) return true;
+          return false;
+        };
+        if (!fitsNext(S.apLane)) {
+          let best = null;
+          for (let ln = 0; ln < lc; ln++) if (fitsNext(ln) && laneOkP(ln) && (best == null || Math.abs(ln - S.apLane) < Math.abs(best - S.apLane))) best = ln;
+          if (best != null) must = S.apLane + Math.sign(best - S.apLane);
+        }
+      }
+      if (must != null && S.apPending == null && Math.abs(shift) < 0.4) {
+        if (!HOOKS.laneFree || HOOKS.laneFree(dir * (laneOffDir(w0, must, dir) - curLat))) {
+          S.apPending = must; S.apSigT = 0.8; S.signal = must < S.apLane ? -1 : 1; S.signalAuto = true; S.apCool = 3;
+        } else if (nxt.d < 90) { thr = 0; brk = Math.max(brk, 0.35); }
+      }
       if (S.apPending != null) {
         S.apSigT -= dt;
         if (S.apSigT <= 0) {
@@ -1161,7 +1322,7 @@ function update(dt) {
         const blocked = ld.gap < 70 && ld.v < vtg - 2;
         const tries = blocked ? [S.apLane - 1, S.apLane + 1] : (ld.gap > 100 && Math.random() < dt * 0.1 ? [S.apLane + 1] : []);
         for (const ln of tries) {
-          if (!laneOkP(ln)) continue;
+          if (!laneOkP(ln) || !fitsNext(ln)) continue;
           if (!HOOKS.laneFree || HOOKS.laneFree(dir * (laneOffDir(w0, ln, dir) - curLat))) {
             S.apPending = ln; S.apSigT = 1.3; S.signal = ln < S.apLane ? -1 : 1; S.signalAuto = true; S.apCool = 5;
             break;
@@ -1337,7 +1498,7 @@ function toggleMenu(force) {
     list.innerHTML = ''; cars.innerHTML = '';
     for (const sp of SPAWNS) {
       const b = document.createElement('button'); b.textContent = sp.name;
-      b.onclick = () => { spawn(sp.way, sp.idx, sp.dir || 1); toggleMenu(false); };
+      b.onclick = () => { toggleMenu(false); goTo(sp); };
       list.appendChild(b);
     }
     for (const t of PLAYER_TYPES) {
@@ -1347,6 +1508,14 @@ function toggleMenu(force) {
       cars.appendChild(b);
     }
   }
+}
+
+async function goTo(sp) {
+  $('loading').classList.remove('hidden');
+  await ensureArea(sp.x, sp.y, '傳送中…');
+  const w = wayByGid(sp.gid);
+  if (w) spawn(w.k, sp.idx, sp.dir || 1);
+  $('loading').classList.add('hidden');
 }
 
 // ======================================================================= 小地圖 (左上圓形)
@@ -1366,8 +1535,12 @@ function drawMinimap() {
   // 世界座標 -> 螢幕 (車頭朝上)
   c.setTransform(DPR * sh * s, DPR * -ch * s, DPR * -ch * s, DPR * -sh * s, DPR * R, DPR * R);
   c.lineCap = 'round'; c.lineJoin = 'round';
-  const order = WAYS.filter((w) => w.bb[2] > S.x - rad && w.bb[0] < S.x + rad && w.bb[3] > S.y - rad && w.bb[1] < S.y + rad)
-    .sort((a, b) => (!!b.city - !!a.city) || (a.link - b.link) || (a.bridge - b.bridge));
+  const order = [];
+  for (const [key] of tilesNear(S.x, S.y, rad + 2600)) {
+    const rec = TILES.get(key);
+    if (rec) for (const k of rec.ways) { const w = WAYS[k]; if (w.bb[2] > S.x - rad && w.bb[0] < S.x + rad && w.bb[3] > S.y - rad && w.bb[1] < S.y + rad) order.push(w); }
+  }
+  order.sort((a, b) => (!!b.city - !!a.city) || (a.link - b.link) || (a.bridge - b.bridge));
   for (const pass of [0, 1]) for (const w of order) {
     c.beginPath();
     for (let i = 0; i < w.n; i++) { const x = w.P[i * 3] - S.x, y = w.P[i * 3 + 1] - S.y; i ? c.lineTo(x, y) : c.moveTo(x, y); }
@@ -1419,34 +1592,32 @@ window.addEventListener('resize', () => {
 });
 
 // ---- 給擴充模組 (features.js: 車流、電台、看板) 用的介面
-const HOOKS = { init: [], update: [], frame: [], minimap: [], wayColor: null };
-window.TW = { T, scene, camera, renderer, WAYS, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
-  laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: META.origin_twd97, MOBILE,
+const HOOKS = { init: [], update: [], frame: [], minimap: [], tile: [], wayColor: null };
+window.TW = { T, scene, camera, renderer, WAYS, wayByGid, TILES, TS, tilesNear, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
+  laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: INDEX.origin_twd97, MOBILE,
   get camMode() { return camMode; } };
 
-setStatus('建立國道與地形…');
-setTimeout(() => {
-  buildWorld();
-  // 起點: 國1 南下 0K (基隆端)，由 build_live.py 依 0K 的 CMS 看板位置算出；網址 ?spawn=路段,點 可覆寫
-  let sp = null;
-  try { const el = $('extra-live'); if (el) sp = JSON.parse(el.textContent).spawn; } catch (e) { sp = null; }
-  if (params.has('spawn')) sp = params.get('spawn').split(',').map(Number);
-  if (sp) spawn(sp[0], sp[1]); else defaultSpawn();
-  // 傳送選單地點
-  let live = null;
-  try { live = JSON.parse($('extra-live').textContent); } catch (e) { live = null; }
-  if (live && live.spawn) SPAWNS.push({ name: '基隆 · 國1 起點 0K（南下）', way: live.spawn[0], idx: live.spawn[1], dir: 1 });
-  if (live && live.spawnXiwu) SPAWNS.push({ name: '國1 汐五高架下（東湖→內湖）', way: live.spawnXiwu[0], idx: live.spawnXiwu[1], dir: 1 });
-  try {
-    const cm = JSON.parse($('city-meta').textContent);
-    for (const [name, kind, wi, pi, dir] of cm.spawns || []) SPAWNS.push({ name, way: kind === 'city' ? NFWY + wi : wi, idx: pi, dir });
-  } catch (e) { /* 沒有一般道路資料 */ }
+setStatus('載入地圖分區…');
+setTimeout(async () => {
+  HOOKS.frame.push(streamFrame, cullBuildings);
+  // 傳送地點 (tile_web.py 依 live.json 起點與 city_web.py SPOTS 產生，附座標)
+  for (const [name, gid, idx, dir, x, y] of INDEX.spawns || []) SPAWNS.push({ name, gid, idx, dir, x, y });
+  // 起點: 國1 南下 0K (基隆端)；網址 ?spawn=路段gid,點 或 ?at=x,y 可覆寫
+  let sp0 = SPAWNS[0] || { x: 0, y: 0 };
+  if (params.has('at')) { const [x, y] = params.get('at').split(',').map(Number); sp0 = { x, y }; }
+  await ensureArea(sp0.x, sp0.y, '載入地圖分區…');
+  const want = params.has('spawn') ? params.get('spawn').split(',').map(Number) : sp0.gid != null ? [sp0.gid, sp0.idx, sp0.dir] : null;
+  const w0 = want && wayByGid(want[0]);
+  if (w0) spawn(w0.k, want[1], want[2] || 1, params.has('lane') ? +params.get('lane') : null);   // ?lane=: 測試用
+  else if (params.has('at')) { S.x = sp0.x; S.y = sp0.y; S.z = terrainAt(sp0.x, sp0.y); respawnNearest(); }
+  else defaultSpawn();
   if (params.has('vehicle')) setVehicle(params.get('vehicle'));
   for (const f of HOOKS.init) f();
   if (params.has('t')) { // 測試用: 先跑幾秒
     autopilot = true; S.v = 25;
     const n = +params.get('t') * 30;
     for (let i = 0; i < n; i++) {
+      if (i % 15 === 0) streamTick({ build: false });   // 內嵌分區: 同步載入資料 (不建模型)
       update(1 / 30); for (const f of HOOKS.update) f(1 / 30);
       if (params.has('trace') && i % 150 === 0 && S.rt) console.log('[trace]', (i / 30).toFixed(0) + 's', S.rt.w.k, S.rt.w.ref, S.rt.w.name, S.rt.w.link ? 'link' : '', 'dir', S.rt.dir, 'i', S.rt.i, '/', S.rt.w.n, 'v', (S.v * 3.6).toFixed(0),
         window.TWX ? (() => { let b = null, bd = 1e9; for (const c of TWX.cars) if (c.alive) { const d = Math.hypot(c.x - S.x, c.y - S.y); if (d < bd) { bd = d; b = c; } }
@@ -1459,6 +1630,7 @@ setTimeout(() => {
       '; pos', S.x.toFixed(1), S.y.toFixed(1), S.z.toFixed(1), 'zVis', S.zVis, '; road', S.road ? (S.road.w.name || S.road.w.k) : null,
       '; lead', HOOKS.leader ? JSON.stringify(HOOKS.leader(0)) : '-', '; city turns', window.TWX ? TWX.stats.turns : '-', '; nan', window.TWX ? TWX.stats.nan : '-', '; joints', window.TWX ? (TWX.stats.joints || 0) : '-');
   }
+  if (params.has('t')) await ensureArea(S.x, S.y);
   syncCar(0); updateCamera(1);
   $('loading').classList.add('hidden');
   let last = performance.now(), frame = 0;
