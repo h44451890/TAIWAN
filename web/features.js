@@ -366,14 +366,18 @@ function leaderFor(me, shift) {
     const d = dx * fx + dy * fy, lat = -dx * fy + dy * fx, cs = Math.cos(o.h - me.h);
     const oCity = o.isPlayer ? !!(o.w && o.w.city) : o.pool === 'city', meCity = me.isPlayer ? !!(me.w && me.w.city) : me.pool === 'city';
     if (oCity !== meCity && Math.abs(cs) < 0.7) return;   // 不同路網的交叉 (上下穿越) 互不影響
+    // 卡住太久 (互相禮讓的死結): 不再讓斜向/橫向也卡住的車，平行同車道的前車照樣跟
+    const meStuck = (me.stuck || 0) > 6, oStuck = !o.isPlayer && ((o.stuck || 0) > 6 || o.v < 0.3);   // AI 永遠讓玩家
     if (cs >= 0.3) {
       if (d <= 0 || d > 160) return;
+      if (meStuck && oStuck && cs < 0.9 && (o.id < me.id || (me.stuck || 0) > 12)) return;
       const hw = (me.wid + o.wid) / 2 + 0.05;
       if (lat < lo - hw || lat > hi + hw) return;
       const g = d - me.front - o.rear;
       if (g < gap) { gap = g; vl = Math.max(0, o.v * cs); }
     } else if (inCity && Math.abs(cs) < 0.75 && d > 1 && d < 22 && Math.abs(lat) < 7) {
       // 路口: 橫向來車在前方，對方在動 (或編號較小) 就讓
+      if (meStuck && oStuck) return;
       if (o.v > 1.5 || o.id < me.id) { const g = d - me.front - 2; if (g < gap) { gap = g; vl = 0; } }
     }
   });
@@ -421,6 +425,7 @@ function stepCar(c, dt) {
   a = Math.max(-9, Math.min(A, a));
   c.v = Math.max(0, c.v + a * dt);
   if (gap < 0.6) c.v = Math.min(c.v, vl * 0.9);
+  c.stuck = c.v < 0.3 ? (c.stuck || 0) + dt : 0;
   let ds = c.v * dt;
   if (gap < 1e8) ds = Math.min(ds, Math.max(0, gap - 0.4));
   c.brake = a < -0.9 || (c.v < 0.8 && gap < 25);
@@ -575,8 +580,11 @@ function updateTraffic(dt) {
     let n = 0;
     for (const c of cars) {
       const d = c.alive ? Math.hypot(c.x - S.x, c.y - S.y) : 1e9;
+      const behind = c.alive && (c.x - S.x) * Math.cos(S.h) + (c.y - S.y) * Math.sin(S.h) < -25;
       const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && d > 250)) : (d > 1800 || (c.deadEnd && d > 700));
-      if (far && n++ < 4) {
+      const jam = ((c.stuck || 0) > 20 && (d > 150 || behind)) || (c.stuck || 0) > 45;   // 卡死的車: 先在看不到的地方回收，卡太久就直接回收
+      if (jam && !far) stats.unjam = (stats.unjam || 0) + 1;
+      if ((far || jam) && n++ < 4) {
         kill(c);
         if (c.pool === 'city') trySpawn(c, 'city', 280, 550); else trySpawn(c, 'fwy', 750, 1500);
       }
@@ -1119,21 +1127,62 @@ const sound = (() => {
     nodes.sqG.gain.setTargetAtTime(enabled && latAcc > 6.5 ? Math.min(0.12, (latAcc - 6.5) * 0.03) : 0, t, 0.05);
     if (gearEl) gearEl.textContent = (S.v < -0.3 ? 'R' : gear) + ' 檔 · ' + Math.round(rpm) + ' rpm';
   }
-  function knock(v, axle) {   // 伸縮縫「叩」: 低沉撞擊 + 金屬聲，車速越快越大聲
+  // 伸縮縫「喀噔」: 模態合成 — 輪胎撞擊激發車身共振 (40~600 Hz 多個衰減模態) + 輪胎拍擊 + 內裝細碎震動 + 懸吊回彈的第二下悶響。
+  // 每個輪軸壓過縫的前、後兩個邊緣各撞一次 (間隔 = 縫寬 / 車速)，左右輪差幾毫秒，每次音高、力道隨機微調，不會像機關槍。
+  let jointBufs = null;
+  function makeJointBufs() {
+    const sr = ac.sampleRate, out = [];
+    for (let variant = 0; variant < 4; variant++) {
+      const len = Math.floor(sr * 0.42), b = ac.createBuffer(1, len, sr), d = b.getChannelData(0);
+      const rnd = (a, z) => a + Math.random() * (z - a);
+      // 車身 / 底盤模態: 頻率, 衰減時間, 振幅
+      const modes = [[rnd(36, 44), 0.11, 1.0], [rnd(55, 64), 0.08, 0.75], [rnd(82, 94), 0.055, 0.55], [rnd(120, 140), 0.04, 0.4],
+        [rnd(190, 230), 0.026, 0.28], [rnd(320, 380), 0.016, 0.2], [rnd(560, 680), 0.009, 0.13], [rnd(900, 1100), 0.005, 0.07]];
+      const ph = modes.map(() => Math.random() * Math.PI * 2);
+      let lp = 0, lp2 = 0, prev = 0;
+      const rb = rnd(0.062, 0.074);   // 回彈時間
+      for (let i = 0; i < len; i++) {
+        const t = i / sr, att = Math.min(1, t / 0.0015);
+        let v = 0;
+        for (let m = 0; m < modes.length; m++) { const [f, tau, a] = modes[m]; v += a * Math.exp(-t / tau) * Math.sin(2 * Math.PI * f * t + ph[m]); }
+        // 懸吊回彈: 約 70 ms 後再一下較小的低頻悶響
+        const t2 = t - rb;
+        if (t2 > 0) v += 0.32 * Math.min(1, t2 / 0.004) * (Math.exp(-t2 / 0.09) * Math.sin(2 * Math.PI * modes[0][0] * 1.05 * t2) + 0.6 * Math.exp(-t2 / 0.05) * Math.sin(2 * Math.PI * modes[1][0] * t2));
+        // 輪胎拍擊: 低通雜訊，很短
+        const n = Math.random() * 2 - 1;
+        lp += (n - lp) * 0.16; lp2 += (lp - lp2) * 0.3;
+        v += 1.6 * lp2 * Math.exp(-t / 0.011);
+        // 內裝塑膠細碎震動: 高通雜訊，延遲一點點出現
+        const hp = n - prev; prev = n;
+        if (t > 0.004) v += 0.05 * hp * Math.exp(-(t - 0.004) / 0.025) * (0.6 + 0.4 * Math.sin(2 * Math.PI * 23 * t));
+        d[i] = v * att;
+      }
+      let pk = 0; for (let i = 0; i < len; i++) pk = Math.max(pk, Math.abs(d[i]));
+      for (let i = 0; i < len; i++) d[i] /= pk || 1;
+      out.push(b);
+    }
+    return out;
+  }
+  function knock(v, axle) {
     if (!ac || !enabled) return;
-    const t = ac.currentTime, k = Math.min(1, 0.25 + v / 28) * (axle ? 0.85 : 1);
-    const o = ac.createOscillator(), og = ac.createGain();
-    o.type = 'sine'; o.frequency.setValueAtTime(95, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.09);
-    og.gain.setValueAtTime(0.9 * k, t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
-    o.connect(og); og.connect(nodes.comp); o.start(t); o.stop(t + 0.14);
-    const s = ac.createBufferSource(); s.buffer = nodes.nb;
-    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 260; f.Q.value = 1.4;
-    const g = ac.createGain(); g.gain.setValueAtTime(0.7 * k, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
-    s.connect(f); f.connect(g); g.connect(nodes.comp); s.start(t); s.stop(t + 0.08);
-    const m = ac.createOscillator(), mg = ac.createGain();
-    m.type = 'triangle'; m.frequency.value = 1350;
-    mg.gain.setValueAtTime(0.05 * k, t); mg.gain.exponentialRampToValueAtTime(0.0005, t + 0.035);
-    m.connect(mg); mg.connect(nodes.comp); m.start(t); m.stop(t + 0.05);
+    if (!jointBufs) jointBufs = makeJointBufs();
+    const t0 = ac.currentTime + 0.002;
+    const sp = Math.max(1, v);
+    const k = Math.min(1.1, Math.pow(sp / 25, 0.8)) * (axle ? 0.78 : 1) * (0.9 + Math.random() * 0.2);
+    const out = ac.createBiquadFilter();   // 車內聽到的: 高頻被車身擋掉，車速快一點比較亮
+    out.type = 'lowpass'; out.frequency.value = Math.min(4200, 1100 + sp * 70) * (axle ? 0.8 : 1); out.Q.value = 0.5;
+    const og = ac.createGain(); og.gain.value = 0.85;
+    out.connect(og); og.connect(nodes.comp);
+    const gapT = Math.min(0.045, Math.max(0.006, 0.38 / sp));   // 縫的前後兩個邊緣
+    const lr = Math.random() * 0.004;                             // 左右輪時間差
+    const hits = [[0, 1], [lr, 0.55], [gapT, 0.7], [gapT + lr, 0.4]];
+    for (const [dt, a] of hits) {
+      const s = ac.createBufferSource();
+      s.buffer = jointBufs[(Math.random() * jointBufs.length) | 0];
+      s.playbackRate.value = (axle ? 0.92 : 1) * (0.94 + Math.random() * 0.12) * (0.9 + Math.min(0.25, sp / 140));
+      const g = ac.createGain(); g.gain.value = k * a * 0.75;
+      s.connect(g); g.connect(out); s.start(t0 + dt); s.stop(t0 + dt + 0.45);
+    }
   }
   function bump() {
     if (!ac || !enabled) return;
@@ -1156,9 +1205,10 @@ const sound = (() => {
   }
   function toggle() { enabled = !enabled; init(); }
   const gearEl = $('gear');
-  const unlock = () => { init(); if (ac.state === 'suspended') ac.resume(); };
+  const unlock = () => { init(); if (ac.state === 'suspended') ac.resume(); if (!jointBufs) jointBufs = makeJointBufs(); };
   window.addEventListener('keydown', unlock, { once: false });
   window.addEventListener('pointerdown', unlock, { once: false });
+  if (TW.params.has('audiotest')) { unlock(); setTimeout(() => { let err = null; try { for (let i = 0; i < 6; i++) knock(10 + i * 5, i & 1); } catch (e) { err = String(e); } console.log('[audiotest] knock ok', !err, err || '', 'bufs', jointBufs ? jointBufs.length : 0, 'state', ac.state); }, 500); }
   return { update, bump, knock, blinker, toggle, get on() { return enabled; } };
 })();
 
@@ -1273,6 +1323,162 @@ const gpsSync = (() => {
   document.addEventListener('visibilitychange', () => { for (const el of pad.querySelectorAll('[data-key]')) { el.classList.remove('on'); send('keyup', el.dataset.key); } });
 })();
 
+// ======================================================================= 操控設定: 按鈕 / 螢幕方向盤 / 重力感應 / 實體方向盤・搖桿
+const controls = (() => {
+  const DEF = { mode: TW.MOBILE ? 'buttons' : 'keys', sens: 1, lock: 180, size: 1, side: 'left', center: true, tiltMax: 35, pad: true, padInv: false, dead: 0.06 };
+  let C = { ...DEF };
+  try { Object.assign(C, JSON.parse(localStorage.getItem('tw_ctrl') || '{}')); } catch (_) {}
+  const testMode = TW.params.get('steer');   // 測試用: ?steer=wheel (不存檔)
+  if (testMode) C.mode = testMode;
+  const save = () => { if (testMode) return; try { localStorage.setItem('tw_ctrl', JSON.stringify(C)); } catch (_) {} };
+  let rot = 0, dragging = false, lastAng = 0, tiltZero = 0, tiltVal = null, padAxis = 0, padThr = 0, padBrk = 0, padSeen = false;
+
+  // ---- 螢幕方向盤
+  const css = document.createElement('style');
+  css.textContent = `
+  #wheel { position: fixed; bottom: calc(18px + env(safe-area-inset-bottom)); z-index: 4; touch-action: none; user-select: none; -webkit-user-select: none; cursor: grab; }
+  #wheel svg { width: 100%; height: 100%; display: block; filter: drop-shadow(0 4px 10px rgba(0,0,0,.45)); }
+  #wheel.hidden { display: none; }
+  #ctrl-panel .row2 { display: flex; align-items: center; gap: 10px; margin: 6px 0; font-size: 14px; }
+  #ctrl-panel .row2 label { width: 120px; flex: none; opacity: .85; }
+  #ctrl-panel .row2 input[type=range] { flex: 1; }
+  #ctrl-panel .row2 output { width: 56px; text-align: right; font-variant-numeric: tabular-nums; }
+  #ctrl-panel .seg { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  #ctrl-panel .seg button { flex: 1 1 110px; text-align: center; }
+  body.wheel-right #t-gas { right: auto; left: calc(22px + env(safe-area-inset-left)); }
+  body.wheel-right #t-brake { right: auto; left: calc(140px + env(safe-area-inset-left)); }
+  #ctrl-panel .hint { font-size: 12px; opacity: .65; margin: 2px 0 10px; }`;
+  document.head.appendChild(css);
+  const wheel = document.createElement('div');
+  wheel.id = 'wheel'; wheel.className = 'hidden';
+  wheel.innerHTML = `<svg viewBox="-100 -100 200 200">
+    <circle r="88" fill="none" stroke="rgba(20,22,26,.85)" stroke-width="20"/>
+    <circle r="88" fill="none" stroke="rgba(255,255,255,.35)" stroke-width="2"/>
+    <circle r="98" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="1.5"/>
+    <g fill="rgba(26,28,33,.9)" stroke="rgba(255,255,255,.3)" stroke-width="1.5">
+      <path d="M-80 8 L-26 14 L-22 30 L-70 44 Z"/><path d="M80 8 L26 14 L22 30 L70 44 Z"/><path d="M-14 26 L14 26 L10 80 L-10 80 Z"/>
+    </g>
+    <circle r="30" fill="rgba(30,33,40,.95)" stroke="rgba(255,255,255,.4)" stroke-width="2"/>
+    <rect x="-5" y="-98" width="10" height="20" rx="3" fill="#e63b2e"/>
+    <text y="7" text-anchor="middle" font-size="16" fill="rgba(255,255,255,.75)" font-family="sans-serif">TW</text>
+  </svg>`;
+  document.body.appendChild(wheel);
+  const angAt = (e) => { const r = wheel.getBoundingClientRect(); return Math.atan2(e.clientY - (r.top + r.height / 2), e.clientX - (r.left + r.width / 2)) * 180 / Math.PI; };
+  wheel.addEventListener('pointerdown', (e) => { e.preventDefault(); try { wheel.setPointerCapture(e.pointerId); } catch (_) {} dragging = true; lastAng = angAt(e); wheel.style.cursor = 'grabbing'; });
+  wheel.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const a = angAt(e); let d = a - lastAng; if (d > 180) d -= 360; if (d < -180) d += 360;
+    lastAng = a; rot = Math.max(-C.lock, Math.min(C.lock, rot + d));
+  });
+  const release = () => { dragging = false; wheel.style.cursor = 'grab'; };
+  wheel.addEventListener('pointerup', release); wheel.addEventListener('pointercancel', release); wheel.addEventListener('lostpointercapture', release);
+
+  // ---- 重力感應 (橫拿手機: 左右傾斜)
+  function onTilt(e) {
+    const ang = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+    let t = ang === 90 ? e.beta : ang === -90 || ang === 270 ? -e.beta : e.gamma;
+    if (t == null) return;
+    tiltVal = t;
+  }
+  async function enableTilt() {
+    try { if (window.DeviceOrientationEvent && DeviceOrientationEvent.requestPermission) { const r = await DeviceOrientationEvent.requestPermission(); if (r !== 'granted') return false; } } catch (_) { return false; }
+    window.addEventListener('deviceorientation', onTilt);
+    return true;
+  }
+
+  // ---- 套用設定: 顯示 / 隱藏方向盤與按鈕
+  function apply() {
+    const sz = Math.round((TW.MOBILE ? 150 : 190) * C.size);
+    wheel.style.width = wheel.style.height = sz + 'px';
+    wheel.style.left = C.side === 'left' ? 'calc(18px + env(safe-area-inset-left))' : '';
+    wheel.style.right = C.side === 'right' ? 'calc(18px + env(safe-area-inset-right))' : '';
+    wheel.classList.toggle('hidden', C.mode !== 'wheel');
+    for (const id of ['t-left', 't-right']) { const el = $(id); if (el) el.style.display = C.mode === 'buttons' || C.mode === 'keys' ? '' : 'none'; }
+    document.body.classList.toggle('wheel-right', C.mode === 'wheel' && C.side === 'right');   // 方向盤在右邊時，油門煞車移到左邊
+    if (C.mode === 'tilt') enableTilt();
+    if (!TW.MOBILE && C.mode === 'wheel' && $('help')) $('help').classList.add('hidden');   // 電腦版方向盤在左下，說明先收起 (H 可再打開)
+    save();
+  }
+
+  // ---- 每格: 算出類比轉向 (-1 右 .. 1 左)，交給主程式
+  function frame(dt) {
+    let axis = null;
+    if (C.mode === 'wheel') {
+      if (!dragging && C.center) rot *= Math.exp(-dt * 7);
+      if (Math.abs(rot) < 0.3 && !dragging) rot = 0;
+      wheel.firstElementChild.style.transform = `rotate(${rot}deg)`;
+      axis = -rot / C.lock * C.sens;
+    } else if (C.mode === 'tilt' && tiltVal != null) {
+      const t = tiltVal - tiltZero, td = Math.abs(t) < 3 ? 0 : t - Math.sign(t) * 3;   // 3° 死區，拿手機的小晃動不算
+      axis = -td / Math.max(5, C.tiltMax - 3) * C.sens;
+    }
+    // 實體方向盤 / 搖桿 (Gamepad API)
+    padThr = padBrk = 0;
+    if (C.pad && navigator.getGamepads) {
+      for (const gp of navigator.getGamepads()) {
+        if (!gp || !gp.connected) continue;
+        const x = gp.axes[0] || 0;
+        const ax = Math.abs(x) < C.dead ? 0 : (x - Math.sign(x) * C.dead) / (1 - C.dead);
+        padThr = gp.buttons[7] ? gp.buttons[7].value : 0; padBrk = gp.buttons[6] ? gp.buttons[6].value : 0;
+        if (ax || padThr > 0.02 || padBrk > 0.02) padSeen = true;
+        if (padSeen) { padAxis = (C.padInv ? ax : -ax) * C.sens; if (axis == null || Math.abs(padAxis) > Math.abs(axis)) axis = padAxis; }
+        break;
+      }
+    }
+    S.steerAxis = axis == null ? null : Math.max(-1, Math.min(1, axis));
+    S.padThr = padThr; S.padBrk = padBrk;
+  }
+
+  // ---- 選單: 操控設定
+  function buildPanel() {
+    const menu = $('menu'); if (!menu || $('ctrl-panel')) return;
+    const p = document.createElement('div'); p.id = 'ctrl-panel';
+    const modes = TW.MOBILE ? [['buttons', '◀ ▶ 按鈕'], ['wheel', '🛞 方向盤'], ['tilt', '📱 重力感應']] : [['keys', '⌨️ 鍵盤'], ['wheel', '🛞 螢幕方向盤']];
+    p.innerHTML = `<h2>操控設定</h2><div class="seg" id="ctrl-mode">${modes.map(([k, n]) => `<button data-m="${k}">${n}</button>`).join('')}</div>
+      <div class="row2"><label>轉向靈敏度</label><input type="range" id="ctrl-sens" min="0.4" max="2.5" step="0.05"><output id="ctrl-sens-o"></output></div>
+      <div class="row2" data-for="wheel"><label>方向盤打到底</label><input type="range" id="ctrl-lock" min="60" max="540" step="10"><output id="ctrl-lock-o"></output></div>
+      <div class="row2" data-for="wheel"><label>方向盤大小</label><input type="range" id="ctrl-size" min="0.6" max="1.6" step="0.05"><output id="ctrl-size-o"></output></div>
+      <div class="seg" data-for="wheel"><button id="ctrl-side">方向盤位置</button><button id="ctrl-center">放開自動回正</button></div>
+      <div class="row2" data-for="tilt"><label>傾斜打到底</label><input type="range" id="ctrl-tilt" min="15" max="70" step="1"><output id="ctrl-tilt-o"></output></div>
+      <div class="seg" data-for="tilt"><button id="ctrl-zero">以目前角度為正中 (校正)</button></div>
+      <div class="seg"><button id="ctrl-pad">實體方向盤 / 搖桿</button><button id="ctrl-padinv">搖桿方向反轉</button></div>
+      <div class="hint">實體方向盤或搖桿：插上後轉一下就會偵測到；X 軸轉向、RT 油門、LT 煞車。設定會記在這台裝置。</div>`;
+    menu.appendChild(p);
+    const sync = () => {
+      for (const b of p.querySelectorAll('#ctrl-mode button')) b.classList.toggle('on', b.dataset.m === C.mode);
+      for (const el of p.querySelectorAll('[data-for]')) el.style.display = el.dataset.for === C.mode ? '' : 'none';
+      $('ctrl-sens').value = C.sens; $('ctrl-sens-o').textContent = '×' + (+C.sens).toFixed(2);
+      $('ctrl-lock').value = C.lock; $('ctrl-lock-o').textContent = '±' + C.lock + '°';
+      $('ctrl-size').value = C.size; $('ctrl-size-o').textContent = Math.round(C.size * 100) + '%';
+      $('ctrl-tilt').value = C.tiltMax; $('ctrl-tilt-o').textContent = C.tiltMax + '°';
+      $('ctrl-side').textContent = '方向盤位置：' + (C.side === 'left' ? '左邊' : '右邊');
+      $('ctrl-center').textContent = '放開自動回正：' + (C.center ? '開' : '關'); $('ctrl-center').classList.toggle('on', C.center);
+      $('ctrl-pad').textContent = '實體方向盤 / 搖桿：' + (C.pad ? '開' : '關'); $('ctrl-pad').classList.toggle('on', C.pad);
+      $('ctrl-padinv').classList.toggle('on', C.padInv);
+      apply();
+    };
+    for (const b of p.querySelectorAll('#ctrl-mode button')) b.onclick = () => { C.mode = b.dataset.m; rot = 0; sync(); };
+    const slider = (id, key) => { $(id).oninput = (e) => { C[key] = +e.target.value; sync(); }; };
+    slider('ctrl-sens', 'sens'); slider('ctrl-lock', 'lock'); slider('ctrl-size', 'size'); slider('ctrl-tilt', 'tiltMax');
+    $('ctrl-side').onclick = () => { C.side = C.side === 'left' ? 'right' : 'left'; sync(); };
+    $('ctrl-center').onclick = () => { C.center = !C.center; sync(); };
+    $('ctrl-zero').onclick = () => { if (tiltVal != null) tiltZero = tiltVal; };
+    $('ctrl-pad').onclick = () => { C.pad = !C.pad; sync(); };
+    $('ctrl-padinv').onclick = () => { C.padInv = !C.padInv; sync(); };
+    sync();
+  }
+  buildPanel(); apply();
+  if (TW.params.has('wheeltest')) setTimeout(() => {   // 測試: 模擬手指把方向盤順時針轉 90°
+    const r = wheel.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2, R = r.width * 0.42;
+    const ev = (type, a) => wheel.dispatchEvent(new PointerEvent(type, { pointerId: 7, bubbles: true, clientX: cx + Math.cos(a) * R, clientY: cy + Math.sin(a) * R }));
+    ev('pointerdown', -Math.PI / 2);
+    for (let k = 1; k <= 9; k++) ev('pointermove', -Math.PI / 2 + k * Math.PI / 18);
+    setTimeout(() => { for (let k = 0; k < 30; k++) frame(1 / 60); console.log('[wheeltest] held rot', rot.toFixed(1), 'axis', S.steerAxis && S.steerAxis.toFixed(3), 'steer', S.steer.toFixed(3), 'h', S.h.toFixed(3));
+      ev('pointerup', 0); setTimeout(() => { for (let k = 0; k < 60; k++) frame(1 / 60); console.log('[wheeltest] released rot', rot.toFixed(1), 'axis', S.steerAxis, 'steer', S.steer.toFixed(3)); }, 1500); }, 1000);
+  }, 1500);
+  return { frame, get settings() { return C; } };
+})();
+
 // ======================================================================= 掛上主程式
 TW.HOOKS.init.push(() => {
   initTraffic();
@@ -1280,7 +1486,7 @@ TW.HOOKS.init.push(() => {
   if (TW.params.get('radio') === 'auto') radio.toggle(); // 測試用
   if (TW.params.has('gpsauto')) gpsSync.toggle();      // 測試用
 });
-TW.HOOKS.update.push((dt) => { updateTraffic(dt); });
+TW.HOOKS.update.push((dt) => { controls.frame(dt); }, (dt) => { PLAYER.stuck = Math.abs(S.v) < 0.3 ? (PLAYER.stuck || 0) + dt : 0; updateTraffic(dt); });
 // 分區載入: 生成點、路況、ETC 門架 (門架所在路段載入時才建)
 const ETC_BY_GID = new Map();
 for (const g of LIVE.etc) { if (!ETC_BY_GID.has(g.way)) ETC_BY_GID.set(g.way, []); ETC_BY_GID.get(g.way).push(g); }
@@ -1303,5 +1509,5 @@ function overlaps() {
   }
   return n;
 }
-window.TWX = { cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync };
+window.TWX = { cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync, controls };
 })();

@@ -816,6 +816,121 @@ function streamTick(opts = {}) {
   return proms;
 }
 /** 等 (x,y) 附近的資料到齊、模型建好 (起點與傳送用) */
+/** 穿模掃描 (?clipscan): 載入全部分區後檢查路口高低差、地形冒出路面、建築壓路、橋墩插路、立體交叉淨空 */
+async function clipScan() {
+  const proms = [];
+  for (const key of Object.keys(INDEX.detail)) { const [tx, ty] = key.split('_').map(Number); const p = requestDetail(key, tx, ty); if (p) proms.push(p); }
+  for (const key of Object.keys(INDEX.tiles_t)) { const p = requestTerrain(key); if (p) proms.push(p); }
+  await Promise.all(proms);
+  const t0 = performance.now();
+  const meshZ = (x, y) => {   // 與 buildTerrainMesh 相同的三角形
+    const J = x / TSTEP, I = y / TSTEP, j = Math.floor(J), i = Math.floor(I), u = J - j, v = I - i;
+    if (j < TGI.J0 || j >= TGI.J0 + TGI.w - 1 || i < TGI.I0 || i >= TGI.I0 + TGI.h - 1) return -1e9;   // 地形網格外不畫地形
+    const h = (ii, jj) => { const tx = Math.floor(jj / TC), ty = Math.floor(ii / TC), a = TERR.get(tkey(tx, ty)); return a ? a[(ii - ty * TC + 1) * TN + (jj - tx * TC + 1)] * 0.1 : -1e9; };
+    const h00 = h(i, j), h10 = h(i, j + 1), h11 = h(i + 1, j + 1), h01 = h(i + 1, j);
+    return u >= v ? h00 + u * (h10 - h00) + v * (h11 - h10) : h00 + v * (h01 - h00) + u * (h11 - h01);
+  };
+  const nm = (w) => (w.city ? '' : '[' + (w.ref || 'fwy') + ']') + (w.name || '?') + '#' + w.gid;
+  const spots = (list, cell = 60) => { const m = new Map(); for (const s of list) { const k = Math.floor(s.x / cell) + ',' + Math.floor(s.y / cell); const o = m.get(k); if (!o || s.d > o.d) m.set(k, s); } return [...m.values()].sort((a, b) => b.d - a.d); };
+  const out = {};
+  // A. 路口高低差
+  const A = [];
+  for (const arr of PT_INDEX.values()) {
+    if (arr.length < 2) continue;
+    let lo = 1e9, hi = -1e9, wl = null, wh = null;
+    for (const [k, i] of arr) { const w = WAYS[k], z = w.P[i * 3 + 2]; if (z < lo) { lo = z; wl = w; } if (z > hi) { hi = z; wh = w; } }
+    if (hi - lo > 0.4 && wl !== wh) { const [k, i] = arr[0]; A.push({ x: WAYS[k].P[i * 3], y: WAYS[k].P[i * 3 + 1], d: hi - lo, a: nm(wl), b: nm(wh) }); }
+  }
+  out.junctionStep = A;
+  // B. 地形冒出路面 (隧道除外)
+  const B = [];
+  for (const w of WAYS) {
+    if (w.tunnel) continue;
+    const P = w.P, e = Math.max(0.3, w.hw - 0.3);
+    for (let i = 0; i < w.n - 1; i++) {
+      const ax = P[i * 3], ay = P[i * 3 + 1], az = P[i * 3 + 2], bx = P[i * 3 + 3], by = P[i * 3 + 4], bz = P[i * 3 + 5];
+      const L = Math.hypot(bx - ax, by - ay); if (L < 0.01) continue;
+      const nx = -(by - ay) / L, ny = (bx - ax) / L, steps = Math.max(1, Math.ceil(L / 5));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps, x = ax + (bx - ax) * t, y = ay + (by - ay) * t, z = az + (bz - az) * t;
+        for (const o of [-e, 0, e]) { const d = meshZ(x + nx * o, y + ny * o) - z; if (d > 0.1) B.push({ x: x + nx * o, y: y + ny * o, d, a: nm(w), br: w.bridge }); }
+      }
+    }
+  }
+  out.terrainOverRoad = B;
+  const segNear = (x, y, fn) => { const a = GRID.get(cellKey(Math.floor(x / CELL), Math.floor(y / CELL))); if (!a) return; for (let q = 0; q < a.length; q += 2) fn(WAYS[a[q]], a[q + 1]); };
+  const onSeg = (w, i, x, y) => {
+    const P = w.P, ax = P[i * 3], ay = P[i * 3 + 1], dx = P[i * 3 + 3] - ax, dy = P[i * 3 + 4] - ay, L2 = dx * dx + dy * dy; if (L2 < 1e-4) return null;
+    const t = ((x - ax) * dx + (y - ay) * dy) / L2; if (t < 0 || t > 1) return null;
+    const lat = ((x - ax) * -dy + (y - ay) * dx) / Math.sqrt(L2);
+    return { z: P[i * 3 + 2] + (P[i * 3 + 5] - P[i * 3 + 2]) * t, lat };
+  };
+  // C. 建築壓在路上
+  const BG = new Map(), C = [];
+  for (const rec of TILES.values()) {
+    const b = rec.bld; if (!b) continue;
+    for (let k = 0, v = 0; k < b.nb; k++) {
+      const n = b.bcnt[k]; let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (let q = 0; q < n; q++) { const x = b.bxy[(v + q) * 2], y = b.bxy[(v + q) * 2 + 1]; x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+      const ent = { b, v, n, base: b.bbase[k], h: b.bh[k] };
+      for (let cx = Math.floor(x0 / 50); cx <= Math.floor(x1 / 50); cx++) for (let cy = Math.floor(y0 / 50); cy <= Math.floor(y1 / 50); cy++) { const kk = cx + ',' + cy; let a = BG.get(kk); if (!a) BG.set(kk, a = []); a.push(ent); }
+      v += n;
+    }
+  }
+  const inPoly = (e, x, y) => { let c = false; const A2 = e.b.bxy; for (let i = 0, j = e.n - 1; i < e.n; j = i++) { const xi = A2[(e.v + i) * 2], yi = A2[(e.v + i) * 2 + 1], xj = A2[(e.v + j) * 2], yj = A2[(e.v + j) * 2 + 1]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; };
+  for (const w of WAYS) {
+    if (w.tunnel) continue;
+    const P = w.P, e = Math.max(0.3, w.hw - 0.5);
+    for (let i = 0; i < w.n - 1; i++) {
+      const ax = P[i * 3], ay = P[i * 3 + 1], az = P[i * 3 + 2], bx = P[i * 3 + 3], by = P[i * 3 + 4], bz = P[i * 3 + 5];
+      const L = Math.hypot(bx - ax, by - ay); if (L < 0.01) continue;
+      const nx = -(by - ay) / L, ny = (bx - ax) / L, steps = Math.max(1, Math.ceil(L / 4));
+      for (let s = 0; s <= steps; s++) {
+        const t = s / steps, z = az + (bz - az) * t;
+        for (const o of [-e, 0, e]) {
+          const x = ax + (bx - ax) * t + nx * o, y = ay + (by - ay) * t + ny * o;
+          for (const en of BG.get(Math.floor(x / 50) + ',' + Math.floor(y / 50)) || []) if (z > en.base - 1 && z < en.base + en.h - 0.5 && inPoly(en, x, y)) { C.push({ x, y, d: 1, a: nm(w), c: o === 0 }); break; }
+        }
+      }
+    }
+  }
+  out.buildingOnRoad = C;
+  // D. 橋墩插在路上
+  const D = [];
+  for (const rec of TILES.values()) {
+    const A3 = rec.piers;
+    for (let k = 0; k < A3.length / 9; k++) {
+      const [x, y, tx, ty, offL, zg, top] = A3.subarray(k * 9, k * 9 + 7);
+      const px = x - ty * offL, py = y + tx * offL;
+      segNear(px, py, (w, i) => { const r = onSeg(w, i, px, py); if (r && Math.abs(r.lat) < w.hw + 0.6 && r.z > zg + 0.3 && r.z < top - 1.6) D.push({ x: px, y: py, d: w.hw + 0.6 - Math.abs(r.lat), a: nm(w) }); });
+    }
+  }
+  out.pierOnRoad = D;
+  // E. 立體交叉淨空 (下層路面到上層路面 0.6 ~ 4.6 m)
+  const E = [];
+  for (const w of WAYS) {
+    const P = w.P;
+    for (let i = 0; i < w.n; i++) {
+      const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
+      segNear(x, y, (o, j) => { if (o === w) return; const r = onSeg(o, j, x, y); if (!r || Math.abs(r.lat) > o.hw) return; const dz = r.z - z; if (dz > 0.6 && dz < 4.6 && !(o.city && w.city && dz < 1.2)) E.push({ x, y, d: 4.6 - dz, a: nm(w), b: nm(o) }); });
+    }
+  }
+  out.clearance = E;
+  const ms = performance.now() - t0;
+  console.log('[clipscan] ways', WAYS.length, 'tiles', TILES.size, 'ms', ms.toFixed(0));
+  for (const [k, list] of Object.entries(out)) {
+    const sp = spots(list);
+    console.log('[clipscan] ' + k + ' ' + JSON.stringify({ samples: list.length, spots: sp.length, top: sp.slice(0, 12).map((s) => [Math.round(s.x), Math.round(s.y), +s.d.toFixed(2), s.a, s.b || (s.br ? 'bridge' : '')]) }));
+  }
+  const hist = (list, edges, f = (q) => q.d) => edges.map((e, k) => list.filter((q) => f(q) >= e && (k === edges.length - 1 || f(q) < edges[k + 1])).length);
+  console.log('[clipscan] hist junction 0.4/1/3/6/20', JSON.stringify(hist(A, [0.4, 1, 3, 6])));
+  const Bf = B.filter((q) => !q.a.startsWith('[')), Bw = B.filter((q) => q.a.startsWith('['));
+  console.log('[clipscan] hist terrain city 0.1/0.3/1/3', JSON.stringify(hist(Bf, [0.1, 0.3, 1, 3])), 'spots', spots(Bf.filter((q) => q.d > 0.3)).length, 'fwy', JSON.stringify(hist(Bw, [0.1, 0.3, 1, 3])), 'spots', spots(Bw.filter((q) => q.d > 0.3)).length, 'bridge', B.filter((q) => q.br).length);
+  console.log('[clipscan] terrain fwy top ' + JSON.stringify(spots(Bw.filter((q) => q.d > 0.3)).slice(0, 10).map((s) => [Math.round(s.x), Math.round(s.y), +s.d.toFixed(2), s.a, s.br ? 'br' : ''])));
+  console.log('[clipscan] terrain city top ' + JSON.stringify(spots(Bf.filter((q) => q.d > 0.3)).slice(0, 10).map((s) => [Math.round(s.x), Math.round(s.y), +s.d.toFixed(2), s.a, s.br ? 'br' : ''])));
+  console.log('[clipscan] building center hits', C.filter((q) => q.c).length, 'spots', spots(C.filter((q) => q.c)).length);
+  window.CLIP = out;
+}
 async function ensureArea(x, y, msg) {
   for (let guard = 0; guard < 10; guard++) {
     const proms = streamTick({ x, y, all: true, build: false });
@@ -1138,6 +1253,7 @@ function nextOptions(w, node) {
   for (const [k, i] of PT_INDEX.get(ptKey(w.P[node * 3], w.P[node * 3 + 1])) || []) {
     if (k === w.k) continue;
     const o = WAYS[k];
+    if (Math.abs(o.P[i * 3 + 2] - w.P[node * 3 + 2]) > 2.5) continue;   // 不同樓層剛好重疊，不相連
     if (i < o.n - 1) res.push({ o, i, dir: 1, hx: o.ny[i], hy: -o.nx[i] });
     if (o.city && !o.oneway && i > 0) res.push({ o, i, dir: -1, hx: -o.ny[i], hy: o.nx[i] });
   }
@@ -1235,7 +1351,16 @@ function updateRoute() {
     if (i < 0 || i > w.n - 2) {
       const node = dir > 0 ? w.n - 1 : 0;
       const nx = chooseNext(w, node, dir, S.signal || 0);
-      if (!nx) { i = Math.min(Math.max(i, 0), w.n - 2); break; }
+      if (!nx) {
+        // 路線走到死路，但車子其實已經開上別的路段 (路網沒接好的地方): 從目前所在路段重新接路線
+        const r = S.road;
+        if (r && r.w !== w && guard < 40) {
+          w = r.w; i = r.i;
+          dir = (w.city && !w.oneway && Math.cos(S.h) * r.tx + Math.sin(S.h) * r.ty < 0) ? -1 : 1;
+          continue;
+        }
+        i = Math.min(Math.max(i, 0), w.n - 2); break;
+      }
       w = nx.o; dir = nx.dir; i = dir > 0 ? nx.i : nx.i - 1;
       if (S.signal && !S.signalAuto) { S.signal = 0; S.sigArmed = false; }   // 轉完彎熄燈
       continue;
@@ -1247,6 +1372,13 @@ function updateRoute() {
     const L = Math.hypot(dx, dy) || 1;
     const lat = ((S.x - ax) * -dy + (S.y - ay) * dx) / L;
     if (Math.abs(lat) > w.hw + 6) { S.rt = null; return null; }
+    // 車子沒照路線走 (轉彎轉不過去開進旁邊的路): 從車子所在的路段重接路線
+    const rr = S.road;
+    if (Math.abs(lat) > w.hw + 1.5 && rr && rr.w !== w && guard < 40 && Math.abs(Math.cos(S.h) * rr.tx + Math.sin(S.h) * rr.ty) > 0.9) {
+      w = rr.w; i = rr.i;
+      dir = (w.city && !w.oneway && Math.cos(S.h) * rr.tx + Math.sin(S.h) * rr.ty < 0) ? -1 : 1;
+      continue;
+    }
     S.rt = { w, i, dir, t: Math.min(Math.max(t, 0), 1), lat };
     return S.rt;
   }
@@ -1355,6 +1487,11 @@ function update(dt) {
   if (keys.KeyS || keys.ArrowDown) brk = 1;
   if (keys.KeyA || keys.ArrowLeft) str += 1;
   if (keys.KeyD || keys.ArrowRight) str -= 1;
+  // 類比輸入 (螢幕方向盤、重力感應、實體方向盤 / 搖桿): 有在轉就取代鍵盤左右
+  const analog = S.steerAxis != null && Math.abs(S.steerAxis) > 0.025;
+  if (analog) str = S.steerAxis;
+  if (S.padThr > 0.03) thr = Math.max(thr, S.padThr);
+  if (S.padBrk > 0.03) brk = Math.max(brk, S.padBrk);
   const boost = keys.ShiftLeft || keys.ShiftRight;
   if (thr || brk || str) autopilot = autopilot && !(thr || brk || str) ? false : autopilot;
   const maxSteer = (big ? 0.6 : 0.55) / (1 + Math.abs(S.v) / 14);
@@ -1398,6 +1535,17 @@ function update(dt) {
       }
       if (ld.gap < 2.5) acc = -10;
       if (acc >= 0) thr = Math.min(1, acc / 2.2); else brk = Math.min(1, -acc / 8);
+      // 卡在路緣 (油門踩著、前面沒車、車子不動) 3 秒: 把車擺回目前車道中央、車頭對齊路
+      S.apStuck = (Math.abs(S.v) < 0.5 && thr > 0.2 && ld.gap > 6) ? (S.apStuck || 0) + dt : 0;
+      if (S.apStuck > 3 && rt) {
+        const P = w0.P, i = rt.i, t = rt.t || 0;
+        const off = laneOffDir(w0, S.apLane, dir);
+        const tx = P[i * 3 + 3] - P[i * 3], ty = P[i * 3 + 4] - P[i * 3 + 1], L = Math.hypot(tx, ty) || 1;
+        S.x = P[i * 3] + tx * t + w0.nx[i] * off; S.y = P[i * 3 + 1] + ty * t + w0.ny[i] * off;
+        S.h = Math.atan2(ty, tx) + (dir < 0 ? Math.PI : 0); S.steer = 0;
+        const r2 = roadAt(S.x, S.y, S.z, 0, 2); if (r2) S.road = r2;
+        S.apStuck = 0; S.apUnstick = (S.apUnstick || 0) + 1;
+      }
       // 換車道
       S.apCool = (S.apCool || 0) - dt;
       const laneOkP = (ln) => ln >= 0 && ln < lc && !(vt.len > 9 && !w0.city && ln < lc - 2);
@@ -1473,7 +1621,8 @@ function update(dt) {
   S.braking = !!(brk && S.v > 0.5) || !!keys.Space;
   // 轉向
   const tgt = str * maxSteer;
-  S.steer += Math.max(-2.5 * dt, Math.min(2.5 * dt, tgt - S.steer));
+  const sRate = analog && !autopilot ? 7 : 2.5;   // 類比方向盤反應快，鍵盤維持平滑
+  S.steer += Math.max(-sRate * dt, Math.min(sRate * dt, tgt - S.steer));
   const yawRate = S.v * Math.tan(S.steer) / WB;
   S.h += yawRate * dt;
   // 平面移動 + 路緣碰撞
@@ -1727,6 +1876,7 @@ setTimeout(async () => {
   else defaultSpawn();
   if (params.has('vehicle')) setVehicle(params.get('vehicle'));
   for (const f of HOOKS.init) f();
+  if (params.has('clipscan')) await clipScan();
   if (params.has('t')) { // 測試用: 先跑幾秒
     const LCT = params.has('lctest');   // 車道置中測試: 手動只踩油門，每 20 秒打一下方向盤
     autopilot = !LCT; S.v = 25;
@@ -1750,6 +1900,8 @@ setTimeout(async () => {
           return b ? `| nearest AI ${b.type} d=${bd.toFixed(1)} v=${(b.v * 3.6).toFixed(0)} w=${b.w.k} s=${b.s.toFixed(0)}/${b.w.s[b.w.n - 1].toFixed(0)} dir=${b.dir} dead=${b.deadEnd} plan=${b.plan ? (b.plan.none ? 'none' : b.plan.o.k) : '-'} dh=${(((b.h - S.h) * 180 / Math.PI) % 360).toFixed(0)}` : ''; })() : '');
     }
     autopilot = params.has('demo') || params.has('keep');
+    if (params.has('trace') && S.road) { const w = S.road.w; const ends = [0, w.n - 1].map(n => nextOptions(w, n).map(o => o.o.gid + '/' + o.dir + (o.o.city ? 'c' : '') + (o.o.oneway ? 'o' : ''))); console.log('[end]', 'unstick', S.apUnstick || 0, 'apStuck', (S.apStuck || 0).toFixed(1), 'v', S.v.toFixed(2), 'gid', w.gid, 'n', w.n, 'city', !!w.city, 'oneway', !!w.oneway, 'i', S.road.i, 't', S.road.t.toFixed(2), 'lat', S.road.lat.toFixed(2), 'hw', w.hw, 'rt', S.rt ? S.rt.dir + ' ' + S.rt.i : '-', 'ends', JSON.stringify(ends), 'thr', S.thr, 'brk', S.brk, 'h', S.h.toFixed(2), 'tan', Math.atan2(S.road.ty, S.road.tx).toFixed(2)); }
+    if (params.has('trace') && S.rt) { const o = S.rt.w, P = o.P; console.log('[end2] rt gid', o.gid, 'n', o.n, 'hw', o.hw, 'lanes', o.lanes, 'width', o.width, 'pts', JSON.stringify(Array.from(P).map(v => +v.toFixed(1))), 'car', S.x.toFixed(1), S.y.toFixed(1), S.z.toFixed(1), 'cur end', JSON.stringify(Array.from(S.road.w.P.slice(-6)).map(v => +v.toFixed(1))), 'cur width', S.road.w.width, 'lanes', S.road.w.lanes, 'la', JSON.stringify(lookAhead(10))); }
     if (LCT) { keys.KeyW = keys.KeyA = keys.KeyD = keys.KeyS = false; console.log('[lc] settled err max', lcMax.toFixed(2), 'mean', (lcSum / Math.max(lcN, 1)).toFixed(2), 'off frames', lcOff, '/', n); }
     console.log('[test] simulated', params.get('t'), 's; speed', (S.v * 3.6).toFixed(0), 'km/h; lane', S.apLane,
       '; player bumps', window.TWX ? TWX.stats.bumps : '-', '; AI overlaps', window.TWX ? TWX.overlaps() : '-',

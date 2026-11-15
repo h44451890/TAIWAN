@@ -14,7 +14,7 @@ import requests
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "..", "data")
-BBOX = (24.95, 121.40, 25.20, 121.80)
+BBOX = (24.85, 121.10, 25.20, 121.80)
 ENDPOINTS = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter",
              "https://maps.mail.ru/osm/tools/overpass/api/interpreter"]
 CITY = "primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|unclassified|living_street"
