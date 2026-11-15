@@ -28,7 +28,16 @@ const ROADS = new Set(LIVE.sections.map((x) => x.road));
 const WAYMAP = LIVE.wayMap;
 let SECTIONS = LIVE.sections;
 const fmtTime = (s) => { const m = /T(\d\d:\d\d)/.exec(s || ''); return m ? m[1] : ''; };
-let trafficSource = '快照 ' + fmtTime(LIVE.updateTime);
+// 路況來源標示: 連上即時伺服器時顯示「即時 · N 秒前」(上游資料多舊)，連不上才顯示打包時的離線快照
+let liveSrc = '', liveAt = 0, liveOkAt = 0;
+function srcLabel() {
+  const now = Date.now();
+  if (liveSrc && now - liveOkAt < 5 * 60 * 1000) {
+    const sec = Math.max(0, Math.round((now - liveAt) / 1000));
+    return '即時 · ' + (sec < 90 ? sec + ' 秒前' : Math.round(sec / 60) + ' 分鐘前') + '（' + liveSrc + '）';
+  }
+  return '離線快照 ' + fmtTime(LIVE.updateTime);
+}
 const wayTraffic = [];   // 依 w.k；分區載入時補上
 const LV_COLOR = ['#8a939b', '#2fbf5b', '#b9d63a', '#f2b632', '#f07c2a', '#e0302a'];
 const LV_NAME = ['無資料', '順暢', '車多', '車多', '壅塞', '嚴重壅塞'];
@@ -80,7 +89,8 @@ async function pollSpeed() {
     const [j, src] = await fetchLive('/freeway-speed');
     if (j && j.ok && j.data && Array.isArray(j.data.items)) {
       SECTIONS = j.data.items.filter((x) => ROADS.has(x.road));
-      trafficSource = '即時 ' + fmtTime(j.data.updateTime) + '（' + src + '）';
+      const age = Number.isFinite(j.data.ageMs) ? j.data.ageMs : Math.max(0, Date.now() - Date.parse(j.data.updateTime || ''));
+      liveSrc = src; liveOkAt = Date.now(); liveAt = Date.now() - (Number.isFinite(age) ? age : 0);
       indexSections(); recomputeTraffic();
       for (const c of cars) if (c.alive) c.v0 = desiredSpeed(c);
       wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);   // 國道路況時時更新: 最多 30 秒抓一次
@@ -233,7 +243,17 @@ function desiredSpeed(c) {
 }
 function densityWeight(w) {
   if (w.city) return w.cls === 5 ? 0.5 : (w.cls === 2 ? 3 : w.cls === 3 ? 2.4 : 1.6);
-  return [1, 1, 1.8, 2.6, 3.6, 4.5][levelOf(wayTraffic[w.k])];
+  return FWY_DENS[levelOf(wayTraffic[w.k])];
+}
+// 國道車流密度跟著即時路況: 順暢 1、車多 3~5、壅塞 7~9 倍 (大約是真實每車道每公里車數的比例)
+const FWY_DENS = [1, 1, 3, 5, 7, 9];
+// 車子總數固定，所以玩家所在路段越塞，就把國道車集中在越小的範圍 (車距變短)，塞車時眼前真的是一排車
+const FWY_R = [[750, 1500, 1800], [750, 1500, 1800], [450, 950, 1150], [300, 650, 800], [220, 480, 600], [160, 380, 480]];
+let fwyLv = 1;
+function playerFwyLevel() {
+  const r = S.road;
+  if (!r || r.w.city) return 1;
+  return Math.max(1, levelOf(wayTraffic[r.w.k]));
 }
 
 /** 下一段路: 國道走主線；一般道路在路口隨機轉彎 (直行機率較高)，不會迴轉 */
@@ -293,7 +313,7 @@ function trySpawn(c, pool, minR, maxR) {
   for (let attempt = 0; attempt < 16; attempt++) {
     const sm = cand[(Math.random() * cand.length) | 0];
     const w = WAYS[sm[0]];
-    if (Math.random() > densityWeight(w) / 4.5) continue;
+    if (Math.random() > densityWeight(w) / (w.city ? 4.5 : 9)) continue;
     let type = pickW(pool === 'city' ? MIX_CITY : MIX_FWY);
     if ((typeCount[type] || 0) >= CAP[type] || (type === 'semi' && (typeCount.semiTrailer || 0) >= CAP.semiTrailer)) type = 'sedan';
     if ((typeCount[type] || 0) >= CAP[type]) return false;
@@ -306,7 +326,7 @@ function trySpawn(c, pool, minR, maxR) {
     const lat = laneLatC(tc, lane);
     poseAt(w, sm[1], lat);
     let ok = Math.hypot(POSE.x - S.x, POSE.y - S.y) > Math.min(minR, 40);
-    const gapNeed = pool === 'city' ? 14 : 28;
+    const gapNeed = pool === 'city' ? 14 : [28, 28, 22, 16, 12, 10][levelOf(wayTraffic[w.k])];   // 塞車時車距短
     for (const o of cars) if (ok && o.alive && o !== c && (o.x - POSE.x) ** 2 + (o.y - POSE.y) ** 2 < gapNeed * gapNeed && Math.abs(o.z - POSE.z) < 3) ok = false;
     if (!ok) continue;
     const TT = TV[type];
@@ -335,7 +355,8 @@ function kill(c) {
 
 function initTraffic() {
   buildInstances();
-  for (let i = 0; i < MAX_FWY; i++) { const c = { alive: false, pool: 'fwy' }; cars.push(c); trySpawn(c, 'fwy', 60, 1500); }
+  fwyLv = playerFwyLevel();
+  for (let i = 0; i < MAX_FWY; i++) { const c = { alive: false, pool: 'fwy' }; cars.push(c); trySpawn(c, 'fwy', 60, FWY_R[fwyLv][1]); }
   for (let i = 0; i < MAX_CITY; i++) { const c = { alive: false, pool: 'city' }; cars.push(c); trySpawn(c, 'city', 40, 550); }
 }
 
@@ -577,16 +598,18 @@ function updateTraffic(dt) {
   respawnClock -= dt;
   if (respawnClock <= 0) {
     respawnClock = 0.25;
+    fwyLv = playerFwyLevel();
     let n = 0;
     for (const c of cars) {
       const d = c.alive ? Math.hypot(c.x - S.x, c.y - S.y) : 1e9;
       const behind = c.alive && (c.x - S.x) * Math.cos(S.h) + (c.y - S.y) * Math.sin(S.h) < -25;
-      const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && d > 250)) : (d > 1800 || (c.deadEnd && d > 700));
+      const FR = FWY_R[fwyLv];
+      const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && d > 250)) : (d > FR[2] || (c.deadEnd && d > Math.min(700, FR[1])));
       const jam = ((c.stuck || 0) > 20 && (d > 150 || behind)) || (c.stuck || 0) > 45;   // 卡死的車: 先在看不到的地方回收，卡太久就直接回收
       if (jam && !far) stats.unjam = (stats.unjam || 0) + 1;
       if ((far || jam) && n++ < 4) {
         kill(c);
-        if (c.pool === 'city') trySpawn(c, 'city', 280, 550); else trySpawn(c, 'fwy', 750, 1500);
+        if (c.pool === 'city') trySpawn(c, 'city', 280, 550); else trySpawn(c, 'fwy', FWY_R[fwyLv][0], FWY_R[fwyLv][1]);
       }
     }
   }
@@ -608,6 +631,40 @@ function updateTraffic(dt) {
     im.count = INST[k].n; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true;
   }
 }
+// 智行地圖路況圖層 (Smart-Nav-Map /api/traffic/segments): 國道 + 臺北、桃園市區官方路況 + 手機回報，順暢的不送
+// 連得上智行地圖伺服器時，小地圖照它的顏色畫出車多、壅塞的路段 (市區道路也有)
+const snmTraffic = { lines: [], at: 0, box: null, busy: false, failAt: -1e9 };
+async function pollSnmTraffic() {
+  if (snmTraffic.busy || !API || Date.now() - snmTraffic.failAt < 60000) return;   // 伺服器沒開: 一分鐘後再試
+  const b = snmTraffic.box;
+  if (b && Date.now() - snmTraffic.at < 30000 && Math.abs(S.x - b[0]) < 1500 && Math.abs(S.y - b[1]) < 1500) return;
+  snmTraffic.busy = true;
+  try {
+    const [la0, lo0] = toLatLon(S.x - 4000, S.y - 4000), [la1, lo1] = toLatLon(S.x + 4000, S.y + 4000);
+    const j = await fetchJson(`${API}/traffic/segments?n=${la1.toFixed(5)}&s=${la0.toFixed(5)}&e=${lo1.toFixed(5)}&w=${lo0.toFixed(5)}`, 8000);
+    const fc = j && (j.data || j);
+    if (fc && Array.isArray(fc.features)) {
+      snmTraffic.lines = [];
+      for (const f of fc.features) {
+        const g = f.geometry, pr = f.properties || {};
+        if (!g || g.type !== 'LineString' || !pr.color || pr.trafficLevel === 'free') continue;
+        const pts = new Float32Array(g.coordinates.length * 2);
+        g.coordinates.forEach((q, i) => { const [x, y] = tm2(q[1], q[0]); pts[i * 2] = x - TW.ORIGIN[0]; pts[i * 2 + 1] = y - TW.ORIGIN[1]; });
+        snmTraffic.lines.push({ pts, color: pr.color });
+      }
+      snmTraffic.at = Date.now(); snmTraffic.box = [S.x, S.y];
+    }
+  } catch (e) { snmTraffic.failAt = Date.now(); /* 智行地圖伺服器沒開: 只用國道路況 */ }
+  snmTraffic.busy = false;
+}
+TW.HOOKS.minimap.push((ctx, s) => {
+  ctx.lineCap = 'round';
+  for (const L of snmTraffic.lines) {
+    ctx.beginPath();
+    for (let i = 0; i < L.pts.length; i += 2) { const x = L.pts[i] - S.x, y = L.pts[i + 1] - S.y; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }
+    ctx.strokeStyle = L.color; ctx.lineWidth = 4 / s; ctx.stroke();
+  }
+});
 TW.HOOKS.minimap.push((ctx, s) => {
   for (const c of cars) {
     if (!c.alive) continue;
@@ -1229,43 +1286,44 @@ function updateTrafficHud(dt) {
   hudClock = 0.3;
   const w = S.road && S.road.w;
   const t = w ? wayTraffic[w.k] : null, mp = w ? WAYMAP[w.gid] : null;
-  if (!t) { trafficEl.textContent = w && w.link ? '匝道 · 路況 ' + trafficSource : '路況 ' + trafficSource; trafficEl.style.borderColor = LV_COLOR[0]; return; }
+  if (!t) { trafficEl.textContent = w && w.link ? '匝道 · 路況 ' + srcLabel() : '路況 ' + srcLabel(); trafficEl.style.borderColor = LV_COLOR[0]; return; }
   const lv = levelOf(t);
-  trafficEl.innerHTML = `<b style="color:${LV_COLOR[lv]}">${t.speed > 0 ? t.speed + ' km/h · ' : ''}${LV_NAME[lv]}</b>　${DIR_NAME[mp[1]] || ''} ${t.from} → ${t.to}　<small>${trafficSource}</small>`;
+  trafficEl.innerHTML = `<b style="color:${LV_COLOR[lv]}">${t.speed > 0 ? t.speed + ' km/h · ' : ''}${LV_NAME[lv]}</b>　${DIR_NAME[mp[1]] || ''} ${t.from} → ${t.to}　<small>${srcLabel()}</small>`;
   trafficEl.style.borderColor = LV_COLOR[lv];
 }
 
 // ======================================================================= 手機定位同步 (透過電腦上的 scripts/phone_location.py)
+// TWD97 TM2 (EPSG:3826) 正算，與 prep_freeway.py 相同公式
+const A = 6378137, F = 1 / 298.257222101, E2 = F * (2 - F), EP2 = E2 / (1 - E2), K0 = 0.9999, LON0 = 121, FE = 250000;
+function tm2(lat, lon) {
+  const phi = lat * Math.PI / 180, lam = (lon - LON0) * Math.PI / 180;
+  const s = Math.sin(phi), c = Math.cos(phi), N = A / Math.sqrt(1 - E2 * s * s), Tn = Math.tan(phi) ** 2, C = EP2 * c * c, Aa = c * lam;
+  const e4 = E2 * E2, e6 = e4 * E2;
+  const M = A * ((1 - E2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * phi - (3 * E2 / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * Math.sin(2 * phi)
+    + (15 * e4 / 256 + 45 * e6 / 1024) * Math.sin(4 * phi) - (35 * e6 / 3072) * Math.sin(6 * phi));
+  const x = FE + K0 * N * (Aa + (1 - Tn + C) * Aa ** 3 / 6 + (5 - 18 * Tn + Tn * Tn + 72 * C - 58 * EP2) * Aa ** 5 / 120);
+  const y = K0 * (M + N * Math.tan(phi) * (Aa * Aa / 2 + (5 - Tn + 9 * C + 4 * C * C) * Aa ** 4 / 24 + (61 - 58 * Tn + Tn * Tn + 600 * C - 330 * EP2) * Aa ** 6 / 720));
+  return [x, y];
+}
+/** 遊戲座標 (公尺) -> 經緯度 (牛頓法反算) */
+function toLatLon(x, y) {
+  const X = x + TW.ORIGIN[0], Y = y + TW.ORIGIN[1];
+  let lat = 25.03, lon = 121.55;
+  for (let k = 0; k < 6; k++) {
+    const [fx, fy] = tm2(lat, lon), h = 1e-6;
+    const [ax, ay] = tm2(lat + h, lon), [bx, by] = tm2(lat, lon + h);
+    const j11 = (ax - fx) / h, j21 = (ay - fy) / h, j12 = (bx - fx) / h, j22 = (by - fy) / h;
+    const rx = X - fx, ry = Y - fy, det = j11 * j22 - j12 * j21;
+    lat += (j22 * rx - j12 * ry) / det; lon += (-j21 * rx + j11 * ry) / det;
+  }
+  return [lat, lon];
+}
+
 // 遊戲每秒把車子的經緯度送到橋接程式，橋接程式再透過 Wi-Fi 設成手機的「模擬定位」(Android adb / iPhone)。
 const gpsSync = (() => {
   const url = (TW.params.get('gps') || 'http://127.0.0.1:8765').replace(/\/$/, '');
   const el = $('gps');
   let on = false, clock = 0, busy = false, status = '';
-  // TWD97 TM2 (EPSG:3826) 正算，與 prep_freeway.py 相同公式
-  const A = 6378137, F = 1 / 298.257222101, E2 = F * (2 - F), EP2 = E2 / (1 - E2), K0 = 0.9999, LON0 = 121, FE = 250000;
-  function tm2(lat, lon) {
-    const phi = lat * Math.PI / 180, lam = (lon - LON0) * Math.PI / 180;
-    const s = Math.sin(phi), c = Math.cos(phi), N = A / Math.sqrt(1 - E2 * s * s), Tn = Math.tan(phi) ** 2, C = EP2 * c * c, Aa = c * lam;
-    const e4 = E2 * E2, e6 = e4 * E2;
-    const M = A * ((1 - E2 / 4 - 3 * e4 / 64 - 5 * e6 / 256) * phi - (3 * E2 / 8 + 3 * e4 / 32 + 45 * e6 / 1024) * Math.sin(2 * phi)
-      + (15 * e4 / 256 + 45 * e6 / 1024) * Math.sin(4 * phi) - (35 * e6 / 3072) * Math.sin(6 * phi));
-    const x = FE + K0 * N * (Aa + (1 - Tn + C) * Aa ** 3 / 6 + (5 - 18 * Tn + Tn * Tn + 72 * C - 58 * EP2) * Aa ** 5 / 120);
-    const y = K0 * (M + N * Math.tan(phi) * (Aa * Aa / 2 + (5 - Tn + 9 * C + 4 * C * C) * Aa ** 4 / 24 + (61 - 58 * Tn + Tn * Tn + 600 * C - 330 * EP2) * Aa ** 6 / 720));
-    return [x, y];
-  }
-  /** 遊戲座標 (公尺) -> 經緯度 (牛頓法反算) */
-  function toLatLon(x, y) {
-    const X = x + TW.ORIGIN[0], Y = y + TW.ORIGIN[1];
-    let lat = 25.03, lon = 121.55;
-    for (let k = 0; k < 6; k++) {
-      const [fx, fy] = tm2(lat, lon), h = 1e-6;
-      const [ax, ay] = tm2(lat + h, lon), [bx, by] = tm2(lat, lon + h);
-      const j11 = (ax - fx) / h, j21 = (ay - fy) / h, j12 = (bx - fx) / h, j22 = (by - fy) / h;
-      const rx = X - fx, ry = Y - fy, det = j11 * j22 - j12 * j21;
-      lat += (j22 * rx - j12 * ry) / det; lon += (-j21 * rx + j11 * ry) / det;
-    }
-    return [lat, lon];
-  }
   const show = () => { el.textContent = on ? '📱 ' + status : ''; };
   async function post(path, body) {
     const r = await fetch(url + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
@@ -1482,9 +1540,21 @@ const controls = (() => {
 // ======================================================================= 掛上主程式
 TW.HOOKS.init.push(() => {
   initTraffic();
-  pollSpeed(); pollCms();
+  pollSpeed(); pollCms(); setInterval(pollSnmTraffic, 5000); pollSnmTraffic();
   if (TW.params.get('radio') === 'auto') radio.toggle(); // 測試用
   if (TW.params.has('gpsauto')) gpsSync.toggle();      // 測試用
+});
+let densClock = 0;
+if (TW.params.has('densdbg')) TW.HOOKS.update.push((dt) => {   // 測試: 玩家附近國道車數
+  if ((densClock += dt) < 5) return; densClock = 0;
+  let n300 = 0, n650 = 0, same = 0, ahead = 0, alive = 0;
+  for (const c of cars) if (c.alive && c.pool === 'fwy') {
+    alive++;
+    const d = Math.hypot(c.x - S.x, c.y - S.y);
+    if (d < 300) n300++; if (d < 650) n650++;
+    if (S.road && c.w === S.road.w) { same++; if ((c.x - S.x) * Math.cos(S.h) + (c.y - S.y) * Math.sin(S.h) > 0) ahead++; }
+  }
+  console.log('[dens] lv', fwyLv, 'alive', alive, '<300m', n300, '<650m', n650, 'sameWay', same, 'ahead', ahead, 'v', (S.v * 3.6).toFixed(0));
 });
 TW.HOOKS.update.push((dt) => { controls.frame(dt); }, (dt) => { PLAYER.stuck = Math.abs(S.v) < 0.3 ? (PLAYER.stuck || 0) + dt : 0; updateTraffic(dt); });
 // 分區載入: 生成點、路況、ETC 門架 (門架所在路段載入時才建)

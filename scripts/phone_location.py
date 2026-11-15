@@ -39,27 +39,88 @@ import re
 import urllib.request
 
 TIS = "https://tisvcloud.freeway.gov.tw/history/motc20/"
-FEED = {}          # 名稱 -> (抓取時間, 內容)
+# 照上游「實際更新的時間」抓 (照 Smart-Nav-Map lib/upstream.js)：
+#   用上游回的 Last-Modified 和 Date 算檔案多舊，推出下一次大概何時更新，時間一到 (+1 秒) 就去看；
+#   還沒更新就每 3 秒用 HEAD 問一次 (不下載整份)；兩次更新之間每 15 秒也問一下 (上游偶爾一分鐘多更新一次)。
+#   背景執行緒一直在跑，所以遊戲來要資料時永遠拿到最新的，不會卡在「幾點幾分」的舊資料。
+PERIOD = {"Section": 6 * 3600, "CMS": 6 * 3600, "LiveTraffic": 60, "CMSLive": 60}
+FEED = {}          # 名稱 -> dict(body, lm, etag, mod_local, expect, next_check, version, got)
 FEED_LOCK = threading.Lock()
-FEED_TTL = {"Section": 6 * 3600, "CMS": 6 * 3600, "LiveTraffic": 55, "CMSLive": 55}
+
+
+def _http(name, method="GET"):
+    req = urllib.request.Request(TIS + name + ".xml", method=method,
+                                 headers={"User-Agent": "taiwan-1to1-local", "Accept-Encoding": "identity"})
+    return urllib.request.urlopen(req, timeout=15)
+
+
+def _plan(f, now):
+    if now < f["expect"]:
+        f["next_check"] = min(f["expect"], now + 15)
+    else:
+        f["next_check"] = now + (30 if now - f["mod_local"] > 300 else 3)   # 上游晚超過 5 分鐘 (可能停更) 就放慢
+
+
+def _check(name):
+    now = time.time()
+    f = FEED.get(name)
+    if f and f.get("lm"):
+        try:   # 先用 HEAD 看檔案時間變了沒 (高公局不支援 304)
+            with _http(name, "HEAD") as r:
+                if r.headers.get("Last-Modified") == f["lm"] and r.headers.get("ETag") == f["etag"]:
+                    with FEED_LOCK:
+                        _plan(f, time.time())
+                    return
+        except Exception:  # noqa: BLE001
+            pass
+    with _http(name) as r:
+        body = r.read().decode("utf-8", "replace")
+        lm, etag, date = r.headers.get("Last-Modified"), r.headers.get("ETag"), r.headers.get("Date")
+    now = time.time()
+    age = 0.0
+    try:
+        from email.utils import parsedate_to_datetime
+        age = max(0.0, (parsedate_to_datetime(date) - parsedate_to_datetime(lm)).total_seconds())
+    except Exception:  # noqa: BLE001
+        pass
+    with FEED_LOCK:
+        old = FEED.get(name) or {"version": 0}
+        g = {"body": body, "lm": lm, "etag": etag, "mod_local": now - age, "got": now,
+             "version": old["version"] + (1 if body != old.get("body") else 0)}
+        g["expect"] = g["mod_local"] + PERIOD[name] + 1
+        _plan(g, now)
+        FEED[name] = g
 
 
 def feed(name):
-    with FEED_LOCK:
-        hit = FEED.get(name)
-        if hit and time.time() - hit[0] < FEED_TTL[name]:
-            return hit[1]
-    try:
-        req = urllib.request.Request(TIS + name + ".xml", headers={"User-Agent": "taiwan-1to1-local", "Accept-Encoding": "identity"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            body = r.read().decode("utf-8", "replace")
-        with FEED_LOCK:
-            FEED[name] = (time.time(), body)
-        return body
-    except Exception:  # noqa: BLE001
-        if hit:
-            return hit[1]   # 上游暫時連不到: 給上一次的
-        raise
+    f = FEED.get(name)
+    if not f or time.time() >= f["next_check"]:
+        try:
+            _check(name)
+        except Exception:  # noqa: BLE001
+            f = FEED.get(name)
+            if not f:
+                raise
+            f["next_check"] = time.time() + 10   # 上游暫時連不到: 給上一次的，10 秒後再試
+    return FEED[name]["body"]
+
+
+def feed_age_ms(name):
+    """上游這份資料已經多舊 (毫秒)。"""
+    f = FEED.get(name)
+    return int((time.time() - f["mod_local"]) * 1000) if f else None
+
+
+def _feed_loop():
+    while True:
+        for name in ("LiveTraffic", "CMSLive", "Section", "CMS"):
+            f = FEED.get(name)
+            if not f or time.time() >= f["next_check"]:
+                try:
+                    feed(name)
+                except Exception:  # noqa: BLE001
+                    pass
+        time.sleep(1)
 
 
 def _blocks(x, n):
@@ -82,9 +143,14 @@ def _mile(s):
 
 
 def next_update_ms(name):
-    with FEED_LOCK:
-        hit = FEED.get(name)
-    return int(max(5, FEED_TTL[name] - (time.time() - hit[0])) * 1000) if hit else 60000
+    """遊戲還要等多久再來抓: 預計上游更新 + 我們抓到之後 (相對時間，手機時鐘不準也沒關係)。"""
+    f = FEED.get(name)
+    if not f:
+        return 60000
+    now = time.time()
+    if now - f["mod_local"] > 300:
+        return 30000
+    return int(max(5.0, f["expect"] + 1 - now) * 1000)
 
 
 def freeway_speed():
@@ -100,7 +166,8 @@ def freeway_speed():
         items.append({"road": _tag(b, "RoadName"), "dir": _tag(b, "RoadDirection"), "s": s, "e": e,
                       "from": _tag(b, "Start"), "to": _tag(b, "End"), "limit": int(_tag(b, "SpeedLimit") or 0) or None,
                       "speed": int(sp) if sp.lstrip("-").isdigit() else -1, "level": int(_tag(lb, "CongestionLevel") or 0)})
-    return {"updateTime": _tag(feed("LiveTraffic"), "UpdateTime"), "nextUpdateIn": next_update_ms("LiveTraffic"), "items": items}
+    return {"updateTime": _tag(feed("LiveTraffic"), "UpdateTime"), "nextUpdateIn": next_update_ms("LiveTraffic"),
+            "ageMs": feed_age_ms("LiveTraffic"), "items": items}
 
 
 def cms_live():
@@ -331,6 +398,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="不連手機，只印出座標")
     ARGS = ap.parse_args()
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=_feed_loop, daemon=True).start()   # 路況背景更新 (照上游更新時間)
     ThreadingHTTPServer.request_queue_size = 128   # 遊戲一次會要幾十個分區
     srv = ThreadingHTTPServer((ARGS.host, ARGS.port), Handler)
     mode = "dry-run，不連手機" if ARGS.dry_run else ("Android / adb: " + ARGS.adb if ARGS.phone == "android" else "iPhone / pymobiledevice3")

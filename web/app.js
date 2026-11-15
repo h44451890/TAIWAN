@@ -353,15 +353,24 @@ const matBarrier = patch(new T.MeshStandardMaterial({ roughness: 0.92, metalness
     float fw = max(fwidth(s), 1e-4);
     float n = fwyFbm(vec3(s * 0.9, h * 3.0, 0.0), 5);
     float streak = fwyFbm(vec3(s * 6.0, h * 0.35, 1.7), 3);
-    vec3 c = vec3(0.18, 0.175, 0.165) * (0.78 + 0.35 * n);
-    c *= mix(1.0, 0.72, smoothstep(0.55, 0.8, streak));
-    c *= mix(0.62, 1.0, smoothstep(0.0, 0.35, h));
+    vec3 c = vec3(0.2, 0.195, 0.185) * (0.78 + 0.35 * n);
+    c *= mix(1.0, 0.62, smoothstep(0.52, 0.8, streak));                                    // 垂直雨痕
+    float grime = fwyFbm(vec3(s * 0.22, h * 1.2, 4.3), 4);                                  // 大片黑色污漬 (街景上一塊一塊)
+    c *= mix(1.0, 0.42, smoothstep(0.5, 0.72, grime) * smoothstep(0.05, 0.4, h));
+    c *= mix(0.55, 1.0, smoothstep(0.0, 0.38, h));                                          // 底部被輪胎濺髒
+    float moss = smoothstep(0.55, 0.75, fwyFbm(vec3(s * 0.5, h * 2.0, 8.1), 3)) * (1.0 - smoothstep(0.05, 0.3, h));
+    c = mix(c, vec3(0.07, 0.085, 0.05), moss * 0.6);                                        // 底部青苔
+    c *= mix(1.0, 1.12, smoothstep(0.8, 0.86, h));                                          // 平頂受光較亮
     float jd = abs(fract(s / 6.0 + 0.5) - 0.5) * 6.0;
     c *= mix(0.35, 1.0, smoothstep(0.012, 0.012 + fw * 1.5, jd));
     float dd = abs(fract(s / 3.0) - 0.5) * 3.0;
     float slot = (1.0 - smoothstep(0.15, 0.15 + fw, dd)) * (1.0 - smoothstep(0.085, 0.1, h));
     diffuseColor.rgb = mix(c, vec3(0.01), slot);
   }`,
+});
+// 中央分隔護欄上的綠色防眩板 (照街景: 綠色鋼板、略褪色、底部有灰塵)
+const matGlare = patch(new T.MeshStandardMaterial({ roughness: 0.55, metalness: 0.25, side: T.DoubleSide }), {
+  color: 'diffuseColor.rgb = vec3(0.045, 0.24, 0.085) * (0.8 + 0.35 * fwyFbm(vObj * 3.0, 3));',
 });
 // 市區道路: 路緣白實線、雙向中央雙黃線、同向車道白虛線；巷道 (代碼 0) 無標線
 const matCityRoad = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalness: 0 }), {
@@ -503,6 +512,27 @@ function addRoad(c, w) {
     for (let i = 0; i < n - 1; i++) {
       if ((M[i] | M[i + 1]) & bit) continue;
       for (let j = 0; j < segs; j++) { const a = g0 + i * per + j * 2; g.q(a, a + 1, a + 1 + per, a + per); }
+    }
+    // 防眩板: 國道主線中央分隔護欄 (左側) 頂上每 4 m 一片，板面幾乎垂直路線 (擋對向車燈、側面看得穿)。
+    // 雙向兩條路面緊貼時兩邊的護欄並排，只由 gid 較小的那一側放，才不會變兩排
+    if (bit === 1 && !w.link && !w.tunnel && w.oneway && !params.has('noglare')) {
+      let skip = false;
+      for (let d = 2; d < s[n - 1]; d += 4) {
+        let k = 0; while (k < n - 2 && s[k + 1] < d) k++;
+        if ((M[k] | M[k + 1]) & bit) continue;
+        const t = (d - s[k]) / ((s[k + 1] - s[k]) || 1);
+        const bx = P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t, by = P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t;
+        const z = P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t;
+        if (((d - 2) / 4) % 10 === 0) {   // 每 40 m 看一次旁邊是不是緊貼著對向路面
+          const pr = roadAt(bx + nx[k] * (hw + 1.6), by + ny[k] * (hw + 1.6), z, 0, 1.5);
+          skip = !!(pr && pr.w !== w && !pr.w.city && Math.abs(pr.z - z) < 1.5 && pr.tx * ny[k] + pr.ty * -nx[k] < -0.8 && pr.w.gid < w.gid);
+        }
+        if (skip) continue;
+        const x = bx + nx[k] * o, y = by + ny[k] * o, a = 0.21;   // 板面轉 12°
+        const tx = ny[k] * Math.cos(a) + nx[k] * Math.sin(a), ty = -nx[k] * Math.cos(a) + ny[k] * Math.sin(a);
+        box(c.glare, x, y, tx, ty, 0.022, 0.12, z + 0.84, z + 1.55);
+        box(c.glare, x, y, ny[k], -nx[k], 0.03, 0.03, z + 0.8, z + 0.9);   // 底座
+      }
     }
     // 反光片: 每 24 m 一片，外側紅色、中央分隔黃色
     const R = bit === 1 ? c.reflY : c.reflR;
@@ -653,7 +683,7 @@ function portalMesh(w, i) {
   return m;
 }
 
-const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), reflR: new GB(), reflY: new GB(),
+const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), reflR: new GB(), reflY: new GB(),
   pier: new GB(), tunnel: new GB(), tlight: new GB(), portals: [] });
 
 /** 一般道路: 鋪在地形上的路面 (市區標線由材質依 aLs=路寬、aLanes=車道代碼 算出)；橋梁加梁身與橋墩 */
@@ -747,7 +777,7 @@ function buildTile(rec) {
   for (const k of rec.ways) { const w = WAYS[k]; if (w.city) addCityRoad(c, w); else addRoad(c, w); }
   for (let k = 0; k < rec.piers.length / 9; k++) addPier(c.pier, rec.piers, k);
   for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
-                   c.barrier.mesh(matBarrier, { cast: true }), c.pier.mesh(matConcrete, { cast: true }),
+                   c.barrier.mesh(matBarrier, { cast: true }), c.glare.mesh(matGlare, { cast: true }), c.pier.mesh(matConcrete, { cast: true }),
                    c.tunnel.mesh(matTunnel, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }),
                    c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false })]) if (m) g.add(m);
   for (const [w, i] of c.portals) g.add(portalMesh(w, i));
@@ -1811,7 +1841,7 @@ function drawMinimap() {
     c.beginPath();
     for (let i = 0; i < w.n; i++) { const x = w.P[i * 3] - S.x, y = w.P[i * 3 + 1] - S.y; i ? c.lineTo(x, y) : c.moveTo(x, y); }
     if (pass === 0) { c.strokeStyle = 'rgba(0,0,0,0.6)'; c.lineWidth = Math.max(w.width, 3.2 / s) + 2 / s; }
-    else { c.strokeStyle = (HOOKS.wayColor && HOOKS.wayColor(w)) || (w.city ? (w.cls === 5 ? '#454e55' : '#66717a') : w.trunk ? (w.link ? '#c98a5a' : '#ff8c42') : w.link ? '#a7b0b8' : (REF_COLOR[w.ref] || '#ddd')); c.lineWidth = Math.max(w.width, (w.city ? (w.cls === 5 ? 1 : 1.6) : w.link ? 2 : 3.2) / s); if (w.tunnel) c.setLineDash([6 / s, 4 / s]); }
+    else { c.strokeStyle = (HOOKS.wayColor && HOOKS.wayColor(w)) || (w.city ? (w.cls === 5 ? '#454e55' : '#66717a') : w.trunk ? (w.link ? '#7d8a96' : '#aebccb') : w.link ? '#a7b0b8' : '#d9dee3'); const tc = HOOKS.wayColor && HOOKS.wayColor(w); c.lineWidth = tc ? Math.max(w.width, 5 / s) : Math.max(w.width, (w.city ? (w.cls === 5 ? 1 : 1.6) : w.link ? 2 : 3.2) / s); if (w.tunnel) c.setLineDash([6 / s, 4 / s]); }
     c.stroke(); c.setLineDash([]);
   }
   for (const f of HOOKS.minimap) f(c, s, rad);
