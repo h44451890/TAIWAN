@@ -67,12 +67,31 @@ def main():
     base = tpl.replace("{{EXTRA}}", extra)
     for k, v in parts.items():
         base = base.replace("{{" + k + "}}", v)
-    inline = []
+    # 台灣.html 內嵌的分區: 地圖變大後全部內嵌會超過 GitHub 單檔 100 MB，
+    # 所以從原點 (台北) 由近到遠內嵌到 INLINE_MB 為止，其他分區開啟時有網路就從 GitHub Pages 下載
+    INLINE_MB = 80
+    keys = set()
     for kind in ("t", "d"):
-        d = os.path.join(tiles, kind)
-        for f in sorted(os.listdir(d)):
-            b64 = base64.b64encode(open(os.path.join(d, f), "rb").read()).decode("ascii")
-            inline.append(f'<script id="tile-{kind}-{f[:-4]}" type="application/octet-stream">{b64}</script>')
+        keys |= {f[:-4] for f in os.listdir(os.path.join(tiles, kind)) if f.endswith(".bin")}
+    def dist(k):
+        tx, ty = (int(v) for v in k.split("_"))
+        return (tx + 0.5) ** 2 + (ty + 0.5) ** 2
+    inline, total, skipped = [], 0, 0
+    for k in sorted(keys, key=dist):
+        blobs = []
+        for kind in ("t", "d"):
+            p = os.path.join(tiles, kind, k + ".bin")
+            if os.path.exists(p):
+                blobs.append((kind, base64.b64encode(open(p, "rb").read()).decode("ascii")))
+        size = sum(len(b) for _, b in blobs)
+        if total + size > INLINE_MB * 1e6:
+            skipped += 1
+            continue
+        total += size
+        for kind, b64 in blobs:
+            inline.append(f'<script id="tile-{kind}-{k}" type="application/octet-stream">{b64}</script>')
+    if skipped:
+        print(f"台灣.html: {len(keys) - skipped} tiles inline, {skipped} tiles fetched online from GitHub Pages")
     for name, tl in (("台灣.html", "\n".join(inline)), ("index.html", "")):
         out = base.replace("{{TILES_INLINE}}", tl)
         path = os.path.join(ROOT, name)

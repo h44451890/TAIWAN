@@ -21,7 +21,7 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "..", "data")
 
-BBOX = (24.85, 121.10, 25.20, 121.80)  # 南, 西, 北, 東 (台北盆地 + 基隆 + 桃園)
+BBOX = (24.00, 120.45, 25.20, 121.92)  # 南, 西, 北, 東 (基隆、台北、桃園、新竹、苗栗、台中、宜蘭)
 GRID_STEP_DEG = 0.0003                 # 地形網格約 30 m
 DENSIFY_M = 8.0                        # 路線加密間距
 LANE_W = 3.75                          # 國道車道寬

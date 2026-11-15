@@ -21,7 +21,8 @@ function b64buf(str) {
 const INDEX = JSON.parse($('tile-index').textContent);
 const TS = INDEX.ts, TC = INDEX.tc, TSTEP = INDEX.step, TN = TC + 3;   // 地形分區含 1 格外框
 const TGI = INDEX.terrain;                                               // 全域地形格點範圍 (J = x / 30, I = y / 30)
-const TILE_BASE = (params.get('tiles') || 'tiles/').replace(/\/?$/, '/');
+// 直接雙擊開 台灣.html (file://) 時，沒內嵌的分區從 GitHub Pages 下載
+const TILE_BASE = (params.get('tiles') || (location.protocol === 'file:' ? 'https://liug1217.github.io/TAIWAN/tiles/' : 'tiles/')).replace(/\/?$/, '/');
 const tkey = (tx, ty) => tx + '_' + ty;
 /** 內嵌的分區直接解碼 (同步)，否則下載 (回傳 Promise) */
 function tileBuf(kind, key) {
@@ -97,6 +98,8 @@ function makeWay(w) {
   indexWay(w);
   return w;
 }
+/** 高度 Int16 (0.1 m) 解碼: 3276.8 m 以上 (合歡山、雪山) 存的時候會繞回負數，小於 -500 m 的值加 65536 換回來 */
+const Z16 = (v) => (v < -5000 ? v + 65536 : v) * 0.1;
 /** 細節分區 -> 路段 (加入 WAYS)、橋墩、建築。格式見 scripts/tile_web.py pack_detail */
 function ingestDetail(buf) {
   const jl = new DataView(buf).getUint32(0, true);
@@ -126,7 +129,7 @@ function ingestDetail(buf) {
   // 一般道路: 第一點 + 0.1 m 相對座標
   const cp = new Float32Array(hd.cnp * 3);
   for (let k = 0, v = 0; k < ncw; k++) for (let i = 0; i < hd.cc[k]; i++, v++) {
-    cp[v * 3] = rxy0[k * 2] + roff[v * 2] * 0.1; cp[v * 3 + 1] = rxy0[k * 2 + 1] + roff[v * 2 + 1] * 0.1; cp[v * 3 + 2] = rz[v] * 0.1;
+    cp[v * 3] = rxy0[k * 2] + roff[v * 2] * 0.1; cp[v * 3 + 1] = rxy0[k * 2 + 1] + roff[v * 2 + 1] * 0.1; cp[v * 3 + 2] = Z16(rz[v]);
   }
   p = 0;
   for (let q = 0; q < ncw; q++) {
@@ -175,7 +178,7 @@ function terrainAt(x, y) {
   const a = TERR.get(tkey(tx, ty));
   if (!a) return 0;
   const lj = j - tx * TC + 1, li = i - ty * TC + 1;
-  const h = (ii, jj) => a[ii * TN + jj] * 0.1;
+  const h = (ii, jj) => Z16(a[ii * TN + jj]);
   return (1 - v) * ((1 - u) * h(li, lj) + u * h(li, lj + 1)) + v * ((1 - u) * h(li + 1, lj) + u * h(li + 1, lj + 1));
 }
 
@@ -763,7 +766,7 @@ function buildTerrainMesh(key, tx, ty) {
   const ja = Math.max(tx * TC, TGI.J0), jb = Math.min(tx * TC + TC, TGI.J0 + TGI.w - 1);
   const ia = Math.max(ty * TC, TGI.I0), ib = Math.min(ty * TC + TC, TGI.I0 + TGI.h - 1);
   if (!a || jb <= ja || ib <= ia) return null;
-  const hh = (I, J) => a[(I - ty * TC + 1) * TN + (J - tx * TC + 1)] * 0.1;
+  const hh = (I, J) => Z16(a[(I - ty * TC + 1) * TN + (J - tx * TC + 1)]);
   const g = new GB(); g.nrm = [];
   const cols = jb - ja + 1;
   for (let I = ia; I <= ib; I++) for (let J = ja; J <= jb; J++) {
@@ -826,7 +829,7 @@ async function clipScan() {
   const meshZ = (x, y) => {   // 與 buildTerrainMesh 相同的三角形
     const J = x / TSTEP, I = y / TSTEP, j = Math.floor(J), i = Math.floor(I), u = J - j, v = I - i;
     if (j < TGI.J0 || j >= TGI.J0 + TGI.w - 1 || i < TGI.I0 || i >= TGI.I0 + TGI.h - 1) return -1e9;   // 地形網格外不畫地形
-    const h = (ii, jj) => { const tx = Math.floor(jj / TC), ty = Math.floor(ii / TC), a = TERR.get(tkey(tx, ty)); return a ? a[(ii - ty * TC + 1) * TN + (jj - tx * TC + 1)] * 0.1 : -1e9; };
+    const h = (ii, jj) => { const tx = Math.floor(jj / TC), ty = Math.floor(ii / TC), a = TERR.get(tkey(tx, ty)); return a ? Z16(a[(ii - ty * TC + 1) * TN + (jj - tx * TC + 1)]) : -1e9; };
     const h00 = h(i, j), h10 = h(i, j + 1), h11 = h(i + 1, j + 1), h01 = h(i + 1, j);
     return u >= v ? h00 + u * (h10 - h00) + v * (h11 - h10) : h00 + v * (h01 - h00) + u * (h11 - h01);
   };

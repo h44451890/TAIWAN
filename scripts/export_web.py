@@ -110,7 +110,7 @@ def main():
         open(os.path.join(DATA, "city.bin"), "wb").write(cblob)
         json.dump(cmeta, open(os.path.join(DATA, "city_meta.json"), "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
 
-    hz = np.round(GZ * 10).astype(np.int16)
+    hz = np.round(GZ * 10).astype(np.int32).astype(np.int16)   # 3276.8 m 以上繞回負數，網頁端 Z16() 解回
     piers = np.array(prep.get("piers", []), np.float32).reshape(-1, 9)
     masks = np.concatenate([np.array(w["edgeL"], np.uint8) | (np.array(w["edgeR"], np.uint8) << 1) for w in ways])
     blob = b"".join([counts.tobytes(), pts.tobytes(), under.tobytes(), piers.tobytes(), hz.tobytes(), masks.tobytes()])

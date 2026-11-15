@@ -1,4 +1,4 @@
-# 台灣 1:1 — 基隆・台北・桃園
+# 台灣 1:1 — 基隆・台北・桃園・新竹・苗栗・台中・宜蘭
 
 用 OpenStreetMap 路線 + 開放地形資料生成 1:1（1 單位 = 1 公尺）的國道模型，
 有 Blender 版，也有可以直接開車的網頁：
@@ -67,7 +67,8 @@
 |---|---|
 | `台灣.html` | 打包好的單一網頁 |
 | `blender/taipei_freeway.blend` | Blender 檔 |
-| `data/taipei_fwy.json` | OSM 國道資料（範圍 24.85–25.20N, 121.10–121.80E：基隆、台北、新北、桃園） |
+| `data/taipei_fwy.json` | OSM 國道 + 快速道路資料（範圍 24.00–25.20N, 120.45–121.92E：基隆到台中、國5 全線南港→雪山隧道→頭城→蘇澳）。一般道路與建築目前有基隆～桃園和台中，新竹、苗栗、宜蘭市區還在補 |
+| `data/terrain_grid.npz` | prep_freeway.py 產生的整平地形（150 MB 以上，不放進 git，重跑 prep_freeway.py 就有） |
 | `scripts/fix_clip.mjs` | 穿模修復：路口高度、地形、建築、橋墩（tile_web.py 之後執行） |
 | `data/terrain/` | AWS Terrain Tiles 地形圖磚（zoom 13） |
 | `data/live/` | 高公局 Section / LiveTraffic / CMS / CMSLive 快照 |
@@ -101,6 +102,8 @@ python scripts/build_html.py
 地圖以 TWD97 本地座標切成 3840 m（128 格 × 30 m）的正方形分區。每個路段、建築依中點歸屬一個分區（路段不切開，全域編號 gid 不變，live.json 照用）。遊戲在車子周圍下載資料、鄰近 8 區都到齊才建模型，遠了就丟掉模型（資料保留）。電腦版模型半徑 7 km、地形 18 km；手機版 4.2 km、9 km。
 
 ## 座標
+高度以 Int16（0.1 m）存放；3276.8 m 以上（合歡山、雪山）會繞回負數，讀取時小於 −500 m 的值加 65536（`Z16()`）。
+
 TWD97 TM2（EPSG:3826）減去原點 `(305500, 2769200)`，原點也存在 Blender 場景自訂屬性 `origin_twd97`。
 
 ## 限制

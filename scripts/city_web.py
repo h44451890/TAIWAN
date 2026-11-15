@@ -296,7 +296,7 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
     pts = np.concatenate([np.c_[r["P"], r["z"]] for r in roads])
     xy0 = np.array([r["P"][0] for r in roads], np.float32)
     roff = np.concatenate([np.round((r["P"] - r["P"][0]) * 10) for r in roads]).astype(np.int16)
-    rz = np.round(pts[:, 2] * 10).astype(np.int16)
+    rz = np.round(pts[:, 2] * 10).astype(np.int32).astype(np.int16)   # 3276.8 m 以上繞回負數，網頁端 Z16() 解回
     # 建築頂點: 每棟第一點存 Float32，其餘存相對第一點的 Int16 (0.1 m)，省一半空間
     bxy0 = np.array([[b[0][0], b[1][0]] for b in blds], np.float32).reshape(-1, 2)
     boff = np.concatenate([np.c_[np.round((b[0] - b[0][0]) * 10), np.round((b[1] - b[1][0]) * 10)] for b in blds]) if blds else np.zeros((0, 2))
@@ -318,7 +318,14 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
              ("水源快速道路", 25.0170, 121.5200, "fwy", "水源"), ("國3 碧潭橋", 24.9588, 121.5394, "fwy", "碧潭"),
              ("桃園車站 · 中正路", 24.9890, 121.3133, "city", None), ("中壢車站 · 中正路", 24.9537, 121.2257, "city", None),
              ("林口 · 文化一路", 25.0710, 121.3680, "city", None), ("國1 林口", 25.0640, 121.3770, "fwy", "中山"),
-             ("國2 機場線", 25.0407, 121.2223, "fwy", "機場"), ("國3 鶯歌", 24.9300, 121.3600, "fwy", "福爾摩沙")]
+             ("國2 機場線", 25.0407, 121.2223, "fwy", "機場"), ("國3 鶯歌", 24.9300, 121.3600, "fwy", "福爾摩沙"),
+             ("新竹車站 · 中正路", 24.8016, 120.9716, "city", None), ("國1 新竹", 24.8100, 121.0280, "fwy", "中山"),
+             ("國3 新竹", 24.7800, 121.0450, "fwy", "福爾摩沙"), ("國1 苗栗頭份", 24.6880, 120.9100, "fwy", "中山"),
+             ("台中車站 · 台灣大道", 24.1372, 120.6869, "city", None), ("逢甲 · 台灣大道", 24.1790, 120.6450, "city", None),
+             ("國1 台中", 24.1650, 120.6460, "fwy", "中山"), ("國3 台中 · 霧峰", 24.0600, 120.6720, "fwy", "福爾摩沙"),
+             ("國5 坪林", 24.9350, 121.7100, "fwy", "蔣渭水"), ("國5 頭城（雪山隧道南口）", 24.8600, 121.7950, "fwy", "蔣渭水"),
+             ("宜蘭車站 · 宜興路", 24.7546, 121.7580, "city", None), ("羅東 · 中正路", 24.6770, 121.7690, "city", None),
+             ("國5 蘇澳端", 24.6150, 121.8230, "fwy", "蔣渭水")]
     spawns = []
     for name, la, lo, kind, key in SPOTS:
         tx, ty = local_xy(np.array([la]), np.array([lo]))
@@ -341,7 +348,7 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
                 i = int(d.argmin())
                 if best is None or d[i] < best[0]:
                     best = (d[i], k, min(max(i, 0), len(P) - 2))
-        if best and best[0] < 1500:
+        if best and best[0] < (2500 if kind == "fwy" else 1500):   # 國道傳送點: 吸附到最近的同名主線
             spawns.append([name, kind, best[1], best[2], 1])
     meta_spawns = spawns
     meta = dict(nways=len(roads), npts=int(len(pts)), nb=len(blds), nbv=int(nbv), spawns=meta_spawns,

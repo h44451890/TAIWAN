@@ -10,6 +10,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TD = path.join(ROOT, 'tiles');
+const Z16 = (v) => (v < -5000 ? v + 65536 : v) * 0.1;   // 高度 Int16 解碼 (3276.8 m 以上繞回負數)
 const INDEX = JSON.parse(fs.readFileSync(path.join(TD, 'index.json'), 'utf8'));
 const TC = INDEX.tc, STEP = INDEX.step, TN = TC + 3, TG = INDEX.terrain;
 
@@ -54,7 +55,7 @@ for (const [key, t] of tiles) {
   t.hd.cw.forEach((m, q) => {
     const n = t.hd.cc[q], P = new Float64Array(n * 3);
     for (let i = 0; i < n; i++) {
-      P[i * 3] = t.rxy0[q * 2] + t.roff[(p + i) * 2] * 0.1; P[i * 3 + 1] = t.rxy0[q * 2 + 1] + t.roff[(p + i) * 2 + 1] * 0.1; P[i * 3 + 2] = t.rz[p + i] * 0.1;
+      P[i * 3] = t.rxy0[q * 2] + t.roff[(p + i) * 2] * 0.1; P[i * 3 + 1] = t.rxy0[q * 2 + 1] + t.roff[(p + i) * 2 + 1] * 0.1; P[i * 3 + 2] = Z16(t.rz[p + i]);
     }
     ways.push({ key, t, city: true, q, p0: p, n, P, gid: m[0], name: m[6], width: m[4], hw: m[4] / 2, bridge: !!m[5], tunnel: false });
     p += n;
@@ -114,7 +115,7 @@ for (const key of Object.keys(INDEX.tiles_t)) {
   const a = new Int16Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
   for (let li = 1; li <= TC + 1; li++) for (let lj = 1; lj <= TC + 1; lj++) {
     const I = ty * TC + li - 1 - TG.I0, J = tx * TC + lj - 1 - TG.J0;
-    if (I >= 0 && I < TG.h && J >= 0 && J < TG.w) G[I * TG.w + J] = a[li * TN + lj] * 0.1;
+    if (I >= 0 && I < TG.h && J >= 0 && J < TG.w) G[I * TG.w + J] = Z16(a[li * TN + lj]);
   }
 }
 const G0 = G.slice();
@@ -128,9 +129,13 @@ function tri(x, y) {
 const meshZ = (x, y) => { const t = tri(x, y); return t ? G[t[0]] * t[3] + G[t[1]] * t[4] + G[t[2]] * t[5] : -1e9; };
 
 // ---------------------------------------------------------------- 2. 地形冒出路面
-const samples = [];   // x, y, 目標高度
-for (const w of ways) {
+// x, y, 目標高度 (地圖大了取樣點會超過一般陣列上限，用可擴充的 Float32Array)
+let samples = new Float32Array(1 << 22), sn = 0;
+let sWay = new Int32Array(1 << 20), curWay = 0;
+const addSample = (x, y, z) => { if (sn + 3 > samples.length) { const b = new Float32Array(samples.length * 2); b.set(samples); samples = b; } if (sn / 3 >= sWay.length) { const b = new Int32Array(sWay.length * 2); b.set(sWay); sWay = b; } sWay[sn / 3] = curWay; samples[sn++] = x; samples[sn++] = y; samples[sn++] = z; };
+for (const [wi, w] of ways.entries()) {
   if (w.tunnel) continue;
+  curWay = wi;
   const P = w.P, br = w.bridge;
   const offs = br ? [-(w.hw + 0.5), -w.hw * 0.5, 0, w.hw * 0.5, w.hw + 0.5] : [-(w.hw + 1.2), -w.hw * 0.5, 0, w.hw * 0.5, w.hw + 1.2];
   const drop = br ? 2.0 : (w.city ? 0.32 : 0.4);
@@ -140,7 +145,7 @@ for (const w of ways) {
     const nx = -(by - ay) / L, ny = (bx - ax) / L, steps = Math.max(1, Math.ceil(L / 4));
     for (let s = 0; s <= steps; s++) {
       const t = s / steps, x = ax + (bx - ax) * t, y = ay + (by - ay) * t, z = az + (bz - az) * t;
-      for (const o of offs) samples.push(x + nx * o, y + ny * o, z - drop);
+      for (const o of offs) addSample(x + nx * o, y + ny * o, z - drop);
     }
   }
 }
@@ -148,15 +153,17 @@ let carvedMax = 0;
 for (let pass = 0; pass < 6; pass++) {
   const req = new Float64Array(G.length);
   let bad = 0;
-  for (let k = 0; k < samples.length; k += 3) {
+  for (let k = 0; k < sn; k += 3) {
     const t = tri(samples[k], samples[k + 1]); if (!t) continue;
     const d = G[t[0]] * t[3] + G[t[1]] * t[4] + G[t[2]] * t[5] - samples[k + 2];
     if (d <= 0.02) continue;
+    if (pass === 0 && d > 40 && process.env.CLIPDBG) { const w = ways[sWay[k / 3]]; (globalThis.DBG ||= new Map()).set(w, Math.max(d, globalThis.DBG.get(w) || 0)); }
     bad++;
     for (let m = 0; m < 3; m++) if (d + 0.02 > req[t[m]]) req[t[m]] = d + 0.02;
   }
   for (let q = 0; q < G.length; q++) if (req[q] > 0) G[q] -= req[q];
   console.log('terrain pass', pass, 'samples above road', bad);
+  if (pass === 0 && globalThis.DBG) { const a = [...globalThis.DBG].sort((p, q) => q[1] - p[1]); console.log('deep carve ways', a.length); for (const [w, d] of a.slice(0, 25)) { const zs = []; for (let i = 0; i < w.n; i++) zs.push(w.P[i*3].toFixed(0)+','+w.P[i*3+1].toFixed(0)+','+w.P[i*3+2].toFixed(0)); let mi=0,ma=0; for (let i=0;i<w.n;i++){ if(w.P[i*3+2]<w.P[mi*3+2])mi=i; if(w.P[i*3+2]>w.P[ma*3+2])ma=i;} console.log('n',w.n,'min',zs[mi],'@',mi,'max',zs[ma],'@',ma, 'meshZ at min', meshZ(w.P[mi*3],w.P[mi*3+1]).toFixed(0), 'meshZ at max', meshZ(w.P[ma*3],w.P[ma*3+1]).toFixed(0)); console.log(zs.slice(Math.max(0,ma-5),ma+5).join(' ')); } for (const [w, d] of a.slice(0, 25)) console.log(' ', w.city ? 'city' : 'fwy', w.gid, w.name, 'br', w.bridge, 'd', d.toFixed(1), 'xy', w.P[0].toFixed(0), w.P[1].toFixed(0), 'z', w.P[2].toFixed(1)); process.exit(0); }
   if (!bad) break;
 }
 let nLow = 0; for (let q = 0; q < G.length; q++) { const d = G0[q] - G[q]; if (d > 0.01) nLow++; carvedMax = Math.max(carvedMax, d); }

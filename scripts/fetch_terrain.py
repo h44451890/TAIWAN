@@ -15,7 +15,7 @@ OUT = os.path.join(HERE, "..", "data", "terrain")
 URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 
 # 台北段範圍 (南, 西, 北, 東)，與 OSM 查詢一致，外加一點邊界
-BBOX = (24.84, 121.09, 25.21, 121.81)
+BBOX = (23.99, 120.44, 25.21, 121.93)
 ZOOM = 13
 
 
