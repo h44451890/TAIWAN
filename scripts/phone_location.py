@@ -138,7 +138,7 @@ def android_prepare():
 def android_set(lat, lon, speed, course):
     adb("shell", "am", "start-foreground-service", "--user", "0", "-n", f"{APPIUM}/.LocationService",
         "--es", "latitude", f"{lat:.7f}", "--es", "longitude", f"{lon:.7f}", "--es", "altitude", "10",
-        "--es", "speed", f"{speed:.1f}", "--es", "bearing", f"{course:.0f}")
+        "--es", "speed", f"{speed:.2f}", "--es", "bearing", f"{course:.1f}", "--es", "accuracy", "3")
 
 
 def android_clear():
@@ -191,7 +191,7 @@ def worker():
     """背景: 有新座標 (移動超過 2 m 或超過 5 秒) 就送到手機；一次送一筆，自然限速。"""
     prepared = False
     while True:
-        time.sleep(0.25)
+        time.sleep(0.1)
         with LOCK:
             tgt, sent, sent_at, want_clear = STATE["target"], STATE["sent"], STATE["sent_at"], STATE["clear"]
             STATE["clear"] = False
@@ -204,7 +204,7 @@ def worker():
                 continue
             if tgt is None:
                 continue
-            if sent is not None and dist_m(tgt, sent) < 2 and time.time() - sent_at < 5:
+            if sent is not None and dist_m(tgt, sent) < 0.5 and abs(tgt[3] - sent[3]) < 2 and time.time() - sent_at < 2:
                 continue
             if ARGS.phone == "android" and not ARGS.dry_run and not prepared:
                 android_prepare()

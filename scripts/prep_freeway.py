@@ -21,7 +21,7 @@ from PIL import Image
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "..", "data")
 
-BBOX = (24.95, 121.40, 25.11, 121.70)  # 南, 西, 北, 東
+BBOX = (24.95, 121.40, 25.20, 121.80)  # 南, 西, 北, 東 (台北盆地 + 基隆)
 GRID_STEP_DEG = 0.0003                 # 地形網格約 30 m
 DENSIFY_M = 8.0                        # 路線加密間距
 LANE_W = 3.75                          # 國道車道寬
@@ -60,8 +60,8 @@ def tm2(lat, lon):
     return x, y
 
 
-_ox, _oy = tm2((BBOX[0] + BBOX[2]) / 2, (BBOX[1] + BBOX[3]) / 2)
-ORIGIN = (float(round(float(_ox), -2)), float(round(float(_oy), -2)))
+# 座標原點固定 (TWD97)，之後地圖擴大 (往台中) 也不會讓既有座標位移
+ORIGIN = (305500.0, 2769200.0)
 
 
 def local_xy(lat, lon):

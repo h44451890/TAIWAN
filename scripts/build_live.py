@@ -198,20 +198,39 @@ def main():
         if sn:
             etc.append(dict(id=gid, road=road, dir=d, m=int(gid[3:7]) * 100, way=sn[1], idx=sn[2]))
 
-    # 預設起點: 國1 南下、汐五高架底下 (東湖→內湖)，CMS 15.8K 看板前約 170 m
-    spawn = None
-    for c in cms:
-        if c["id"] == "CMS-N1-S-15.800-M":
-            P = np.array(ways[c["way"]]["pts"])
-            s_ = np.r_[0, np.cumsum(np.hypot(*np.diff(P[:, :2], axis=0).T))]
-            i = int(np.searchsorted(s_, max(s_[c["idx"]] - 170, 0)))
-            spawn = [c["way"], min(i, len(P) - 2)]
-    print("default spawn:", spawn)
+    # 起點: 國1 南下 0K (基隆端) 為預設；汐五高架底下 (CMS 15.8K 前 170 m) 放進傳送選單
+    def spawn_near_cms(cid, back_m):
+        for c in cms:
+            if c["id"] == cid:
+                P = np.array(ways[c["way"]]["pts"])
+                s_ = np.r_[0, np.cumsum(np.hypot(*np.diff(P[:, :2], axis=0).T))]
+                i = int(np.searchsorted(s_, max(s_[c["idx"]] - back_m, 0)))
+                return [c["way"], min(max(i, 1), len(P) - 2)]
+        return None
+
+    def spawn_near_ll(road, d, lat, lon):
+        """沒有看板時: 找同路同向主線上最近的點。"""
+        x, y = local_xy(lat, lon)
+        best = None
+        for k, w in enumerate(ways):
+            mp = way_map[k]
+            if not mp or mp[0] != road or mp[1] != d:
+                continue
+            P = np.array(w["pts"])
+            dd = np.hypot(P[:, 0] - x, P[:, 1] - y)
+            i = int(dd.argmin())
+            if best is None or dd[i] < best[0]:
+                best = (dd[i], k, min(max(i, 1), len(P) - 2))
+        return [best[1], best[2]] if best and best[0] < 800 else None
+
+    spawn = spawn_near_cms("CMS-N1-S-0.000-M", 0) or spawn_near_ll("國道1號", "S", 25.1231, 121.7358)
+    spawn_xiwu = spawn_near_cms("CMS-N1-S-15.800-M", 170)
+    print("default spawn (國1 0K 基隆):", spawn, " 汐五高架下:", spawn_xiwu)
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     out = dict(updateTime=tag(live_xml, "UpdateTime"), cmsUpdateTime=tag(cmsl_xml, "UpdateTime"),
                apiBase="https://node.tailfdfee1.ts.net/api", sections=sections, wayMap=way_map,
-               cms=cms, etc=etc, radio=RADIO, spawn=spawn)
+               cms=cms, etc=etc, radio=RADIO, spawn=spawn, spawnXiwu=spawn_xiwu)
     json.dump(out, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     mapped = sum(1 for x in way_map if x)
     main_n = sum(1 for w in ways if w["highway"] == "motorway")

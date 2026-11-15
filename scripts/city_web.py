@@ -77,8 +77,20 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
         u, v = fj - j, fi - i
         return ((1 - v) * ((1 - u) * GZ[i, j] + u * GZ[i, j + 1]) + v * ((1 - u) * GZ[i + 1, j] + u * GZ[i + 1, j + 1]))
 
-    # ---- 國道點 (接頭高度用)
-    FP = np.concatenate([np.array(w["pts"]) for w in fwy_ways])
+    # ---- 國道路網的「端點」(匝道末端接市區道路處)，只有這些點會讓一般道路高度銜接過去。
+    #      不能用所有國道點，否則經過高架橋旁的市區道路會被拉上橋面 (市區車橫越國道)。
+    cnt = {}
+    for w in fwy_ways:
+        for p in w["pts"]:
+            k = (round(p[0], 1), round(p[1], 1))
+            cnt[k] = cnt.get(k, 0) + 1
+    ends = []
+    for w in fwy_ways:
+        for p in (w["pts"][0], w["pts"][-1]):
+            if cnt[(round(p[0], 1), round(p[1], 1))] == 1:   # 沒有接其他國道路段 = 路網端點
+                ends.append(p)
+    FP = np.array(ends) if ends else np.zeros((0, 3))
+    print(f"freeway network ends for city joins: {len(FP)}")
 
     # ---- 一般道路
     osm = json.load(open(os.path.join(DATA, "taipei_city.json"), encoding="utf-8"))
@@ -148,6 +160,56 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
                 w_ = np.clip(1 - dist / 40.0, 0, 1)
                 z += (zf - 0.15 - z[end]) * w_ * w_ * (3 - 2 * w_)
                 joined += 1
+    # 立體交叉: 一般道路橫越國道/快速道路且高度差 < 5 m (例如橋頭旁被墊高的街道) -> 改成從下面穿過
+    #          (一般道路本身是橋則從上面跨過)，前後以 8% 坡度漸變，避免市區車輛開上國道橋面
+    from prep_freeway import pairs_within
+    FX, FY, FZ, FHW, FTX, FTY = [], [], [], [], [], []
+    for w in fwy_ways:
+        P = np.array(w["pts"])
+        if len(P) < 2:
+            continue
+        d = np.gradient(P[:, :2], axis=0)
+        L = np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-6)
+        FX.append(P[:, 0]); FY.append(P[:, 1]); FZ.append(P[:, 2]); FHW.append(np.full(len(P), w["width"] / 2))
+        FTX.append(d[:, 0] / L); FTY.append(d[:, 1] / L)
+    FX, FY, FZ, FHW, FTX, FTY = map(np.concatenate, (FX, FY, FZ, FHW, FTX, FTY))
+    CP = np.concatenate([r["P"] for r in roads])
+    CZ = np.concatenate([r["z"] for r in roads])
+    CR = np.concatenate([np.full(len(r["P"]), k) for k, r in enumerate(roads)])
+    CTX, CTY = [], []
+    for r in roads:
+        d = np.gradient(r["P"], axis=0) if len(r["P"]) > 1 else np.array([[1.0, 0.0]])
+        L = np.maximum(np.hypot(d[:, 0], d[:, 1]), 1e-6)
+        CTX.append(d[:, 0] / L); CTY.append(d[:, 1] / L)
+    CTX, CTY = np.concatenate(CTX), np.concatenate(CTY)
+    a, b = pairs_within(CP[:, 0], CP[:, 1], FX, FY, 22.0)
+    dx, dy = CP[a, 0] - FX[b], CP[a, 1] - FY[b]
+    along = dx * FTX[b] + dy * FTY[b]
+    lat = -dx * FTY[b] + dy * FTX[b]
+    cross = np.abs(CTX[a] * FTX[b] + CTY[a] * FTY[b]) < 0.85
+    hit = (np.abs(along) < 6) & (np.abs(lat) < FHW[b] + 2.5) & (np.abs(CZ[a] - FZ[b]) < 5.0) & cross
+    a, b = a[hit], b[hit]
+    fixed_roads = 0
+    if len(a):
+        start = np.r_[0, np.cumsum([len(r["P"]) for r in roads])]
+        target = {}
+        for ai, bi in zip(a, b):
+            k = int(CR[ai]); i = int(ai - start[k]); r = roads[k]
+            tz = FZ[bi] + 6.5 if r["bridge"] else FZ[bi] - 5.5
+            cur = target.setdefault(k, {})
+            cur[i] = max(cur.get(i, -1e9), tz) if r["bridge"] else min(cur.get(i, 1e9), tz)
+        for k, pts in target.items():
+            r = roads[k]
+            s = np.r_[0, np.cumsum(np.hypot(*np.diff(r["P"], axis=0).T))]
+            z = r["z"].copy()
+            for i, tz in pts.items():   # 8% 坡度錐
+                dz = tz - r["z"][i]
+                ramp = np.maximum(np.abs(dz) - 0.08 * np.abs(s - s[i]), 0.0) * np.sign(dz)
+                z = np.maximum(z, r["z"] + ramp) if dz > 0 else np.minimum(z, r["z"] + ramp)
+            r["z"] = z
+            fixed_roads += 1
+    print(f"city/freeway crossings fixed: {fixed_roads} roads ({len(a)} conflict points)")
+
     # 地形整平: 地面一般道路底下的格點往下壓到路面下 0.25 m
     gp = np.concatenate([np.c_[r["P"], r["z"], np.full(len(r["P"]), r["width"] / 2)] for r in roads if not r["bridge"]])
     fi = np.round((gp[:, 1] - Y0) / STEP).astype(int)
@@ -246,7 +308,9 @@ def build(DATA, local_xy, GZ, X0, Y0, STEP, fwy_ways):
     blob = b"".join([counts.tobytes(), xy0.tobytes(), bxy0.tobytes(), bbase.tobytes(), bh.tobytes(),
                      roff.tobytes(), rz.tobytes(), boff.tobytes(), bcnt.tobytes(), bcol.tobytes()])
     # ---- 傳送地點: [名稱, 種類, 路段索引, 點索引, 方向]
-    SPOTS = [("台北101 · 信義路", 25.0334, 121.5638, "city", None), ("台北車站 · 忠孝西路", 25.0463, 121.5168, "city", None),
+    SPOTS = [("基隆車站 · 中正路", 25.1318, 121.7400, "city", None), ("基隆 · 廟口 / 愛四路", 25.1290, 121.7435, "city", None),
+             ("國3 起點 · 基隆", 25.1530, 121.7050, "fwy", "福爾摩沙"), ("台62 萬里瑞濱線", 25.1240, 121.7150, "fwy", "萬里瑞濱"),
+             ("台北101 · 信義路", 25.0334, 121.5638, "city", None), ("台北車站 · 忠孝西路", 25.0463, 121.5168, "city", None),
              ("西門町 · 中華路", 25.0425, 121.5073, "city", None), ("大直 · 北安路", 25.0807, 121.5470, "city", None),
              ("板橋車站 · 縣民大道", 25.0140, 121.4640, "city", None), ("新店 · 北新路", 24.9790, 121.5410, "city", None),
              ("建國高架", 25.0420, 121.5370, "fwy", "建國"), ("市民大道高架", 25.0448, 121.5300, "fwy", "市民大道"),

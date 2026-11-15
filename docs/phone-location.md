@@ -56,7 +56,8 @@ python scripts/phone_location.py --dry-run
 | 遊戲顯示「連不到電腦上的橋接程式」 | 確認 `phone_location.py` 有在跑，而且遊戲開在同一台電腦 |
 | 顯示「找不到手機」 | 執行 `adb devices` 確認手機在清單裡；沒有的話重新 `adb connect`（連接埠可能變了） |
 | Google Maps 位置沒動 | 確認「選取模擬位置應用程式」是 Appium Settings；把 Google Maps 關掉重開 |
-| 位置一格一格跳 | 正常：大約每秒更新一次 |
+| 位置一格一格跳 | 正常：每秒更新 2 次 |
+| 藍點的方向（扇形光束）跟著手機轉，不是車子方向 | Google Maps 一般地圖上的光束是用**手機的指南針**決定的，Android 不允許沒有 root 的 App 假造指南針。遊戲已經把車子的**行進方向與速度**一起送進模擬定位；車子在移動時，Google Maps 的**導航模式**與神盾會改用行進方向。 |
 
 ## iPhone
 iPhone 也支援（`python scripts/phone_location.py --phone iphone`），但第一次一定要用 USB 線配對並開啟開發者模式，

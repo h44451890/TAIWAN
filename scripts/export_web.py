@@ -14,7 +14,11 @@ sys.path.insert(0, HERE)
 from prep_freeway import DATA, DEM, TERRAIN_ZOOM, inverse_local, local_xy  # noqa: E402
 
 STEP = 30.0
-X0, X1, Y0, Y1 = -15000.0, 15000.0, -8800.0, 8800.0
+# 地形網格範圍: 由 BBOX 四角投影，往內縮 150 m，對齊 30 m
+from prep_freeway import BBOX  # noqa: E402
+_cx, _cy = local_xy(np.array([BBOX[0], BBOX[0], BBOX[2], BBOX[2]]), np.array([BBOX[1], BBOX[3], BBOX[1], BBOX[3]]))
+X0, X1 = float(np.ceil((max(_cx[0], _cx[2]) + 150) / STEP) * STEP), float(np.floor((min(_cx[1], _cx[3]) - 150) / STEP) * STEP)
+Y0, Y1 = float(np.ceil((max(_cy[0], _cy[1]) + 150) / STEP) * STEP), float(np.floor((min(_cy[2], _cy[3]) - 150) / STEP) * STEP)
 
 
 def main():

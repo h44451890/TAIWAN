@@ -350,6 +350,9 @@ const matRoof = patch(new T.MeshStandardMaterial({ roughness: 0.9, metalness: 0,
   frag: 'varying vec3 vCol;',
   color: 'diffuseColor.rgb = vCol * (0.8 + 0.4 * fwyFbm(vObj * 0.2, 3));',
 });
+// 伸縮縫: 鋼板 + 橡膠縫
+const matJointSteel = new T.MeshStandardMaterial({ color: new T.Color(0.32, 0.33, 0.34), metalness: 0.85, roughness: 0.38 });
+const matJointRubber = new T.MeshStandardMaterial({ color: new T.Color(0.01, 0.01, 0.012), roughness: 0.9 });
 const matReflR = new T.MeshBasicMaterial({ color: new T.Color(0.75, 0.02, 0.02), toneMapped: false });
 const matReflY = new T.MeshBasicMaterial({ color: new T.Color(0.85, 0.55, 0.02), toneMapped: false });
 const matTunnel = concreteLike([0.55, 0.53, 0.48], 0.6, 0.2, 1.5);
@@ -446,6 +449,60 @@ function addRoad(c, w) {
     }
   }
   if (w.tunnel) addTunnel(c, w);
+}
+
+// ======================================================================= 伸縮縫 (橋梁接縫)
+// 每座橋墩上方與橋頭各一道；車輪壓過時「叩」一聲 (前輪、後輪各一下)
+const JOINTS = [], JGRID = new Map(), JCELL = 50;
+function addJoint(x, y, tx, ty, hw, z) {
+  const j = { x, y, tx, ty, hw, z };
+  JOINTS.push(j);
+  const r = hw + 2;
+  for (let cx = Math.floor((x - r) / JCELL); cx <= Math.floor((x + r) / JCELL); cx++)
+    for (let cy = Math.floor((y - r) / JCELL); cy <= Math.floor((y + r) / JCELL); cy++) {
+      const k = cx * 100003 + cy;
+      let a = JGRID.get(k); if (!a) JGRID.set(k, a = []); a.push(j);
+    }
+}
+function buildJoints(world) {
+  const steel = new GB(), rubber = new GB(), seen = new Set();
+  const mk = (x, y, z, tx, ty, hw) => {
+    const key = Math.round(x) + ',' + Math.round(y) + ',' + Math.round(z);
+    if (seen.has(key)) return;
+    seen.add(key);
+    const span = hw - 0.25;
+    box(steel, x + tx * 0.17, y + ty * 0.17, tx, ty, 0.12, span, z - 0.03, z + 0.012);
+    box(steel, x - tx * 0.17, y - ty * 0.17, tx, ty, 0.12, span, z - 0.03, z + 0.012);
+    box(rubber, x, y, tx, ty, 0.05, span, z - 0.03, z + 0.004);
+    addJoint(x, y, tx, ty, hw, z);
+  };
+  for (let k = 0; k < NPIER; k++) {   // 橋墩上方
+    const x = PIERS[k * 9], y = PIERS[k * 9 + 1], tx = PIERS[k * 9 + 2], ty = PIERS[k * 9 + 3], top = PIERS[k * 9 + 6];
+    const r = roadAt(x, y, top + 2.5, 0, 1.0);
+    if (r && Math.abs(r.z - (top + 2.2)) < 1.5) mk(x, y, r.z, tx, ty, r.w.hw);
+  }
+  for (const w of WAYS) {             // 橋頭 (橋接地面路段處)
+    if (!w.bridge || w.city) continue;
+    for (const i of [0, w.n - 1]) {
+      const others = PT_INDEX.get(ptKey(w.P[i * 3], w.P[i * 3 + 1])) || [];
+      if (!others.some(([k]) => k !== w.k && !WAYS[k].bridge)) continue;
+      mk(w.P[i * 3], w.P[i * 3 + 1], w.P[i * 3 + 2], w.ny[i], -w.nx[i], w.hw);
+    }
+  }
+  for (const m of [steel.mesh(matJointSteel), rubber.mesh(matJointRubber)]) if (m) world.add(m);
+}
+/** 車軸從 (ax,ay) 移到 (bx,by) 時有沒有壓過伸縮縫 */
+function crossedJoint(ax, ay, bx, by, z) {
+  const a = JGRID.get(Math.floor(bx / JCELL) * 100003 + Math.floor(by / JCELL));
+  if (!a) return false;
+  for (const j of a) {
+    if (Math.abs(z - j.z) > 1.5) continue;
+    const d0 = (ax - j.x) * j.tx + (ay - j.y) * j.ty, d1 = (bx - j.x) * j.tx + (by - j.y) * j.ty;
+    if (d0 * d1 > 0 || d0 === d1) continue;
+    const lat = (bx - j.x) * -j.ty + (by - j.y) * j.tx;
+    if (Math.abs(lat) <= j.hw) return true;
+  }
+  return false;
 }
 
 function box(g, cx, cy, tx, ty, hx, hy, z0, z1) {
@@ -595,6 +652,7 @@ function buildWorld() {
     }
     world.add(g.mesh(matTerrain));
   }
+  buildJoints(world);
   if (CITY && !params.has('nobld')) { buildBuildings(world); HOOKS.frame.push(cullBuildings); }   // nobld: 測試用，不建建築
   scene.add(world);
 }
@@ -1160,12 +1218,23 @@ function update(dt) {
     if (!r) { nx = S.x; ny = S.y; r = S.road; S.v *= 0.5; }
   }
   if (r) { S.x = nx; S.y = ny; S.road = r; }
+  // 伸縮縫: 前輪、後輪各自壓過時「叩」一聲，車身輕彈
+  {
+    const hb = WB / 2, cx = Math.cos(S.h), cy = Math.sin(S.h);
+    const fx1 = S.x + cx * hb, fy1 = S.y + cy * hb, rx1 = S.x - cx * hb, ry1 = S.y - cy * hb;
+    if (S.axF && Math.abs(S.v) > 1) {
+      if (crossedJoint(S.axF[0], S.axF[1], fx1, fy1, S.z)) { if (HOOKS.joint) HOOKS.joint(Math.abs(S.v), 0); S.jolt = 0.025; }
+      if (crossedJoint(S.axR[0], S.axR[1], rx1, ry1, S.z)) { if (HOOKS.joint) HOOKS.joint(Math.abs(S.v), 1); S.jolt = 0.02; }
+    }
+    S.axF = [fx1, fy1]; S.axR = [rx1, ry1];
+  }
   // 垂直
   const g = S.road ? S.road.z : terrainAt(S.x, S.y);
   if (S.z > g + 0.4) { S.vz -= 9.81 * dt; S.z += S.vz * dt; if (S.z < g) { S.z = g; S.vz = 0; } }
   else { S.z = g; S.vz = 0; }
   if (S.zVis == null || Math.abs(S.zVis - S.z) > 3) S.zVis = S.z;
   S.zVis += (S.z - S.zVis) * (1 - Math.exp(-dt * 14));
+  if (S.jolt) { S.zVis += S.jolt; S.jolt = 0; }   // 壓過伸縮縫的小彈跳 (會被平滑濾掉)
   // 車身姿態 (機車轉彎壓車)
   const fx = Math.cos(S.h), fy = Math.sin(S.h);
   const zs = (dx, dy) => { const q = roadAt(S.x + dx, S.y + dy, S.z + 0.5, 0, 1.0); return q ? q.z : S.z; };
@@ -1358,13 +1427,16 @@ window.TW = { T, scene, camera, renderer, WAYS, PT_INDEX, ptKey, S, LANE_W, road
 setStatus('建立國道與地形…');
 setTimeout(() => {
   buildWorld();
-  // 起點: 國1 南下汐五高架底下 (東湖→內湖)，由 build_live.py 依 CMS 看板位置算出；網址 ?spawn=路段,點 可覆寫
+  // 起點: 國1 南下 0K (基隆端)，由 build_live.py 依 0K 的 CMS 看板位置算出；網址 ?spawn=路段,點 可覆寫
   let sp = null;
   try { const el = $('extra-live'); if (el) sp = JSON.parse(el.textContent).spawn; } catch (e) { sp = null; }
   if (params.has('spawn')) sp = params.get('spawn').split(',').map(Number);
   if (sp) spawn(sp[0], sp[1]); else defaultSpawn();
   // 傳送選單地點
-  if (sp) SPAWNS.push({ name: '國1 汐五高架下（東湖→內湖）', way: sp[0], idx: sp[1], dir: 1 });
+  let live = null;
+  try { live = JSON.parse($('extra-live').textContent); } catch (e) { live = null; }
+  if (live && live.spawn) SPAWNS.push({ name: '基隆 · 國1 起點 0K（南下）', way: live.spawn[0], idx: live.spawn[1], dir: 1 });
+  if (live && live.spawnXiwu) SPAWNS.push({ name: '國1 汐五高架下（東湖→內湖）', way: live.spawnXiwu[0], idx: live.spawnXiwu[1], dir: 1 });
   try {
     const cm = JSON.parse($('city-meta').textContent);
     for (const [name, kind, wi, pi, dir] of cm.spawns || []) SPAWNS.push({ name, way: kind === 'city' ? NFWY + wi : wi, idx: pi, dir });
@@ -1374,13 +1446,18 @@ setTimeout(() => {
   if (params.has('t')) { // 測試用: 先跑幾秒
     autopilot = true; S.v = 25;
     const n = +params.get('t') * 30;
-    for (let i = 0; i < n; i++) { update(1 / 30); for (const f of HOOKS.update) f(1 / 30); }
+    for (let i = 0; i < n; i++) {
+      update(1 / 30); for (const f of HOOKS.update) f(1 / 30);
+      if (params.has('trace') && i % 150 === 0 && S.rt) console.log('[trace]', (i / 30).toFixed(0) + 's', S.rt.w.k, S.rt.w.ref, S.rt.w.name, S.rt.w.link ? 'link' : '', 'dir', S.rt.dir, 'i', S.rt.i, '/', S.rt.w.n, 'v', (S.v * 3.6).toFixed(0),
+        window.TWX ? (() => { let b = null, bd = 1e9; for (const c of TWX.cars) if (c.alive) { const d = Math.hypot(c.x - S.x, c.y - S.y); if (d < bd) { bd = d; b = c; } }
+          return b ? `| nearest AI ${b.type} d=${bd.toFixed(1)} v=${(b.v * 3.6).toFixed(0)} w=${b.w.k} s=${b.s.toFixed(0)}/${b.w.s[b.w.n - 1].toFixed(0)} dir=${b.dir} dead=${b.deadEnd} plan=${b.plan ? (b.plan.none ? 'none' : b.plan.o.k) : '-'} dh=${(((b.h - S.h) * 180 / Math.PI) % 360).toFixed(0)}` : ''; })() : '');
+    }
     autopilot = params.has('demo') || params.has('keep');
     console.log('[test] simulated', params.get('t'), 's; speed', (S.v * 3.6).toFixed(0), 'km/h; lane', S.apLane,
       '; player bumps', window.TWX ? TWX.stats.bumps : '-', '; AI overlaps', window.TWX ? TWX.overlaps() : '-',
       '; AI lane changes', window.TWX ? TWX.stats.laneChanges : '-', '; player lane changes', S.apChanges || 0,
       '; pos', S.x.toFixed(1), S.y.toFixed(1), S.z.toFixed(1), 'zVis', S.zVis, '; road', S.road ? (S.road.w.name || S.road.w.k) : null,
-      '; lead', HOOKS.leader ? JSON.stringify(HOOKS.leader(0)) : '-', '; city turns', window.TWX ? TWX.stats.turns : '-', '; nan', window.TWX ? TWX.stats.nan : '-');
+      '; lead', HOOKS.leader ? JSON.stringify(HOOKS.leader(0)) : '-', '; city turns', window.TWX ? TWX.stats.turns : '-', '; nan', window.TWX ? TWX.stats.nan : '-', '; joints', window.TWX ? (TWX.stats.joints || 0) : '-');
   }
   syncCar(0); updateCamera(1);
   $('loading').classList.add('hidden');

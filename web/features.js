@@ -71,7 +71,7 @@ async function fetchJson(url, ms) {
   } finally { clearTimeout(tm); }
 }
 async function pollSpeed() {
-  let wait = 60000;
+  let wait = 30000;
   try {
     const [j, src] = await fetchLive('/freeway-speed');
     if (j && j.ok && j.data && Array.isArray(j.data.items)) {
@@ -79,7 +79,7 @@ async function pollSpeed() {
       trafficSource = '即時 ' + fmtTime(j.data.updateTime) + '（' + src + '）';
       recomputeTraffic();
       for (const c of cars) if (c.alive) c.v0 = desiredSpeed(c);
-      wait = (j.data.nextUpdateIn || 60000) + Math.random() * 1500;
+      wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);   // 國道路況時時更新: 最多 30 秒抓一次
     }
   } catch (e) { /* 連不到後端: 沿用快照 */ }
   setTimeout(pollSpeed, wait);
@@ -352,6 +352,8 @@ function leaderFor(me, shift) {
     const dx = o.x - me.x, dy = o.y - me.y;
     if (dx * dx + dy * dy > 40000) return;
     const d = dx * fx + dy * fy, lat = -dx * fy + dy * fx, cs = Math.cos(o.h - me.h);
+    const oCity = o.isPlayer ? !!(o.w && o.w.city) : o.pool === 'city', meCity = me.isPlayer ? !!(me.w && me.w.city) : me.pool === 'city';
+    if (oCity !== meCity && Math.abs(cs) < 0.7) return;   // 不同路網的交叉 (上下穿越) 互不影響
     if (cs >= 0.3) {
       if (d <= 0 || d > 160) return;
       const hw = (me.wid + o.wid) / 2 + 0.05;
@@ -494,6 +496,8 @@ function collidePlayer(dt) {
   const pcx = S.x + fx * pOff, pcy = S.y + fy * pOff;
   for (const c of cars) {
     if (!c.alive || Math.abs(c.z - S.z) > 2) continue;
+    // 國道車與市區車垂直交會 (不同路網的立體交叉) 不算碰撞
+    if (S.road && (c.pool === 'city') !== !!S.road.w.city && Math.abs(Math.cos(c.h - S.h)) < 0.7) continue;
     const cOff = (c.front - c.rear) / 2, cHalf = (c.front + c.rear) / 2;
     const ccx = c.x + Math.cos(c.h) * cOff, ccy = c.y + Math.sin(c.h) * cOff;
     const dx = ccx - pcx, dy = ccy - pcy;
@@ -766,7 +770,7 @@ function updateSigns(dt) {
   }
 }
 async function pollCms() {
-  let wait = 60000;
+  let wait = 30000;
   try {
     const [j] = await fetchLive('/cms');
     if (j && j.ok && j.data && Array.isArray(j.data.items)) {
@@ -779,7 +783,7 @@ async function pollCms() {
           if (sg.model && pages.length) { const t = sg.model.faceMat.map; t.image = boardCanvas(pages[0]); t.needsUpdate = true; }
         }
       }
-      wait = (j.data.nextUpdateIn || 60000) + Math.random() * 1500;
+      wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);
     }
   } catch (e) { /* 沿用快照 */ }
   setTimeout(pollCms, wait);
@@ -916,6 +920,22 @@ const sound = (() => {
     nodes.sqG.gain.setTargetAtTime(enabled && latAcc > 6.5 ? Math.min(0.25, (latAcc - 6.5) * 0.05) : 0, t, 0.05);
     if (gearEl) gearEl.textContent = (S.v < -0.3 ? 'R' : gear) + ' 檔 · ' + Math.round(rpm) + ' rpm';
   }
+  function knock(v, axle) {   // 伸縮縫「叩」: 低沉撞擊 + 金屬聲，車速越快越大聲
+    if (!ac || !enabled) return;
+    const t = ac.currentTime, k = Math.min(1, 0.25 + v / 28) * (axle ? 0.85 : 1);
+    const o = ac.createOscillator(), og = ac.createGain();
+    o.type = 'sine'; o.frequency.setValueAtTime(95, t); o.frequency.exponentialRampToValueAtTime(42, t + 0.09);
+    og.gain.setValueAtTime(0.9 * k, t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.12);
+    o.connect(og); og.connect(nodes.comp); o.start(t); o.stop(t + 0.14);
+    const s = ac.createBufferSource(); s.buffer = nodes.nb;
+    const f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 260; f.Q.value = 1.4;
+    const g = ac.createGain(); g.gain.setValueAtTime(0.7 * k, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.06);
+    s.connect(f); f.connect(g); g.connect(nodes.comp); s.start(t); s.stop(t + 0.08);
+    const m = ac.createOscillator(), mg = ac.createGain();
+    m.type = 'triangle'; m.frequency.value = 1350;
+    mg.gain.setValueAtTime(0.05 * k, t); mg.gain.exponentialRampToValueAtTime(0.0005, t + 0.035);
+    m.connect(mg); mg.connect(nodes.comp); m.start(t); m.stop(t + 0.05);
+  }
   function bump() {
     if (!ac || !enabled) return;
     const s = ac.createBufferSource(); s.buffer = nodes.nb;
@@ -940,7 +960,7 @@ const sound = (() => {
   const unlock = () => { init(); if (ac.state === 'suspended') ac.resume(); };
   window.addEventListener('keydown', unlock, { once: false });
   window.addEventListener('pointerdown', unlock, { once: false });
-  return { update, bump, blinker, toggle, get on() { return enabled; } };
+  return { update, bump, knock, blinker, toggle, get on() { return enabled; } };
 })();
 
 window.addEventListener('keydown', (e) => {
@@ -1020,7 +1040,7 @@ const gpsSync = (() => {
     if (!on) post('/clear').catch(() => {});
     show();
   }
-  function frame(dt) { if (!on) return; clock -= dt; if (clock <= 0) { clock = 1; send(); } }
+  function frame(dt) { if (!on) return; clock -= dt; if (clock <= 0) { clock = 0.5; send(); } }   // 每秒 2 次，手機 App 才會判定「正在移動」並用行進方向
   const btn = $('menu-gps');
   if (btn) btn.addEventListener('click', toggle);
   window.addEventListener('keydown', (e) => { if (e.code === 'KeyL') toggle(); });
@@ -1063,6 +1083,7 @@ TW.HOOKS.init.push(() => {
   if (TW.params.has('gpsauto')) gpsSync.toggle();      // 測試用
 });
 TW.HOOKS.update.push((dt) => { updateTraffic(dt); });
+TW.HOOKS.joint = (v, axle) => { stats.joints = (stats.joints || 0) + 1; sound.knock(v, axle); };
 TW.HOOKS.frame.push((dt) => { updateSigns(dt); sound.update(dt); sound.blinker(); updateTrafficHud(dt); gpsSync.frame(dt); });
 // 除錯/測試: AI 車之間互相重疊的對數
 function overlaps() {
