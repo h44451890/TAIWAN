@@ -1,6 +1,6 @@
 <?xml version="1.0" ?>
 <SectionList xmlns="http://traffic.transportdata.tw/standard/traffic/schema/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://traffic.transportdata.tw/standard/traffic/schema/a">
-  <UpdateTime>2026-11-15T17:30:12</UpdateTime>
+  <UpdateTime>2026-11-15T21:29:12</UpdateTime>
   <UpdateInterval>86400</UpdateInterval>
   <AuthorityCode>NFB</AuthorityCode>
   <LinkVersion>25.12.1</LinkVersion>

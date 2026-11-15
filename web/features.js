@@ -1544,6 +1544,66 @@ TW.HOOKS.init.push(() => {
   if (TW.params.get('radio') === 'auto') radio.toggle(); // 測試用
   if (TW.params.has('gpsauto')) gpsSync.toggle();      // 測試用
 });
+// ======================================================================= 樹木 (玩家附近的山坡、山區)
+// 18 m 一格，依格子雜湊決定有沒有樹 (同一個地方每次都一樣)。只長在坡度 6° 以上或海拔 150 m 以上 (山區少建築)，
+// 道路兩側 8 m 內、高架下方都不種。玩家移動 150 m 以上才重新排一次。
+const trees = (() => {
+  if (TW.params.has('notrees')) return { update() {} };
+  const CAP = TW.MOBILE ? 1800 : 7000, R = TW.MOBILE ? 450 : 900, STEP = 18;
+  const crownGeo = new T.IcosahedronGeometry(1, 1);
+  { // 樹冠稍微壓扁、表面不規則
+    const p = crownGeo.getAttribute('position');
+    for (let i = 0; i < p.count; i++) { const k = 0.85 + 0.3 * Math.abs(Math.sin(p.getX(i) * 7.1 + p.getZ(i) * 5.3)); p.setXYZ(i, p.getX(i) * k, p.getY(i) * 0.8 * k, p.getZ(i) * k); }
+    crownGeo.computeVertexNormals();
+  }
+  const trunkGeo = new T.CylinderGeometry(0.12, 0.2, 1, 6);
+  const crown = new T.InstancedMesh(crownGeo, new T.MeshStandardMaterial({ roughness: 0.9, metalness: 0, flatShading: true }), CAP);
+  const trunk = new T.InstancedMesh(trunkGeo, new T.MeshStandardMaterial({ color: 0x3b2a1c, roughness: 0.95 }), CAP);
+  for (const m of [crown, trunk]) { m.castShadow = true; m.receiveShadow = true; m.count = 0; m.frustumCulled = false; TW.scene.add(m); }
+  const M4 = new T.Matrix4(), Q = new T.Quaternion(), V = new T.Vector3(), SC = new T.Vector3(), COL = new T.Color(), UP = new T.Vector3(0, 1, 0);
+  const hash = (i, j, k) => { let h = (i * 374761393 + j * 668265263 + k * 2147483647) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); return ((h ^ (h >>> 16)) >>> 0) / 4294967296; };
+  let cx = 1e9, cy = 1e9;
+  function rebuild() {
+    cx = S.x; cy = S.y;
+    let n = 0;
+    const i0 = Math.floor((cx - R) / STEP), i1 = Math.floor((cx + R) / STEP), j0 = Math.floor((cy - R) / STEP), j1 = Math.floor((cy + R) / STEP);
+    for (let i = i0; i <= i1 && n < CAP; i++) for (let j = j0; j <= j1 && n < CAP; j++) {
+      const x = (i + hash(i, j, 1)) * STEP, y = (j + hash(i, j, 2)) * STEP;
+      if ((x - cx) ** 2 + (y - cy) ** 2 > R * R) continue;
+      const z = TW.terrainAt(x, y);
+      if (!z && z !== 0) continue;
+      const sl = Math.hypot(TW.terrainAt(x + 6, y) - z, TW.terrainAt(x, y + 6) - z) / 6;   // 坡度 (tan)
+      let dens = sl > 0.1 ? 0.75 : z > 150 ? 0.55 : 0;
+      if (z > 3000) dens *= 0.3;                       // 高山: 草原、樹少
+      if (sl > 1.2) dens *= 0.4;                       // 懸崖
+      if (hash(i, j, 3) > dens) continue;
+      if (TW.roadAt(x, y, z + 30, -8, 0)) continue;     // 道路附近、高架下方不種
+      const h = 6 + hash(i, j, 4) * 9, w = h * (0.32 + hash(i, j, 5) * 0.14);
+      Q.setFromAxisAngle(UP, hash(i, j, 6) * 6.28);
+      M4.compose(V.set(x, z + h * 0.62, -y), Q, SC.set(w, h * 0.42, w)); crown.setMatrixAt(n, M4);
+      M4.compose(V.set(x, z + h * 0.2 - 0.3, -y), Q, SC.set(1, h * 0.45, 1)); trunk.setMatrixAt(n, M4);
+      const g = hash(i, j, 7);
+      crown.setColorAt(n, COL.setRGB(0.03 + g * 0.04, 0.07 + g * 0.06, 0.025 + g * 0.02));
+      n++;
+    }
+    crown.count = trunk.count = n;
+    crown.instanceMatrix.needsUpdate = trunk.instanceMatrix.needsUpdate = true;
+    if (crown.instanceColor) crown.instanceColor.needsUpdate = true;
+  }
+  let clock = 0, since = 0, early = 0;
+  return {
+    update(dt) {
+      if ((clock -= dt) > 0) return; clock = 0.5;
+      since += 0.5;
+      // 移動 150 m 重排；剛開始或傳送後地形分區陸續載入，前幾次每 3 秒補排
+      if (Math.hypot(S.x - cx, S.y - cy) > 150) { early = 0; since = 0; rebuild(); }
+      else if (early < 6 && since > 3) { early++; since = 0; rebuild(); }
+    },
+    get count() { return crown.count; },
+  };
+})();
+TW.HOOKS.update.push((dt) => trees.update(dt));
+
 let densClock = 0;
 if (TW.params.has('densdbg')) TW.HOOKS.update.push((dt) => {   // 測試: 玩家附近國道車數
   if ((densClock += dt) < 5) return; densClock = 0;

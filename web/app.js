@@ -210,15 +210,30 @@ function buildSky() {
     vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
     fragmentShader: `
       varying vec3 vDir; uniform vec3 sunDir;
+      float h3(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+      float n3(vec3 x){ vec3 i=floor(x); vec3 f=fract(x); f=f*f*(3.0-2.0*f);
+        return mix(mix(mix(h3(i),h3(i+vec3(1,0,0)),f.x), mix(h3(i+vec3(0,1,0)),h3(i+vec3(1,1,0)),f.x),f.y),
+                   mix(mix(h3(i+vec3(0,0,1)),h3(i+vec3(1,0,1)),f.x), mix(h3(i+vec3(0,1,1)),h3(i+vec3(1,1,1)),f.x),f.y), f.z); }
+      float fbm(vec3 p){ float a=0.5, s=0.0; for(int i=0;i<6;i++){ s+=a*n3(p); p*=2.03; a*=0.5; } return s; }
       void main(){
         vec3 d = normalize(vDir);
         float e = d.y;
-        vec3 zenith = vec3(0.16, 0.30, 0.62);
-        vec3 horizon = vec3(0.62, 0.70, 0.80);
+        vec3 zenith = vec3(0.13, 0.27, 0.58);
+        vec3 horizon = vec3(0.66, 0.73, 0.82);
         vec3 ground = vec3(0.10, 0.11, 0.10);
-        vec3 col = e > 0.0 ? mix(horizon, zenith, pow(e, 0.45)) : mix(horizon, ground, pow(min(-e*4.0,1.0),0.6));
+        vec3 col = e > 0.0 ? mix(horizon, zenith, pow(e, 0.5)) : mix(horizon, ground, pow(min(-e*4.0,1.0),0.6));
         float s = max(dot(d, sunDir), 0.0);
-        col += vec3(1.0,0.85,0.6) * pow(s, 8.0) * 0.25;   // 只有光暈、沒有太陽圓盤 (與 Blender sun_disc=False 相同)
+        col += vec3(1.0,0.85,0.6) * (pow(s, 8.0) * 0.25 + pow(s, 64.0) * 0.6);   // 太陽光暈
+        col = mix(col, horizon * 1.05, exp(-max(e, 0.0) * 18.0) * 0.6);              // 地平線霧氣 (台灣常見的灰白天際)
+        // 積雲: 投影到雲層高度平面，fbm 取閾值；向陽面亮、底部灰
+        if (e > 0.0) {
+          vec2 uv = d.xz / (e + 0.12) * 1.6;
+          float c = fbm(vec3(uv, 0.0) * 1.3) * 0.8 + fbm(vec3(uv * 4.0, 1.7)) * 0.25;
+          float cov = smoothstep(0.52, 0.78, c) * smoothstep(0.02, 0.2, e);
+          float lit = 0.75 + 0.35 * fbm(vec3(uv * 4.0 + sunDir.xz * 0.3, 3.1)) + 0.25 * pow(s, 4.0);
+          vec3 cloud = mix(vec3(0.55, 0.58, 0.63), vec3(1.0, 0.98, 0.95), clamp(lit - 0.35, 0.0, 1.0));
+          col = mix(col, cloud, cov * 0.92);
+        }
         gl_FragColor = vec4(col, 1.0);
       }`,
   });
@@ -237,7 +252,7 @@ scene.fog = new T.FogExp2(HORIZON.clone(), 0.000045);
 
 const sun = new T.DirectionalLight(0xffffff, 3.2);   // 與 Blender 太陽強度相同
 sun.castShadow = true;
-sun.shadow.mapSize.set(MOBILE ? 1024 : 2048, MOBILE ? 1024 : 2048);
+sun.shadow.mapSize.set(MOBILE ? 1024 : 4096, MOBILE ? 1024 : 4096);
 const SC = sun.shadow.camera; SC.left = -90; SC.right = 90; SC.top = 90; SC.bottom = -90; SC.near = 1; SC.far = 1500;
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
@@ -433,13 +448,34 @@ const matReflR = new T.MeshBasicMaterial({ color: new T.Color(0.75, 0.02, 0.02),
 const matReflY = new T.MeshBasicMaterial({ color: new T.Color(0.85, 0.55, 0.02), toneMapped: false });
 const matTunnel = concreteLike([0.55, 0.53, 0.48], 0.6, 0.2, 1.5);
 const matTunnelLight = new T.MeshStandardMaterial({ color: 0x000000, emissive: new T.Color(1.0, 0.82, 0.55), emissiveIntensity: 2.5 });
+// 地形: 依坡度與高度上色 — 平地是田野、草地拼塊，山坡是闊葉林 (近看有一叢叢樹冠)，陡坡露岩，高山 (2500 m 以上) 是箭竹草原
 const matTerrain = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness: 0 }), {
+  vert: 'varying vec3 vTN;',
+  vmain: 'vTN = normal;',
+  frag: 'varying vec3 vTN;',
   color: `{
-    float t = clamp((vObj.z - 15.0) / (90.0 - 15.0), 0.0, 1.0);
-    float n1 = fwyFbm(vObj*0.004, 5);
-    vec3 low = mix(vec3(0.055,0.068,0.045), vec3(0.075,0.085,0.06), n1);     // 盆地: 灰綠 (都市+綠地)
-    vec3 high = mix(vec3(0.016,0.042,0.014), vec3(0.032,0.068,0.024), n1);   // 山區: 闊葉林深綠
-    diffuseColor.rgb = mix(low, high, t);
+    float slope = 1.0 - clamp(normalize(vTN).y, 0.0, 1.0);          // 0 平地 .. 1 垂直
+    float z = vObj.z;
+    float n1 = fwyFbm(vObj * 0.004, 5), n2 = fwyFbm(vObj * 0.0012 + 7.3, 4);
+    float camD = length(vViewPosition);
+    float near = 1.0 - smoothstep(250.0, 900.0, camD);               // 細節只在近處 (遠處會閃)
+    // 平地: 田野拼塊 (約 60 m 一塊) + 草地 + 灰色 (村落、空地)
+    vec2 cell = floor(vObj.xy / vec2(70.0, 48.0) + n1 * 1.5);
+    float fh = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+    vec3 field = fh < 0.35 ? vec3(0.085, 0.11, 0.045) : fh < 0.6 ? vec3(0.06, 0.09, 0.035) : fh < 0.8 ? vec3(0.11, 0.105, 0.06) : vec3(0.075, 0.075, 0.068);
+    vec3 flat_ = mix(mix(vec3(0.07, 0.085, 0.05), vec3(0.09, 0.1, 0.06), n1), field, 0.55 * (1.0 - smoothstep(150.0, 400.0, z)));
+    // 山坡: 闊葉林，近看有樹冠 (亮綠頂、暗綠縫)
+    float canopy = fwyFbm(vObj * 0.11, 3);
+    vec3 forest = mix(vec3(0.018, 0.045, 0.016), vec3(0.04, 0.078, 0.028), n1 * 0.7 + n2 * 0.3);
+    forest *= mix(1.0, 0.55 + 0.9 * canopy, near);
+    vec3 rock = mix(vec3(0.09, 0.085, 0.075), vec3(0.13, 0.12, 0.1), n2);
+    vec3 alpine = mix(vec3(0.075, 0.085, 0.04), vec3(0.11, 0.1, 0.055), n1);
+    float fw = smoothstep(0.006, 0.045, slope + (n2 - 0.5) * 0.02) * (1.0 - smoothstep(40.0, 10.0, z) * 0.6);   // 坡度 6°~17° 漸變成森林
+    fw = max(fw, smoothstep(250.0, 500.0, z) * 0.85);
+    vec3 c = mix(flat_, forest, fw);
+    c = mix(c, rock, smoothstep(0.45, 0.62, slope + (n1 - 0.5) * 0.1));   // 57° 以上的陡崖才露岩
+    c = mix(c, alpine, smoothstep(2400.0, 2900.0, z + (n2 - 0.5) * 300.0) * (1.0 - smoothstep(0.6, 0.8, slope)));
+    diffuseColor.rgb = c;
   }`,
 });
 

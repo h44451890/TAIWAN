@@ -229,7 +229,7 @@ def main():
 
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
     out = dict(updateTime=tag(live_xml, "UpdateTime"), cmsUpdateTime=tag(cmsl_xml, "UpdateTime"),
-               apiBase="https://node.tailfdfee1.ts.net/api", sections=sections, wayMap=way_map,
+               apiBase="https://node-1.tailfdfee1.ts.net/api", sections=sections, wayMap=way_map,
                cms=cms, etc=etc, radio=RADIO, spawn=spawn, spawnXiwu=spawn_xiwu)
     json.dump(out, open(OUT, "w", encoding="utf-8"), ensure_ascii=False, separators=(",", ":"))
     mapped = sum(1 for x in way_map if x)

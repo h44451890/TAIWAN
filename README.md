@@ -51,6 +51,7 @@
 - **手機定位同步**：遊戲位置即時送到 Android（adb 無線偵錯 + Appium Settings）或 iPhone 的模擬定位，Google Maps、神盾會跟著移動。
 - **AI 車流**：最多 90 台（多種顏色，包含計程車黃，以及轎車、休旅、掀背三種車型）。採 IDM 跟車模型，會依前車加減速並保持安全距離，前車慢時會安全換道超車，也會回到外側車道。AI 車輛也會閃避玩家；只會在 750 m 外生成、1.8 km 外回收，不會在眼前突然消失。
 - **即時路況**：高公局路段車速決定 AI 車速與車流密度。車子總數固定，玩家所在路段越塞，國道車就集中在越小的範圍（車多約 3～5 倍、壅塞 7～9 倍密度），塞車時眼前真的是一排車。小地圖只有路況才上色（國道底色改成中性灰，不會和路況顏色混淆）；連得上智行地圖伺服器時，再疊上它的 `/traffic/segments` 圖層（國道 + 臺北、桃園市區官方路況 + 手機回報）。
+- **畫面**：天空有程序生成的積雲與地平線霧氣；地形依坡度與高度上色（平地田野拼塊、山坡闊葉林、57° 以上陡崖露岩、2500 m 以上高山草原），近看有樹冠紋理；玩家附近（電腦 900 m、手機 450 m）的山坡長出立體樹木（避開道路與高架下方）；電腦版陰影 4096。
 - **中央分隔島**：風化混凝土護欄（雨痕、大片黑色污漬、底部青苔）＋ 綠色防眩板（每 4 m 一片，雙向路面緊貼時只放一排）。
 - **CMS 電子看板**：145 座，位置與訊息來自高公局，造型參考 Smart-Nav-Map `cms_3d.js`（鋼桁架、LED 點陣看板、閃光燈、里程牌），多則訊息每 5 秒輪播。
 - **ETC 門架**：50 座，每個車道上方一組偵測器，並附門架編號牌。
@@ -60,7 +61,7 @@
 - **引擎音效**：Web Audio 即時合成，包含 6 速自動變速、轉速對應音高、油門越大聲音越渾厚、換檔頓挫、進氣聲、風切與胎噪、過彎胎叫，以及碰撞聲。
 
 ## 即時資料
-網頁依序試：本機 `phone_location.py` → Smart-Nav-Map 後端（預設 `https://node.tailfdfee1.ts.net/api`，提供 `/freeway-speed`、`/cms`、`/traffic/segments`）→ 打包當下的快照（`data/live/*.xml`）。
+網頁依序試：本機 `phone_location.py` → Smart-Nav-Map 後端（預設 `https://node-1.tailfdfee1.ts.net/api`，提供 `/freeway-speed`、`/cms`、`/traffic/segments`）→ 打包當下的快照（`data/live/*.xml`）。
 本機伺服器照 Smart-Nav-Map `lib/upstream.js` 的作法，依高公局檔案的 Last-Modified 推算下一次更新時間，一到就抓（還沒更新每 3 秒用 HEAD 問一次），網頁照回傳的 `nextUpdateIn` 來拿，資料一更新就拿到。
 路況列顯示「即時 · N 秒前（本機／後端）」；兩個伺服器都連不到才顯示「離線快照」。GitHub Pages 是靜態網頁，手機上要即時路況必須開著智行地圖的後端伺服器（`Smart-Nav-Map/server/啟動伺服器.bat` + Tailscale Funnel）。
 
@@ -69,7 +70,7 @@
 |---|---|
 | `台灣.html` | 打包好的單一網頁 |
 | `blender/taipei_freeway.blend` | Blender 檔 |
-| `data/taipei_fwy.json` | OSM 國道 + 快速道路資料（範圍 24.00–25.20N, 120.45–121.92E：基隆到台中、國5 全線南港→雪山隧道→頭城→蘇澳）。一般道路與建築目前有基隆～桃園和台中，新竹、苗栗、宜蘭市區還在補 |
+| `data/taipei_fwy.json` | OSM 國道 + 快速道路資料（範圍 24.00–25.20N, 120.45–121.92E：基隆到台中、國5 全線南港→雪山隧道→頭城→蘇澳）。一般道路與建築涵蓋基隆、台北、桃園、新竹、苗栗、台中、宜蘭 |
 | `data/terrain_grid.npz` | prep_freeway.py 產生的整平地形（150 MB 以上，不放進 git，重跑 prep_freeway.py 就有） |
 | `scripts/fix_clip.mjs` | 穿模修復：路口高度、地形、建築、橋墩（tile_web.py 之後執行） |
 | `data/terrain/` | AWS Terrain Tiles 地形圖磚（zoom 13） |
