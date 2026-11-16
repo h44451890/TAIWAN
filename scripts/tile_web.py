@@ -173,6 +173,10 @@ def main():
     hz = fwy["hz"]
     N = TC + 3
     tsz = {}
+    lc_path = os.path.join(DATA, "landcover.npy")   # scripts/landcover.py 產生；沒有就不附
+    lc = np.load(lc_path) if os.path.exists(lc_path) else None
+    if lc is not None and lc.shape != hz.shape:
+        print("landcover.npy 尺寸和地形不同，略過 (請重跑 scripts/landcover.py)"); lc = None
     tx0, tx1 = int(np.floor(J0 / TC)), int(np.floor((J0 + W - 2) / TC))
     ty0, ty1 = int(np.floor(I0 / TC)), int(np.floor((I0 + H - 2) / TC))
     for ty in range(ty0, ty1 + 1):
@@ -182,8 +186,11 @@ def main():
             win = hz[np.ix_(ii, jj)]
             assert win.shape == (N, N)
             key = tkey(tx, ty)
-            open(os.path.join(OUT, "t", key + ".bin"), "wb").write(np.ascontiguousarray(win, np.int16).tobytes())
-            tsz[key] = N * N * 2
+            blob = np.ascontiguousarray(win, np.int16).tobytes()
+            if lc is not None:   # 地表分類 (uint8 N x N) 接在高度後面
+                blob += np.ascontiguousarray(lc[np.ix_(ii, jj)], np.uint8).tobytes()
+            open(os.path.join(OUT, "t", key + ".bin"), "wb").write(blob)
+            tsz[key] = len(blob)
 
     # ---- 傳送地點 (附座標，載入器才知道要先載哪幾區)
     def way_xy(gid, idx):

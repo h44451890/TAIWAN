@@ -109,10 +109,12 @@ console.log('junction groups fixed', jFixed, 'split (different levels)', jSplit)
 
 // ---------------------------------------------------------------- 地形 (全域格點)
 const G = new Float64Array(TG.w * TG.h);
+const LC_TAIL = new Map();
 for (const key of Object.keys(INDEX.tiles_t)) {
   const [tx, ty] = key.split('_').map(Number);
   const b = fs.readFileSync(path.join(TD, 't', key + '.bin'));
-  const a = new Int16Array(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength));
+  const a = new Int16Array(b.buffer.slice(b.byteOffset, b.byteOffset + TN * TN * 2));
+  if (b.byteLength > TN * TN * 2) LC_TAIL.set(key, b.subarray(TN * TN * 2));   // 地表分類 (寫回時原樣接上)
   for (let li = 1; li <= TC + 1; li++) for (let lj = 1; lj <= TC + 1; lj++) {
     const I = ty * TC + li - 1 - TG.I0, J = tx * TC + lj - 1 - TG.J0;
     if (I >= 0 && I < TG.h && J >= 0 && J < TG.w) G[I * TG.w + J] = Z16(a[li * TN + lj]);
@@ -283,7 +285,10 @@ for (const key of Object.keys(INDEX.tiles_t)) {
     const I = Math.min(Math.max(ty * TC + li - 1 - TG.I0, 0), TG.h - 1), J = Math.min(Math.max(tx * TC + lj - 1 - TG.J0, 0), TG.w - 1);
     a[li * TN + lj] = Math.round(G[I * TG.w + J] * 10);
   }
-  fs.writeFileSync(path.join(TD, 't', key + '.bin'), Buffer.from(a.buffer));
+  const tail = LC_TAIL.get(key);
+  const out = tail ? Buffer.concat([Buffer.from(a.buffer), tail]) : Buffer.from(a.buffer);
+  fs.writeFileSync(path.join(TD, 't', key + '.bin'), out);
+  INDEX.tiles_t[key] = out.length;
 }
 fs.writeFileSync(path.join(TD, 'index.json'), JSON.stringify(INDEX));
 console.log('done');

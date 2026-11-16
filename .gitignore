@@ -3,3 +3,5 @@ data/z_debug*
 __pycache__/
 *.pyc
 data/terrain_grid.npz
+data/landcover/
+data/landcover.npy

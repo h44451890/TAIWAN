@@ -171,6 +171,13 @@ function roadAt(x, y, zRef, margin, climb = 1.3) {
 }
 
 const TERR = new Map();       // 地形分區 key -> Int16Array (TN x TN, 0.1 m)
+const LCLS = new Map();       // 地形分區 key -> Uint8Array 地表分類 (0 未知 1 水 2 沙 3 砂石 4 濕地 5 都市 6 農田 7 森林 8 草地)
+/** (x,y) 的地表分類 (最近的格點)；沒有資料回 0 */
+function landcoverAt(x, y) {
+  const J = Math.round(x / TSTEP), I = Math.round(y / TSTEP), tx = Math.floor(J / TC), ty = Math.floor(I / TC);
+  const a = LCLS.get(tkey(tx, ty));
+  return a ? a[(I - ty * TC + 1) * TN + (J - tx * TC + 1)] : 0;
+}
 function terrainAt(x, y) {
   const J = Math.min(Math.max(x / TSTEP, TGI.J0), TGI.J0 + TGI.w - 1.001), I = Math.min(Math.max(y / TSTEP, TGI.I0), TGI.I0 + TGI.h - 1.001);
   const j = Math.floor(J), i = Math.floor(I), u = J - j, v = I - i;
@@ -201,53 +208,63 @@ const camera = new T.PerspectiveCamera(60, window.innerWidth / window.innerHeigh
 // 太陽方向: 與 Blender 太陽 (rotation 58°, 0, 35°) 相同 -> 指向太陽的單位向量 (three 座標)
 const SUN_DIR = new T.Vector3(0.486, 0.530, 0.695).normalize();
 const HORIZON = new T.Color(0.62, 0.70, 0.80);
+const NIGHT = { value: 0 };   // 0 白天 .. 1 夜晚: 路燈、大樓窗戶、車燈共用
 
-// ---- 天空 (方向漸層 + 太陽光暈) -> 背景與環境光
-function buildSky() {
-  const mat = new T.ShaderMaterial({
-    side: T.BackSide, depthWrite: false,
-    uniforms: { sunDir: { value: SUN_DIR } },
-    vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
-    fragmentShader: `
-      varying vec3 vDir; uniform vec3 sunDir;
-      float h3(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
-      float n3(vec3 x){ vec3 i=floor(x); vec3 f=fract(x); f=f*f*(3.0-2.0*f);
-        return mix(mix(mix(h3(i),h3(i+vec3(1,0,0)),f.x), mix(h3(i+vec3(0,1,0)),h3(i+vec3(1,1,0)),f.x),f.y),
-                   mix(mix(h3(i+vec3(0,0,1)),h3(i+vec3(1,0,1)),f.x), mix(h3(i+vec3(0,1,1)),h3(i+vec3(1,1,1)),f.x),f.y), f.z); }
-      float fbm(vec3 p){ float a=0.5, s=0.0; for(int i=0;i<6;i++){ s+=a*n3(p); p*=2.03; a*=0.5; } return s; }
-      void main(){
-        vec3 d = normalize(vDir);
-        float e = d.y;
-        vec3 zenith = vec3(0.13, 0.27, 0.58);
-        vec3 horizon = vec3(0.66, 0.73, 0.82);
-        vec3 ground = vec3(0.10, 0.11, 0.10);
-        vec3 col = e > 0.0 ? mix(horizon, zenith, pow(e, 0.5)) : mix(horizon, ground, pow(min(-e*4.0,1.0),0.6));
-        float s = max(dot(d, sunDir), 0.0);
-        col += vec3(1.0,0.85,0.6) * (pow(s, 8.0) * 0.25 + pow(s, 64.0) * 0.6);   // 太陽光暈
-        col = mix(col, horizon * 1.05, exp(-max(e, 0.0) * 18.0) * 0.6);              // 地平線霧氣 (台灣常見的灰白天際)
-        // 積雲: 投影到雲層高度平面，fbm 取閾值；向陽面亮、底部灰
-        if (e > 0.0) {
-          vec2 uv = d.xz / (e + 0.12) * 1.6;
-          float c = fbm(vec3(uv, 0.0) * 1.3) * 0.8 + fbm(vec3(uv * 4.0, 1.7)) * 0.25;
-          float cov = smoothstep(0.52, 0.78, c) * smoothstep(0.02, 0.2, e);
-          float lit = 0.75 + 0.35 * fbm(vec3(uv * 4.0 + sunDir.xz * 0.3, 3.1)) + 0.25 * pow(s, 4.0);
-          vec3 cloud = mix(vec3(0.55, 0.58, 0.63), vec3(1.0, 0.98, 0.95), clamp(lit - 0.35, 0.0, 1.0));
-          col = mix(col, cloud, cov * 0.92);
-        }
-        gl_FragColor = vec4(col, 1.0);
-      }`,
-  });
-  const skyScene = new T.Scene();
-  skyScene.add(new T.Mesh(new T.SphereGeometry(10, 64, 32), mat));
-  const rt = new T.WebGLCubeRenderTarget(512, { type: T.HalfFloatType });
-  const cc = new T.CubeCamera(0.1, 100, rt);
-  cc.update(renderer, skyScene);
-  scene.background = rt.texture;
-  const pm = new T.PMREMGenerator(renderer);
-  scene.environment = pm.fromCubemap(rt.texture).texture;
+// ---- 天空 (方向漸層 + 太陽光暈 + 積雲；黃昏有晚霞、夜晚有星星) -> 背景與環境光。太陽移動時重畫
+const SKY_U = { sunDir: { value: SUN_DIR }, uDay: { value: 1 }, uSet: { value: 0 } };
+const skyMat = new T.ShaderMaterial({
+  side: T.BackSide, depthWrite: false, uniforms: SKY_U,
+  vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+  fragmentShader: `
+    varying vec3 vDir; uniform vec3 sunDir; uniform float uDay; uniform float uSet;
+    float h3(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+    float n3(vec3 x){ vec3 i=floor(x); vec3 f=fract(x); f=f*f*(3.0-2.0*f);
+      return mix(mix(mix(h3(i),h3(i+vec3(1,0,0)),f.x), mix(h3(i+vec3(0,1,0)),h3(i+vec3(1,1,0)),f.x),f.y),
+                 mix(mix(h3(i+vec3(0,0,1)),h3(i+vec3(1,0,1)),f.x), mix(h3(i+vec3(0,1,1)),h3(i+vec3(1,1,1)),f.x),f.y), f.z); }
+    float fbm(vec3 p){ float a=0.5, s=0.0; for(int i=0;i<6;i++){ s+=a*n3(p); p*=2.03; a*=0.5; } return s; }
+    void main(){
+      vec3 d = normalize(vDir);
+      float e = d.y, s = max(dot(d, sunDir), 0.0);
+      vec3 zenith = mix(vec3(0.004, 0.008, 0.025), vec3(0.13, 0.27, 0.58), uDay);
+      vec3 horizon = mix(vec3(0.02, 0.03, 0.06), vec3(0.66, 0.73, 0.82), uDay);
+      vec2 dh = normalize(d.xz + vec2(1e-5)), sh = normalize(sunDir.xz + vec2(1e-5));
+      horizon = mix(horizon, vec3(1.0, 0.52, 0.25), uSet * (0.35 + 0.65 * pow(max(dot(dh, sh), 0.0), 2.0)));
+      vec3 ground = mix(vec3(0.01, 0.012, 0.015), vec3(0.10, 0.11, 0.10), uDay);
+      vec3 col = e > 0.0 ? mix(horizon, zenith, pow(e, 0.5)) : mix(horizon, ground, pow(min(-e*4.0,1.0),0.6));
+      col += mix(vec3(1.0,0.85,0.6), vec3(1.0,0.5,0.2), uSet) * (pow(s, 8.0) * 0.25 + pow(s, 64.0) * 0.6) * smoothstep(-0.12, 0.02, sunDir.y);
+      col = mix(col, horizon * 1.05, exp(-max(e, 0.0) * 18.0) * 0.6);
+      if (e > 0.0) {
+        vec3 q = floor(d * 420.0);
+        float st = step(0.9975, h3(q)) * (1.0 - uDay) * smoothstep(0.05, 0.3, e);   // 星星
+        col += vec3(0.8, 0.85, 1.0) * st * (0.4 + 0.6 * h3(q + 3.1));
+        vec2 uv = d.xz / (e + 0.12) * 1.6;
+        float c = fbm(vec3(uv, 0.0) * 1.3) * 0.8 + fbm(vec3(uv * 4.0, 1.7)) * 0.25;
+        float cov = smoothstep(0.52, 0.78, c) * smoothstep(0.02, 0.2, e);
+        float lit = 0.75 + 0.35 * fbm(vec3(uv * 4.0 + sunDir.xz * 0.3, 3.1)) + 0.25 * pow(s, 4.0);
+        vec3 cloud = mix(vec3(0.55, 0.58, 0.63), vec3(1.0, 0.98, 0.95), clamp(lit - 0.35, 0.0, 1.0));
+        cloud = mix(cloud, vec3(1.0, 0.6, 0.38) * (0.6 + 0.5 * lit), uSet * 0.8);   // 晚霞
+        cloud *= mix(0.06, 1.0, uDay);
+        col = mix(col, cloud, cov * 0.92);
+      }
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+const skyScene = new T.Scene();
+skyScene.add(new T.Mesh(new T.SphereGeometry(10, 64, 32), skyMat));
+const skyRT = new T.WebGLCubeRenderTarget(512, { type: T.HalfFloatType });
+const skyCam = new T.CubeCamera(0.1, 100, skyRT);
+const skyPM = new T.PMREMGenerator(renderer);
+let skyEnv = null;
+function renderSky() {
+  skyCam.update(renderer, skyScene);
+  scene.background = skyRT.texture;
+  const env = skyPM.fromCubemap(skyRT.texture).texture;
+  if (skyEnv) skyEnv.dispose();
+  skyEnv = env;
+  scene.environment = env;
   scene.environmentIntensity = 0.55;
 }
-buildSky();
+renderSky();
 scene.fog = new T.FogExp2(HORIZON.clone(), 0.000045);
 
 const sun = new T.DirectionalLight(0xffffff, 3.2);   // 與 Blender 太陽強度相同
@@ -256,6 +273,91 @@ sun.shadow.mapSize.set(MOBILE ? 1024 : 4096, MOBILE ? 1024 : 4096);
 const SC = sun.shadow.camera; SC.left = -90; SC.right = 90; SC.top = 90; SC.bottom = -90; SC.near = 1; SC.far = 1500;
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
+
+// ======================================================================= 日夜: 依台灣真實時間算太陽位置 (O 鍵切換 即時 / 清晨 / 中午 / 黃昏 / 夜晚)
+const TIME_MODES = [['即時', null], ['清晨', 6.1], ['中午', 12.5], ['黃昏', 17.55], ['夜晚', 21.0]];
+let timeMode = 0;
+{
+  const m = /^(\d{1,2})(?::(\d{2}))?$/.exec(params.get('time') || '');
+  if (m) { TIME_MODES.push(['測試 ' + params.get('time'), +m[1] + (+(m[2] || 0)) / 60]); timeMode = TIME_MODES.length - 1; }
+}
+/** 今天 (台灣日期) 的某個台灣時間；h = null 表示現在 */
+function taiwanTime(h) {
+  const now = new Date();
+  if (h == null) return now;
+  const tw = new Date(now.getTime() + 8 * 3600e3);
+  return new Date(Date.UTC(tw.getUTCFullYear(), tw.getUTCMonth(), tw.getUTCDate()) - 8 * 3600e3 + h * 3600e3);
+}
+/** 太陽高度角、方位角 (弧度；方位由北往東)，NOAA 簡化公式，誤差 < 1° */
+function sunPos(date, lat = 24.6, lon = 121.0) {
+  const rad = Math.PI / 180, n = date.getTime() / 86400000 - 10957.5;
+  const L = (280.460 + 0.9856474 * n) % 360, g = ((357.528 + 0.9856003 * n) % 360) * rad;
+  const lam = (L + 1.915 * Math.sin(g) + 0.020 * Math.sin(2 * g)) * rad, eps = (23.439 - 0.0000004 * n) * rad;
+  const ra = Math.atan2(Math.cos(eps) * Math.sin(lam), Math.cos(lam)), dec = Math.asin(Math.sin(eps) * Math.sin(lam));
+  const gmst = ((18.697374558 + 24.06570982441908 * n) % 24 + 24) % 24;
+  const ha = (gmst * 15 + lon) * rad - ra, phi = lat * rad;
+  const el = Math.asin(Math.sin(phi) * Math.sin(dec) + Math.cos(phi) * Math.cos(dec) * Math.cos(ha));
+  const az = Math.atan2(-Math.sin(ha), Math.tan(dec) * Math.cos(phi) - Math.sin(phi) * Math.cos(ha));
+  return { el, az };
+}
+const SKY_SUN = new T.Vector3().copy(SUN_DIR);
+SKY_U.sunDir.value = SKY_SUN;
+const MOON_DIR = new T.Vector3(-0.35, 0.82, 0.45).normalize();
+const smooth01 = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+let dnClock = 0, dnSkyEl = 1e9, dnMode = -1;
+function updateDayNight(dt) {
+  if ((dnClock -= dt) > 0 && dnMode === timeMode) return;
+  dnClock = 2;
+  const { el, az } = sunPos(taiwanTime(TIME_MODES[timeMode][1]));
+  const e = el * 180 / Math.PI;
+  SKY_SUN.set(Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az));
+  const day = smooth01(-7, 6, e), set = (1 - smooth01(2, 16, e)) * smooth01(-8, 0, e);
+  NIGHT.value = 1 - smooth01(-6, 3, e);
+  if (e > -2) {
+    SUN_DIR.copy(SKY_SUN);
+    if (SUN_DIR.y < 0.05) { SUN_DIR.y = 0.05; SUN_DIR.normalize(); }
+    const k = smooth01(0, 25, e);
+    sun.intensity = 3.2 * smooth01(-2, 10, e);
+    sun.color.setRGB(1, 0.62 + 0.38 * k, 0.42 + 0.58 * k);
+  } else {   // 夜晚: 月光 (淡藍、從高處照)
+    SUN_DIR.copy(MOON_DIR);
+    sun.intensity = 0.25;
+    sun.color.setRGB(0.6, 0.7, 1.0);
+  }
+  renderer.toneMappingExposure = 1 + 0.7 * NIGHT.value;
+  // 霧色 = 地平線顏色
+  const hz = [0.02 + 0.64 * day, 0.03 + 0.70 * day, 0.06 + 0.76 * day];
+  scene.fog.color.setRGB(hz[0] + (1.0 - hz[0]) * set * 0.35, hz[1] + (0.55 - hz[1]) * set * 0.35, hz[2] + (0.3 - hz[2]) * set * 0.35);
+  if (Math.abs(e - dnSkyEl) > 0.4 || dnMode !== timeMode) {
+    dnSkyEl = e; dnMode = timeMode;
+    SKY_U.uDay.value = day; SKY_U.uSet.value = set;
+    renderSky();
+  }
+  matLampHead.emissiveIntensity = 5 * NIGHT.value;
+  GLOW_LAMP.opacity = NIGHT.value; GLOW_LAMP.visible = NIGHT.value > 0.02;
+}
+const timeToast = document.createElement('div');
+timeToast.style.cssText = 'position:fixed;top:120px;left:50%;transform:translateX(-50%);background:rgba(10,14,12,.8);color:#fff;padding:8px 16px;border-radius:10px;font-size:15px;z-index:20;pointer-events:none;opacity:0;transition:opacity .4s';
+document.body.appendChild(timeToast);
+function cycleTime() {
+  timeMode = (timeMode + 1) % TIME_MODES.length;
+  const [name, h] = TIME_MODES[timeMode];
+  timeToast.textContent = '🕒 時間：' + name + (h == null ? '（照台灣現在時間）' : '');
+  timeToast.style.opacity = 1;
+  clearTimeout(cycleTime.t); cycleTime.t = setTimeout(() => { timeToast.style.opacity = 0; }, 1800);
+  dnClock = 0;
+}
+// 發光點 (路燈燈頭、車燈) 用的圓形光暈貼圖
+const GLOW_TEX = (() => {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 64;
+  const g = cv.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.2, 'rgba(255,255,255,0.8)'); gr.addColorStop(0.5, 'rgba(255,255,255,0.18)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; return t;
+})();
+const GLOW_LAMP = new T.PointsMaterial({ map: GLOW_TEX, color: new T.Color(1, 0.8, 0.5), size: 4.5, sizeAttenuation: true, transparent: true, depthWrite: false, blending: T.AdditiveBlending, opacity: 0, toneMapped: false, fog: false });
+const matLampPole = new T.MeshStandardMaterial({ color: new T.Color(0.42, 0.44, 0.46), metalness: 0.6, roughness: 0.45 });
+const matLampHead = new T.MeshStandardMaterial({ color: new T.Color(0.08, 0.08, 0.08), emissive: new T.Color(1, 0.82, 0.55), emissiveIntensity: 0, roughness: 0.4 });
 
 // ======================================================================= 材質 (移植自 Blender)
 const GLSL_NOISE = `
@@ -266,13 +368,14 @@ const GLSL_NOISE = `
   float fwyFbm(vec3 p, int oct){ float a=0.5, s=0.0, t=0.0; for(int i=0;i<8;i++){ if(i>=oct) break; s+=a*fwyVNoise(p); t+=a; p*=2.02; a*=0.5; } return s/t; }
 `;
 
-function patch(mat, { vert = '', vmain = '', frag = '', color = '', rough = '', normal = '', uniforms = null }) {
+function patch(mat, { vert = '', vmain = '', frag = '', color = '', rough = '', normal = '', emis = '', uniforms = null }) {
   // 每個材質注入的程式碼不同，必須有自己的快取 key；否則 three.js 會讓它們共用第一個編譯好的著色器
-  const key = 'fwy:' + vert + '|' + vmain + '|' + frag + '|' + color + '|' + rough + '|' + normal;
+  const key = 'fwy:' + vert + '|' + vmain + '|' + frag + '|' + color + '|' + rough + '|' + normal + '|' + emis;
   mat.customProgramCacheKey = () => key;
   mat.onBeforeCompile = (sh) => {
     if (uniforms) Object.assign(sh.uniforms, uniforms);
     if (rough) sh.fragmentShader = sh.fragmentShader.replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n' + rough);
+    if (emis) sh.fragmentShader = sh.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n' + emis);
     if (normal) sh.fragmentShader = sh.fragmentShader.replace('#include <normal_fragment_maps>', '#include <normal_fragment_maps>\n' + normal);
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vObj;\n' + vert)
@@ -301,8 +404,9 @@ const ASPH_U = {
   tAsD: { value: texFrom('tex-asphalt_diff', true) },
   tAsN: { value: texFrom('tex-asphalt_nor_gl', false) },
   tAsR: { value: texFrom('tex-asphalt_rough', false) },
+  uNight: NIGHT,
 };
-const ASPH_DECL = `uniform sampler2D tAsD; uniform sampler2D tAsN; uniform sampler2D tAsR; float gMark; vec2 gUv1; vec2 gUv2; float gMix;
+const ASPH_DECL = `uniform sampler2D tAsD; uniform sampler2D tAsN; uniform sampler2D tAsR; uniform float uNight; float gMark; vec2 gUv1; vec2 gUv2; float gMix;
   void asphUv(vec3 p) {
     gUv1 = p.xy / 4.04;
     gUv2 = mat2(0.866, -0.5, 0.5, 0.866) * p.xy / 5.3 + vec2(0.37, 0.71);
@@ -323,6 +427,11 @@ const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness
   vmain: 'vRUv = aUv; vLs = aLs; vLanes = aLanes;',
   frag: 'varying vec2 vRUv; varying float vLs; varying float vLanes;' + ASPH_DECL,
   uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
+  emis: `if (uNight > 0.01) {   // 夜晚: 中央分隔島路燈照在路面 (每 40 m 一盞)
+    float ds = (fract((vRUv.y - 2.0) / 40.0 + 0.5) - 0.5) * 40.0, du = vRUv.x - 1.0;
+    float L = exp(-(ds * ds * 0.5 + du * du * 0.7) / 90.0) + 0.06;
+    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.82, 0.55) * L * 2.2 * uNight;
+  }`,
   color: `{
     float k = (vRUv.x - vLs) / ${LANE_W.toFixed(2)};
     float kr = floor(k + 0.5);
@@ -393,6 +502,11 @@ const matCityRoad = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalnes
   vmain: 'vRUv = aUv; vW = aLs; vCode = aLanes;',
   frag: 'varying vec2 vRUv; varying float vW; varying float vCode;' + ASPH_DECL,
   uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
+  emis: `if (uNight > 0.01) {   // 夜晚: 市區路燈 (兩側每 30 m)
+    float ds = (fract(vRUv.y / 30.0) - 0.5) * 30.0, du = min(vRUv.x, max(vW - vRUv.x, 0.0));
+    float L = exp(-(ds * ds * 0.6 + du * du) / 70.0) + 0.08;
+    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.8, 0.5) * L * 2.0 * uNight;
+  }`,
   color: `{
     float u = vRUv.x, W = vW, fw = max(fwidth(u), 1e-4);
     asphUv(vObj);
@@ -421,17 +535,22 @@ const matCityRoad = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalnes
 const matWall = patch(new T.MeshStandardMaterial({ roughness: 0.8, metalness: 0.05, side: T.DoubleSide }), {
   vert: 'attribute vec3 aUv3; attribute vec3 aCol; varying vec3 vB; varying vec3 vCol;',
   vmain: 'vB = aUv3; vCol = aCol;',
-  frag: 'varying vec3 vB; varying vec3 vCol;',
+  frag: 'varying vec3 vB; varying vec3 vCol; uniform float uNight; float gWin; float gShop;',
+  uniforms: { uNight: NIGHT },
+  emis: 'totalEmissiveRadiance += (vec3(1.0, 0.8, 0.52) * gWin * 1.6 + vec3(0.95, 0.95, 1.0) * gShop * 1.1) * uNight;',
   color: `{
     float u = vB.x, v = vB.y, h = vB.z;
     vec3 c = vCol * (0.85 + 0.3 * fwyFbm(vec3(u * 0.3, v * 0.5, 3.1), 4));
     float fl = fract(v / 3.2), wx = fract(u / 2.6);
     float win = step(0.3, fl) * step(fl, 0.82) * step(0.16, wx) * step(wx, 0.84) * step(3.4, v) * step(v, h - 0.8);
-    float lit = step(0.82, fwyHash(vec3(floor(u / 2.6), floor(v / 3.2), floor(h))));
+    float hw = fwyHash(vec3(floor(u / 2.6), floor(v / 3.2), floor(h)));
+    float lit = step(0.82, hw);
+    gWin = win * step(0.55, hw);   // 夜晚約 45% 的窗戶亮燈
     vec3 glass = mix(vec3(0.03, 0.04, 0.05), vec3(0.08, 0.09, 0.1), lit);
     c = mix(c, glass, win);
     float shop = step(v, 3.2) * step(0.4, v) * step(0.06, wx) * step(wx, 0.94);
     c = mix(c, vec3(0.025, 0.03, 0.035), shop * 0.85);
+    gShop = shop * step(0.3, fwyHash(vec3(floor(u / 7.0), 1.0, floor(h))));   // 一樓店面燈
     diffuseColor.rgb = c;
   }`,
 });
@@ -444,15 +563,32 @@ const matRoof = patch(new T.MeshStandardMaterial({ roughness: 0.9, metalness: 0,
 // 伸縮縫: 鋼板 + 橡膠縫
 const matJointSteel = new T.MeshStandardMaterial({ color: new T.Color(0.32, 0.33, 0.34), metalness: 0.85, roughness: 0.38 });
 const matJointRubber = new T.MeshStandardMaterial({ color: new T.Color(0.01, 0.01, 0.012), roughness: 0.9 });
-const matReflR = new T.MeshBasicMaterial({ color: new T.Color(0.75, 0.02, 0.02), toneMapped: false });
-const matReflY = new T.MeshBasicMaterial({ color: new T.Color(0.85, 0.55, 0.02), toneMapped: false });
+const matReflR = new T.MeshBasicMaterial({ color: new T.Color(0.75, 0.02, 0.02), toneMapped: false, side: T.DoubleSide });
+const matReflY = new T.MeshBasicMaterial({ color: new T.Color(0.85, 0.55, 0.02), toneMapped: false, side: T.DoubleSide });
 const matTunnel = concreteLike([0.55, 0.53, 0.48], 0.6, 0.2, 1.5);
 const matTunnelLight = new T.MeshStandardMaterial({ color: 0x000000, emissive: new T.Color(1.0, 0.82, 0.55), emissiveIntensity: 2.5 });
+// 水面: 海 (藍綠) / 河、湖 (帶泥的綠褐)；法線用會流動的雜訊做波紋，低粗糙度反射天空與太陽
+const WATER_T = { value: 0 };
+const matWater = patch(new T.MeshStandardMaterial({ roughness: 0.07, metalness: 0, color: 0xffffff }), {
+  vert: 'attribute vec2 aUv; varying float vSea;',
+  vmain: 'vSea = aUv.x;',
+  frag: 'varying float vSea; uniform float uWT;',
+  uniforms: { uWT: WATER_T },
+  color: 'diffuseColor.rgb = mix(vec3(0.035, 0.06, 0.045), vec3(0.012, 0.05, 0.07), vSea) * (0.85 + 0.3 * fwyFbm(vObj * 0.01, 3));',
+  normal: `{
+    vec2 p = vObj.xy; float t = uWT;
+    float sc = mix(0.12, 0.05, vSea), e = 0.8;
+    vec3 o = vec3(t * 0.06, t * 0.04, t * 0.15);
+    float h0 = fwyFbm(vec3(p * sc, 0.0) + o, 3), hx = fwyFbm(vec3((p + vec2(e, 0.0)) * sc, 0.0) + o, 3), hy = fwyFbm(vec3((p + vec2(0.0, e)) * sc, 0.0) + o, 3);
+    vec3 dw = vec3(-(hx - h0), 0.0, (hy - h0)) * mix(4.0, 7.0, vSea);
+    normal = normalize(normal + mat3(viewMatrix) * dw);
+  }`,
+});
 // 地形: 依坡度與高度上色 — 平地是田野、草地拼塊，山坡是闊葉林 (近看有一叢叢樹冠)，陡坡露岩，高山 (2500 m 以上) 是箭竹草原
 const matTerrain = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness: 0 }), {
-  vert: 'varying vec3 vTN;',
-  vmain: 'vTN = normal;',
-  frag: 'varying vec3 vTN;',
+  vert: 'varying vec3 vTN; attribute vec4 aLc0; attribute vec4 aLc1; varying vec4 vLc0; varying vec4 vLc1;',
+  vmain: 'vTN = normal; vLc0 = aLc0; vLc1 = aLc1;',
+  frag: 'varying vec3 vTN; varying vec4 vLc0; varying vec4 vLc1;',
   color: `{
     float slope = 1.0 - clamp(normalize(vTN).y, 0.0, 1.0);          // 0 平地 .. 1 垂直
     float z = vObj.z;
@@ -475,6 +611,17 @@ const matTerrain = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness
     vec3 c = mix(flat_, forest, fw);
     c = mix(c, rock, smoothstep(0.45, 0.62, slope + (n1 - 0.5) * 0.1));   // 57° 以上的陡崖才露岩
     c = mix(c, alpine, smoothstep(2400.0, 2900.0, z + (n2 - 0.5) * 300.0) * (1.0 - smoothstep(0.6, 0.8, slope)));
+    // OSM 地表分類 (有資料的地方蓋過自動上色)
+    float sp = fwyFbm(vObj * 0.9, 2);
+    vec3 cUrban = mix(vec3(0.085, 0.085, 0.082), vec3(0.13, 0.125, 0.115), n1) * (0.85 + 0.3 * fwyHash(floor(vObj / 9.0)));
+    vec3 cFarm = mix(field, vec3(0.05, 0.1, 0.035), 0.25);
+    vec3 cGrass = mix(vec3(0.06, 0.11, 0.035), vec3(0.09, 0.14, 0.05), n1);
+    vec3 cSand = mix(vec3(0.33, 0.29, 0.21), vec3(0.42, 0.37, 0.27), n2) * (0.92 + 0.16 * sp);
+    vec3 cGravel = mix(vec3(0.17, 0.165, 0.15), vec3(0.26, 0.25, 0.23), sp) * (0.85 + 0.3 * fwyFbm(vObj * 0.05, 3));
+    vec3 cWet = mix(vec3(0.035, 0.05, 0.03), vec3(0.06, 0.07, 0.045), n1);
+    vec3 cBed = vec3(0.05, 0.055, 0.045);
+    c = mix(c, cBed, vLc0.x); c = mix(c, cSand, vLc0.y); c = mix(c, cGravel, vLc0.z); c = mix(c, cWet, vLc0.w);
+    c = mix(c, cUrban, vLc1.x); c = mix(c, cFarm, vLc1.y); c = mix(c, forest, vLc1.z); c = mix(c, cGrass, vLc1.w);
     diffuseColor.rgb = c;
   }`,
 });
@@ -570,6 +717,26 @@ function addRoad(c, w) {
         box(c.glare, x, y, ny[k], -nx[k], 0.03, 0.03, z + 0.8, z + 0.9);   // 底座
       }
     }
+    // 路燈: 國道主線中央分隔島每 40 m 一支雙臂燈 (夜晚燈頭發光、路面有光暈)
+    if (bit === 1 && !w.link && !w.tunnel && w.oneway && !params.has('nolamps')) {
+      for (let d = 2; d < s[n - 1]; d += 40) {
+        let k = 0; while (k < n - 2 && s[k + 1] < d) k++;
+        if ((M[k] | M[k + 1]) & bit) continue;
+        const t = (d - s[k]) / ((s[k + 1] - s[k]) || 1);
+        const bx = P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t, by = P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t;
+        const z = P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t;
+        const pr = roadAt(bx + nx[k] * (hw + 1.6), by + ny[k] * (hw + 1.6), z, 0, 1.5);
+        if (pr && pr.w !== w && !pr.w.city && Math.abs(pr.z - z) < 1.5 && pr.tx * ny[k] + pr.ty * -nx[k] < -0.8 && pr.w.gid < w.gid) continue;
+        const x = bx + nx[k] * o, y = by + ny[k] * o;
+        box(c.lampPole, x, y, ny[k], -nx[k], 0.09, 0.09, z + 0.85, z + 10.5);
+        box(c.lampPole, x, y, ny[k], -nx[k], 0.05, 2.0, z + 10.3, z + 10.42);
+        for (const sd of [-1, 1]) {
+          const lx = x + nx[k] * sd * 1.9, ly = y + ny[k] * sd * 1.9;
+          box(c.lampHead, lx, ly, ny[k], -nx[k], 0.32, 0.16, z + 10.12, z + 10.3);
+          c.glows.push(lx, z + 10.05, -ly);
+        }
+      }
+    }
     // 反光片: 每 24 m 一片，外側紅色、中央分隔黃色
     const R = bit === 1 ? c.reflY : c.reflR;
     for (let d = 12; d < s[n - 1]; d += 24) {
@@ -578,7 +745,8 @@ function addRoad(c, w) {
       const t = (d - s[k]) / ((s[k + 1] - s[k]) || 1);
       const x = P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t + nx[k] * o, y = P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t + ny[k] * o;
       const z = P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t;
-      box(R, x, y, ny[k], -nx[k], 0.05, 0.035, z + 0.84, z + 0.95);
+      disc(R, x, y, z + 0.97, ny[k], -nx[k], 0.07, 0.025);                    // 圓形反光片，面向來車
+      box(R, x, y, ny[k], -nx[k], 0.012, 0.012, z + 0.86, z + 0.9);           // 底座
     }
   }
   if (w.tunnel) addTunnel(c, w);
@@ -649,6 +817,22 @@ function crossedJoint(ax, ay, bx, by, z) {
   return false;
 }
 
+/** 圓片 (軸沿路線方向 tx,ty，面向來車)：中心 (cx, cy, cz)、半徑 r、厚 th */
+function disc(g, cx, cy, cz, tx, ty, r, th, seg = 12) {
+  const nx = -ty, ny = tx, b = g.n;
+  for (const f of [-1, 1]) {   // 前後兩個圓面 (中心 + 外圈)
+    const ox = cx + tx * th * 0.5 * f, oy = cy + ty * th * 0.5 * f;
+    g.v(ox, oy, cz);
+    for (let i = 0; i < seg; i++) { const a = i / seg * Math.PI * 2; g.v(ox + nx * Math.cos(a) * r, oy + ny * Math.cos(a) * r, cz + Math.sin(a) * r); }
+  }
+  const back = b, front = b + seg + 1;
+  for (let i = 0; i < seg; i++) {
+    const j = (i + 1) % seg;
+    g.i.push(back, back + 1 + j, back + 1 + i);
+    g.i.push(front, front + 1 + i, front + 1 + j);
+    g.q(back + 1 + i, back + 1 + j, front + 1 + j, front + 1 + i);   // 側邊
+  }
+}
 function box(g, cx, cy, tx, ty, hx, hy, z0, z1) {
   // tx,ty: 沿線方向；法向 = (-ty, tx)
   const nx = -ty, ny = tx;
@@ -719,7 +903,7 @@ function portalMesh(w, i) {
   return m;
 }
 
-const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), reflR: new GB(), reflY: new GB(),
+const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), lampPole: new GB(), lampHead: new GB(), glows: [], reflR: new GB(), reflY: new GB(),
   pier: new GB(), tunnel: new GB(), tlight: new GB(), portals: [] });
 
 /** 一般道路: 鋪在地形上的路面 (市區標線由材質依 aLs=路寬、aLanes=車道代碼 算出)；橋梁加梁身與橋墩 */
@@ -796,7 +980,11 @@ function requestTerrain(key) {
   if (TERR_REC.has(key) || !INDEX.tiles_t[key]) return null;
   const rec = { state: 'loading', mesh: null };
   TERR_REC.set(key, rec);
-  return whenBuf('t', key, (buf) => { TERR.set(key, new Int16Array(buf)); rec.state = 'data'; },
+  return whenBuf('t', key, (buf) => {
+    TERR.set(key, new Int16Array(buf, 0, TN * TN));
+    if (buf.byteLength >= TN * TN * 3) LCLS.set(key, new Uint8Array(buf, TN * TN * 2, TN * TN));   // 地表分類 (scripts/landcover.py)
+    rec.state = 'data';
+  },
     (e) => { console.warn('地形載入失敗', key, e); setTimeout(() => TERR_REC.delete(key), 3000); });
 }
 function neighborsReady(rec) {
@@ -813,10 +1001,14 @@ function buildTile(rec) {
   for (const k of rec.ways) { const w = WAYS[k]; if (w.city) addCityRoad(c, w); else addRoad(c, w); }
   for (let k = 0; k < rec.piers.length / 9; k++) addPier(c.pier, rec.piers, k);
   for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
-                   c.barrier.mesh(matBarrier, { cast: true }), c.glare.mesh(matGlare, { cast: true }), c.pier.mesh(matConcrete, { cast: true }),
+                   c.barrier.mesh(matBarrier, { cast: true }), c.glare.mesh(matGlare, { cast: true }), c.lampPole.mesh(matLampPole, { cast: true }), c.lampHead.mesh(matLampHead), c.pier.mesh(matConcrete, { cast: true }),
                    c.tunnel.mesh(matTunnel, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }),
                    c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false })]) if (m) g.add(m);
   for (const [w, i] of c.portals) g.add(portalMesh(w, i));
+  if (c.glows.length) {
+    const pg = new T.BufferGeometry(); pg.setAttribute('position', new T.Float32BufferAttribute(c.glows, 3)); pg.computeBoundingSphere();
+    const pts = new T.Points(pg, GLOW_LAMP); pts.matrixAutoUpdate = false; g.add(pts);
+  }
   jointMeshes(rec.joints, g);
   rec.bldChunks = (rec.bld && !params.has('nobld')) ? buildBuildings(rec.bld, g) : [];   // nobld: 測試用，不建建築
   worldGroup.add(g);
@@ -833,10 +1025,15 @@ function buildTerrainMesh(key, tx, ty) {
   const ia = Math.max(ty * TC, TGI.I0), ib = Math.min(ty * TC + TC, TGI.I0 + TGI.h - 1);
   if (!a || jb <= ja || ib <= ia) return null;
   const hh = (I, J) => Z16(a[(I - ty * TC + 1) * TN + (J - tx * TC + 1)]);
+  const lc = LCLS.get(key), lcAt = (I, J) => lc ? lc[(I - ty * TC + 1) * TN + (J - tx * TC + 1)] : 0;
   const g = new GB(); g.nrm = [];
   const cols = jb - ja + 1;
+  const W0 = [], W1 = [];   // 地表分類 one-hot (內插後邊界自然漸變)
   for (let I = ia; I <= ib; I++) for (let J = ja; J <= jb; J++) {
-    g.v(J * TSTEP, I * TSTEP, hh(I, J));
+    const k = lcAt(I, J), z = hh(I, J);
+    W0.push(k === 1 ? 1 : 0, k === 2 ? 1 : 0, k === 3 ? 1 : 0, k === 4 ? 1 : 0);
+    W1.push(k === 5 ? 1 : 0, k === 6 ? 1 : 0, k === 7 ? 1 : 0, k === 8 ? 1 : 0);
+    g.v(J * TSTEP, I * TSTEP, k === 1 ? Math.min(z, 0.4) - (z < 0.6 ? 3 : 1.8) : z);   // 水底壓低，水面才看得到
     const hx = (hh(I, J + 1) - hh(I, J - 1)) / (2 * TSTEP), hy = (hh(I + 1, J) - hh(I - 1, J)) / (2 * TSTEP);
     const L = Math.hypot(hx, hy, 1);
     g.nrm.push(-hx / L, 1 / L, hy / L);
@@ -844,7 +1041,30 @@ function buildTerrainMesh(key, tx, ty) {
   for (let i = 0; i < ib - ia; i++) for (let j = 0; j < jb - ja; j++) {
     const q = i * cols + j; g.q(q, q + 1, q + cols + 1, q + cols);
   }
-  return g.mesh(matTerrain);
+  const m = g.mesh(matTerrain);
+  m.geometry.setAttribute('aLc0', new T.Float32BufferAttribute(W0, 4));
+  m.geometry.setAttribute('aLc1', new T.Float32BufferAttribute(W1, 4));
+  if (!lc) return m;
+  // 水面: 碰到水格的方格都畫；水格在原地形高度 (海 = 海平面)，旁邊陸地格壓到地面下 → 岸邊自然切出水線
+  const wg = new GB('uv'), idx = new Int32Array((ib - ia + 1) * cols).fill(-1);
+  const vid = (i, j) => {
+    const q = i * cols + j;
+    if (idx[q] < 0) {
+      const I = ia + i, J = ja + j, z = hh(I, J), water = lcAt(I, J) === 1, sea = z < 0.6;
+      idx[q] = wg.v(J * TSTEP, I * TSTEP, water ? (sea ? 0.15 : z - 0.2) : z - 0.8);
+      wg.uv.push(sea ? 1 : 0, 0);
+    }
+    return idx[q];
+  };
+  for (let i = 0; i < ib - ia; i++) for (let j = 0; j < jb - ja; j++) {
+    const I = ia + i, J = ja + j;
+    if (lcAt(I, J) !== 1 && lcAt(I, J + 1) !== 1 && lcAt(I + 1, J + 1) !== 1 && lcAt(I + 1, J) !== 1) continue;
+    wg.q(vid(i, j), vid(i, j + 1), vid(i + 1, j + 1), vid(i + 1, j));
+  }
+  const grp = new T.Group(); grp.add(m);
+  const wm = wg.mesh(matWater, { receive: true }); if (wm) grp.add(wm);
+  grp.matrixAutoUpdate = false;
+  return grp;
 }
 /** opts: x,y (預設車子位置)；all: 不限同時下載數；build: 'all' 全部建 / false 不建 / 預設每次 1 區 */
 function streamTick(opts = {}) {
@@ -1393,6 +1613,7 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'Digit1') camMode = 1;
   if (e.code === 'Digit3') camMode = 3;
   if (e.code === 'KeyP') autopilot = !autopilot;
+  if (e.code === 'KeyO') cycleTime();
   if (e.code === 'KeyK') { laneCenter = !laneCenter; S.lcLane = null; try { localStorage.setItem('tw_lc', laneCenter ? '1' : '0'); } catch (_) {} }
   if (e.code === 'KeyM') mapScaleIdx = (mapScaleIdx + 1) % MAP_SCALES.length;
   if (e.code === 'KeyR') respawnNearest();
@@ -1777,12 +1998,20 @@ function syncCar(dt) {
 
 // ======================================================================= 攝影機
 const camPos = new T.Vector3(), camLook = new T.Vector3();
-let camInit = false, orbitYaw = 0, dragging = false, lastX = 0;
+let camInit = false, orbitYaw = (+params.get('yaw') || 0) * Math.PI / 180, dragging = false, lastX = 0;   // yaw: 測試用，空拍朝向 (度)
 renderer.domElement.addEventListener('pointerdown', (e) => { dragging = true; lastX = e.clientX; });
 window.addEventListener('pointerup', () => { dragging = false; });
 window.addEventListener('pointermove', (e) => { if (dragging) { orbitYaw -= (e.clientX - lastX) * 0.006; lastX = e.clientX; } });
 
+const CAMAT = params.get('camat') ? params.get('camat').split(',').map(Number) : null;   // 測試: ?camat=x,y,z&look=x,y,z 固定攝影機 (資料座標)
+const LOOKAT = params.get('look') ? params.get('look').split(',').map(Number) : null;
 function updateCamera(dt) {
+  if (CAMAT && LOOKAT) {
+    camera.position.set(CAMAT[0], CAMAT[2], -CAMAT[1]); camera.lookAt(LOOKAT[0], LOOKAT[2], -LOOKAT[1]); camera.updateProjectionMatrix();
+    const c = new T.Vector3(LOOKAT[0], LOOKAT[2], -LOOKAT[1]);
+    sun.target.position.copy(c); sun.position.copy(c).addScaledVector(SUN_DIR, 600);
+    return;
+  }
   const vt = S.vt || { cam: 1, eye: [0.1, 1.2, -0.37] };
   const fwd = new T.Vector3(Math.cos(S.h), 0, -Math.sin(S.h));
   const carP = new T.Vector3(S.x, S.zVis != null ? S.zVis : S.z, -S.y);
@@ -1925,7 +2154,7 @@ window.addEventListener('resize', () => {
 
 // ---- 給擴充模組 (features.js: 車流、電台、看板) 用的介面
 const HOOKS = { init: [], update: [], frame: [], minimap: [], tile: [], wayColor: null };
-window.TW = { T, scene, camera, renderer, WAYS, wayByGid, TILES, TS, tilesNear, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
+window.TW = { T, scene, camera, renderer, NIGHT, GLOW_TEX, landcoverAt, WAYS, wayByGid, TILES, TS, tilesNear, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
   laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: INDEX.origin_twd97, MOBILE,
   get camMode() { return camMode; } };
 
@@ -1979,7 +2208,7 @@ setTimeout(async () => {
       '; lead', HOOKS.leader ? JSON.stringify(HOOKS.leader(0)) : '-', '; city turns', window.TWX ? TWX.stats.turns : '-', '; nan', window.TWX ? TWX.stats.nan : '-', '; joints', window.TWX ? (TWX.stats.joints || 0) : '-');
   }
   if (params.has('t')) await ensureArea(S.x, S.y);
-  syncCar(0); updateCamera(1);
+  syncCar(0); updateCamera(1); updateDayNight(0);
   $('loading').classList.add('hidden');
   let last = performance.now(), frame = 0;
   function loop(now) {
@@ -1987,7 +2216,7 @@ setTimeout(async () => {
     const sub = Math.max(1, Math.ceil(dt / (1 / 120)));
     for (let i = 0; i < sub; i++) update(dt / sub);
     for (const f of HOOKS.update) f(dt);
-    syncCar(dt); updateCamera(dt);
+    syncCar(dt); updateCamera(dt); updateDayNight(dt); WATER_T.value = now / 1000;
     for (const f of HOOKS.frame) f(dt);
     renderer.render(scene, camera);
     if ((frame++ & 1) === 0) drawMinimap();

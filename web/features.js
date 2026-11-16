@@ -353,7 +353,7 @@ function trySpawn(c, pool, minR, maxR) {
       id: nextId++, alive: true, pool, type, T: TT, w, s: s0, dir, lane, lat, prevLat: lat, pers: rand(0.88, 1.1), mood: 1, moodT: 1, moodTimer: rand(10, 40),
       color: pick(PAINTS[type] || COLORS.map((x) => x[0])), accent: pick(ACCENTS[type] || [[0.6, 0.6, 0.6]]),
       sx: scale[0], sy: scale[1], sz: scale[2], front: TT.front * scale[0], rear: TT.rear * scale[0], wid: TT.wid * scale[2],
-      lcCool: rand(2, 8), brake: false, deadEnd: false, pending: null, signal: 0, sigT: 0, plan: null, roll: 0, trail: [],
+      lcCool: rand(2, 8), vlat: 0, brake: false, deadEnd: false, pending: null, signal: 0, sigT: 0, plan: null, roll: 0, trail: [],
       x: POSE.x, y: POSE.y, z: POSE.z, h: Math.atan2(POSE.ty, POSE.tx) + (dir < 0 ? Math.PI : 0), pitch: 0,
     });
     if (TT.trailer) for (let k = 0; k <= 30; k++) c.trail.push([POSE.x - Math.cos(c.h) * k * 0.5, POSE.y - Math.sin(c.h) * k * 0.5, POSE.z]);
@@ -511,15 +511,22 @@ function stepCar(c, dt) {
     c.plan = null; c.signal = 0; c.pending = null;
   }
   // 橫向 (平滑換道 / 轉彎後回到車道)
+  // 二階阻尼彈簧 + 橫向加速度上限: 換車道是平順的 S 形 (慢慢切出去、慢慢擺正)，車頭角度跟著橫向速度連續變化，不會甩一下
   const tgt = laneLatC(c, c.lane);
   c.prevLat = c.lat;
-  const rate = c.type === 'scooter' ? 0.9 : 1.15;
-  c.lat += Math.max(-rate * dt, Math.min(rate * dt, tgt - c.lat));
+  const vmax = c.type === 'scooter' ? 1.0 : 1.2;
+  const om = c.pool === 'city' ? 1.45 : 1.1, aMax = c.pool === 'city' ? 1.3 : 0.8;
+  const err = tgt - c.lat;
+  let acc = om * om * err - 2 * om * (c.vlat || 0);
+  acc = Math.max(-aMax, Math.min(aMax, acc));
+  c.vlat = Math.max(-vmax, Math.min(vmax, (c.vlat || 0) + acc * dt));
+  c.lat += c.vlat * dt;
+  if (Math.abs(err) < 0.01 && Math.abs(c.vlat) < 0.03) { c.lat = tgt; c.vlat = 0; }
   poseAt(c.w, c.s, c.lat);
   c.x = POSE.x; c.y = POSE.y; c.z = POSE.z;
-  const latVel = (c.lat - c.prevLat) / Math.max(dt, 1e-3);
+  const latVel = c.vlat;
   const h0 = c.h;
-  c.h = Math.atan2(POSE.ty, POSE.tx) + (c.dir < 0 ? Math.PI : 0) + Math.atan2(c.dir * latVel, Math.max(c.v, 3));
+  c.h = Math.atan2(POSE.ty, POSE.tx) + (c.dir < 0 ? Math.PI : 0) + Math.atan2(c.dir * latVel, Math.max(c.v, 4));
   const z1 = poseAt(c.w, c.s + c.dir * 1.4, c.lat, {}).z, z0 = poseAt(c.w, c.s - c.dir * 1.4, c.lat, {}).z;
   c.pitch = Math.atan2(z1 - z0, 2.8);
   if (c.T.lean) {   // 機車轉彎壓車
@@ -1599,7 +1606,9 @@ const trees = (() => {
       const z = TW.terrainAt(x, y);
       if (!z && z !== 0) continue;
       const sl = Math.hypot(TW.terrainAt(x + 6, y) - z, TW.terrainAt(x, y + 6) - z) / 6;   // 坡度 (tan)
-      let dens = sl > 0.1 ? 0.75 : z > 150 ? 0.55 : 0;
+      const lcK = TW.landcoverAt ? TW.landcoverAt(x, y) : 0;
+      if (lcK && lcK !== 7 && lcK !== 4) continue;          // 水、沙灘、砂石、都市、農田、草地不種
+      let dens = lcK === 7 ? 0.8 : lcK === 4 ? 0.25 : sl > 0.1 ? 0.75 : z > 150 ? 0.55 : 0;
       if (z > 3000) dens *= 0.3;                       // 高山: 草原、樹少
       if (sl > 1.2) dens *= 0.4;                       // 懸崖
       if (hash(i, j, 3) > dens) continue;
@@ -1629,6 +1638,56 @@ const trees = (() => {
   };
 })();
 TW.HOOKS.update.push((dt) => trees.update(dt));
+
+// ======================================================================= 夜晚車燈: 頭燈白色光暈、尾燈紅色 (煞車更亮)，玩家車頭燈照亮前方路面
+const carGlow = (() => {
+  const N = MAX_FWY + MAX_CITY + 1;   // 車子在 init 才生成，這裡用上限
+  const mk = (size, cap) => {
+    const g = new T.BufferGeometry();
+    g.setAttribute('position', new T.BufferAttribute(new Float32Array(cap * 3), 3));
+    g.setAttribute('color', new T.BufferAttribute(new Float32Array(cap * 3), 3));
+    const m = new T.PointsMaterial({ map: TW.GLOW_TEX, size, sizeAttenuation: true, vertexColors: true, transparent: true, depthWrite: false, blending: T.AdditiveBlending, toneMapped: false, fog: false });
+    const pts = new T.Points(g, m); pts.frustumCulled = false; pts.visible = false; TW.scene.add(pts);
+    return pts;
+  };
+  const heads = mk(1.7, N * 2), tails = mk(0.9, N * 2);
+  const beam = new T.SpotLight(0xfff1dc, 0, 110, 0.42, 0.55, 1.0);
+  beam.castShadow = false; TW.scene.add(beam, beam.target);
+  let hn = 0, tn = 0;
+  const put = (pts, i, x, y, z, r, gg, b) => {
+    const P = pts.geometry.attributes.position.array, C = pts.geometry.attributes.color.array;
+    P[i * 3] = x; P[i * 3 + 1] = z; P[i * 3 + 2] = -y; C[i * 3] = r; C[i * 3 + 1] = gg; C[i * 3 + 2] = b;
+  };
+  function lamps(x, y, z, h, front, rear, wid, brake, isHeavy) {
+    const fx = Math.cos(h), fy = Math.sin(h), lx = -fy, ly = fx, hw = wid * 0.38, hz = isHeavy ? 1.0 : 0.68;
+    for (const sd of [-1, 1]) {
+      put(heads, hn++, x + fx * front + lx * hw * sd, y + fy * front + ly * hw * sd, z + hz, 1, 0.95, 0.82);
+      const k = brake ? 1 : 0.45;
+      put(tails, tn++, x - fx * rear + lx * hw * sd, y - fy * rear + ly * hw * sd, z + hz + 0.1, k, 0.02 * k, 0.01 * k);
+    }
+  }
+  return {
+    update() {
+      const night = TW.NIGHT.value;
+      heads.visible = tails.visible = night > 0.02;
+      beam.intensity = night * 40;
+      if (!heads.visible) return;
+      heads.material.opacity = tails.material.opacity = night;
+      hn = tn = 0;
+      for (const c of cars) if (c.alive) lamps(c.x, c.y, c.z, c.h, c.front, c.rear, c.wid, c.brake, HEAVY.has(c.type));
+      const vt = TW.S.vt || { wid: 1.85 };
+      lamps(S.x, S.y, S.zVis != null ? S.zVis : S.z, S.h, 2.25, 2.25, vt.wid || 1.85, S.brk > 0.1, false);
+      for (const p of [heads, tails]) {
+        p.geometry.setDrawRange(0, p === heads ? hn : tn);
+        p.geometry.attributes.position.needsUpdate = p.geometry.attributes.color.needsUpdate = true;
+      }
+      const fx = Math.cos(S.h), fy = Math.sin(S.h), z = (S.zVis != null ? S.zVis : S.z) + 0.75;
+      beam.position.set(S.x + fx * 2.2, z, -(S.y + fy * 2.2));
+      beam.target.position.set(S.x + fx * 30, z - 2.2, -(S.y + fy * 30));
+    },
+  };
+})();
+TW.HOOKS.update.push(() => carGlow.update());
 
 let densClock = 0;
 if (TW.params.has('densdbg')) TW.HOOKS.update.push((dt) => {   // 測試: 玩家附近國道車數
