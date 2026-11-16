@@ -3,6 +3,7 @@
 //   1. 路口高低差: 同一點上的路段高度不同 -> 一般道路平順拉到同一高度 (差太多視為不同樓層，錯開不相連)
 //   2. 地形冒出路面: 每個路面取樣點所在的地形三角形三個頂點壓到路面下 (三角形內插保證不會再冒出來)
 //   3. 建築壓到路: 牆角推到路緣外，推不開才移除
+//   0. 匝道: 接主線那一段改成貼著主線外側並行 (路緣相接、高度一致)，再慢慢分開；記下匝道資訊給網頁畫槽化線、導桿
 //   4. 橋墩插在別條路上: 沿帽梁左右找空位，找不到才移除
 import fs from 'node:fs';
 import path from 'node:path';
@@ -48,7 +49,8 @@ for (const [key, t] of tiles) {
   t.hd.fw.forEach((m, q) => {
     const n = t.hd.fc[q], P = new Float64Array(n * 3);
     for (let i = 0; i < n * 3; i++) P[i] = t.fP[(p * 3) + i];
-    ways.push({ key, t, city: false, q, p0: p, n, P, gid: m[0], name: m[2], width: m[6], hw: m[6] / 2, bridge: !!(m[7] & 1), tunnel: !!(m[7] & 2) });
+    ways.push({ key, t, city: false, q, p0: p, n, P, gid: m[0], name: m[2], width: m[6], hw: m[6] / 2, bridge: !!(m[7] & 1), tunnel: !!(m[7] & 2),
+      link: !!(m[7] & 4), oneway: !!(m[7] & 8), M: t.emask.subarray(p, p + n) });
     p += n;
   });
   p = 0;
@@ -65,8 +67,143 @@ const cum = (P, n) => { const s = new Float64Array(n); for (let i = 1; i < n; i+
 for (const w of ways) w.s = cum(w.P, w.n);
 console.log('ways', ways.length, 'tiles', tiles.size);
 
-// ---------------------------------------------------------------- 1. 路口高低差
 const ptKey = (x, y) => Math.round(x * 10) + ',' + Math.round(y * 10);
+// ---------------------------------------------------------------- 0. 匝道接主線
+// OSM 的匝道在交流道是從主線「中心線」岔出去的，所以前一兩百公尺整條疊在主線路面上 (穿模、高高低低)。
+// 照實際交流道: 匝道車道貼在主線最外側並行 (路緣剛好相接、高度和主線一樣)，再照原本路線慢慢分開；
+// 兩條路之間分開的三角區由網頁畫槽化線 (斑馬紋) 與橘色導桿，鼻端放緩衝桶；這段兩邊的護欄拿掉。
+// 匝道端點移開後和主線不再同一點，記在 hd.ramp，網頁用它把兩條路接起來 (AI 換路段時保留實際位置，像真的切車道)。
+const GORE_MAX = 9;   // 兩路緣距離小於這個值的範圍是槽化區 (沒有護欄)
+const MCELL = 50, MGRID = new Map();
+const mck = (x, y) => Math.floor(x / MCELL) * 100003 + Math.floor(y / MCELL);
+for (const w of ways) {
+  if (w.city || w.link) continue;
+  for (let i = 0; i < w.n - 1; i++) {
+    const ax = w.P[i * 3], ay = w.P[i * 3 + 1], bx = w.P[i * 3 + 3], by = w.P[i * 3 + 4], r = 30;
+    for (let cx = Math.floor((Math.min(ax, bx) - r) / MCELL); cx <= Math.floor((Math.max(ax, bx) + r) / MCELL); cx++)
+      for (let cy = Math.floor((Math.min(ay, by) - r) / MCELL); cy <= Math.floor((Math.max(ay, by) + r) / MCELL); cy++) {
+        const k = cx * 100003 + cy; let a = MGRID.get(k); if (!a) MGRID.set(k, a = []); a.push(w, i);
+      }
+  }
+}
+/** 最近的同向主線: 投影點、左法向、帶正負號的橫向距離 */
+function projMain(x, y, z, tx, ty) {
+  const a = MGRID.get(mck(x, y)); if (!a) return null;
+  let best = null;
+  for (let q = 0; q < a.length; q += 2) {
+    const w = a[q], i = a[q + 1], P = w.P;
+    const ax = P[i * 3], ay = P[i * 3 + 1], bx = P[i * 3 + 3], by = P[i * 3 + 4];
+    const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy); if (L < 1e-3) continue;
+    const ux = dx / L, uy = dy / L;
+    if (ux * tx + uy * ty < 0.7) continue;
+    const t = ((x - ax) * ux + (y - ay) * uy) / L;
+    if (t < -0.02 || t > 1.02) continue;
+    const tc = Math.min(1, Math.max(0, t));
+    const pz = P[i * 3 + 2] + (P[i * 3 + 5] - P[i * 3 + 2]) * tc;
+    if (Math.abs(pz - z) > 3) continue;
+    const px = ax + dx * tc, py = ay + dy * tc, lat = (x - px) * -uy + (y - py) * ux;
+    if (!best || Math.abs(lat) < Math.abs(best.lat)) best = { w, i, t: tc, px, py, pz, nx: -uy, ny: ux, lat };
+  }
+  return best;
+}
+const tanAt = (w, k, dir) => {   // 沿行車方向 (路線點序) 的切線
+  const a = Math.max(0, Math.min(w.n - 2, k - (dir > 0 ? 0 : 1)));
+  const dx = w.P[a * 3 + 3] - w.P[a * 3], dy = w.P[a * 3 + 4] - w.P[a * 3 + 1], L = Math.hypot(dx, dy) || 1;
+  return [dx / L, dy / L];
+};
+const ORIG = new Map();   // 原始端點座標 -> [[way, idx]] (移動匝道的點時，接在同一點的其他路段端點一起移)
+for (const w of ways) for (const i of [0, w.n - 1]) { const k = ptKey(w.P[i * 3], w.P[i * 3 + 1]); let a = ORIG.get(k); if (!a) ORIG.set(k, a = []); a.push([w, i]); }
+const smooth = (u) => u <= 0 ? 0 : u >= 1 ? 1 : u * u * (3 - 2 * u);
+let rampEnds = 0, rampMoved = 0, rampAlias = 0, followMoved = 0;
+const moved = new Set();
+for (const w of ways) {
+  if (!w.link || w.city || w.tunnel) continue;
+  for (const e of [0, w.n - 1]) {
+    const dir = e === 0 ? 1 : -1;   // 從端點往路段內走的方向
+    const x0 = w.P[e * 3], y0 = w.P[e * 3 + 1], z0 = w.P[e * 3 + 2];
+    const [tx0, ty0] = tanAt(w, e, 1);
+    const m0 = projMain(x0, y0, z0, tx0, ty0);
+    if (!m0 || Math.abs(m0.lat) > 1.2) continue;
+    // 端點附近要和主線差不多平行才算 (環道、垂直接上的不處理)
+    let k20 = e, a20 = 0;
+    while (a20 < 20 && k20 + dir >= 0 && k20 + dir < w.n) { a20 += Math.hypot(w.P[(k20 + dir) * 3] - w.P[k20 * 3], w.P[(k20 + dir) * 3 + 1] - w.P[k20 * 3 + 1]); k20 += dir; }
+    const ddx = (w.P[k20 * 3] - x0) * dir, ddy = (w.P[k20 * 3 + 1] - y0) * dir, dl = Math.hypot(ddx, ddy) || 1;
+    if ((ddx * m0.ny - ddy * m0.nx) / dl < 0.85) continue;   // 主線切線 = (ny, -nx)
+    rampEnds++;
+    // 沿匝道記錄每一點相對主線的位置
+    const rec = [];
+    let along = 0;
+    for (let k = e; k >= 0 && k < w.n && along < 450; k += dir) {
+      if (k !== e) along += Math.hypot(w.P[k * 3] - w.P[(k - dir) * 3], w.P[k * 3 + 1] - w.P[(k - dir) * 3 + 1]);
+      const [tx, ty] = tanAt(w, k, 1);
+      const m = projMain(w.P[k * 3], w.P[k * 3 + 1], w.P[k * 3 + 2], tx, ty);
+      if (!m) break;
+      rec.push({ k, along, m });
+    }
+    if (rec.length < 3) continue;
+    let side = 0;
+    for (const r of rec) if (Math.abs(r.m.lat) > r.m.w.hw + w.hw + 3) { side = Math.sign(r.m.lat); break; }
+    if (!side) { for (let j = rec.length - 1; j >= 0; j--) if (Math.abs(rec[j].m.lat) > 1) { side = Math.sign(rec[j].m.lat); break; } }
+    if (!side) continue;
+    // 橫向: 平滑取 max(原位置, 貼齊位置)；高度: 槽化區內跟主線一樣，分開後漸漸回到原本的縱斷面
+    const B = 8;
+    let free = 0, prevM = null;
+    const tipOld = [x0, y0];
+    for (const r of rec) {
+      const { k, m } = r;
+      const R = m.w.hw + w.hw - 0.05, x = side * m.lat - R;
+      if (x >= B) { if (++free >= 3) break; r.gap = x; continue; }
+      if (free > 0) break;   // 已經分開又「貼回」= 找到別條主線，不處理
+      if (prevM && m.w !== prevM.w && Math.abs(m.lat - prevM.lat) > 4) break;   // 主線突然換一條、位置跳很多
+      prevM = m;
+      const out = x <= -B ? 0 : (x + B) * (x + B) / (4 * B);
+      const ox = w.P[k * 3], oy = w.P[k * 3 + 1], oz = w.P[k * 3 + 2];
+      const nxp = m.px + side * m.nx * (R + out), nyp = m.py + side * m.ny * (R + out);
+      const wz = 1 - smooth((out - 1) / 13);
+      const nz = m.pz * wz + oz * (1 - wz);
+      // 接在這一點上的其他路段端點 (例如匝道再分岔) 一起移
+      for (const [o, oi] of ORIG.get(ptKey(ox, oy)) || []) {
+        if (o === w || moved.has(o.gid + ':' + oi)) continue;
+        moved.add(o.gid + ':' + oi);
+        const dx = nxp - ox, dy = nyp - oy, dz = nz - oz, odir = oi === 0 ? 1 : -1;
+        let oa = 0;
+        for (let j = oi; j >= 0 && j < o.n; j += odir) {
+          if (j !== oi) oa += Math.hypot(o.P[j * 3] - o.P[(j - odir) * 3], o.P[j * 3 + 1] - o.P[(j - odir) * 3 + 1]);
+          if (oa > 40) break;
+          const f = 1 - smooth(oa / 40);
+          o.P[j * 3] += dx * f; o.P[j * 3 + 1] += dy * f; o.P[j * 3 + 2] += dz * f;
+        }
+        followMoved++;
+      }
+      w.P[k * 3] = nxp; w.P[k * 3 + 1] = nyp; w.P[k * 3 + 2] = nz;
+      r.gap = out;
+      rampMoved++;
+      // 槽化區兩邊不放護欄 / 側牆: 主線靠匝道那一側、匝道靠主線那一側
+      if (out < GORE_MAX) {
+        const mb = side > 0 ? 1 : 2;
+        m.w.M[m.i] |= mb; m.w.M[m.i + 1] |= mb;
+        const [ltx, lty] = tanAt(w, k, 1);
+        const lb = (-lty * -side * m.nx + ltx * -side * m.ny) > 0 ? 1 : 2;   // 匝道左法向 (-ty, tx) 跟「朝主線」同向 = 左側
+        w.M[k] |= lb;
+      }
+    }
+    // 高度沿線再順一次 (端點固定)，避免縱斷面出現小台階
+    const last = rec.findIndex((r) => r.gap != null && r.gap >= B);
+    const upto = Math.min(rec.length, (last < 0 ? rec.length : last) + 6);
+    for (let pass = 0; pass < 3; pass++) {
+      const zs = rec.slice(0, upto).map((r) => w.P[r.k * 3 + 2]);
+      for (let j = 1; j < upto - 1; j++) w.P[rec[j].k * 3 + 2] = 0.25 * zs[j - 1] + 0.5 * zs[j] + 0.25 * zs[j + 1];
+    }
+    // 端點原本和主線的某個點重合 -> 記下來給網頁接路網
+    let mi = -1;
+    for (let i = 0; i < m0.w.n; i++) if (Math.hypot(m0.w.P[i * 3] - tipOld[0], m0.w.P[i * 3 + 1] - tipOld[1]) < 0.6) { mi = i; break; }
+    if (mi >= 0) rampAlias++;
+    (w.t.hd.ramp ||= []).push([w.gid, e, side, m0.w.gid, mi]);
+  }
+}
+console.log('ramp ends aligned', rampEnds, 'points moved', rampMoved, 'joined ends followed', followMoved, 'network aliases', rampAlias);
+
+// ---------------------------------------------------------------- 1. 路口高低差
 const PT = new Map();
 for (const w of ways) for (let i = 0; i < w.n; i++) { const k = ptKey(w.P[i * 3], w.P[i * 3 + 1]); let a = PT.get(k); if (!a) PT.set(k, a = []); a.push([w, i]); }
 let jFixed = 0, jSplit = 0;

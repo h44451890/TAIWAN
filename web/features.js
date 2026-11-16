@@ -11,7 +11,10 @@ const LIVE = JSON.parse($('extra-live').textContent);
 const API = TW.params.get('api') || LIVE.apiBase;
 // 即時資料來源 (依序嘗試): 本機伺服器 scripts/phone_location.py -> Smart-Nav-Map 後端 -> 打包時的快照
 const LOCAL = (TW.params.get('gps') || 'http://127.0.0.1:8765').replace(/\/$/, '');
-const SOURCES = [[LOCAL, '本機'], [API, '後端']];
+// 本機伺服器只在「遊戲本身就開在這台電腦」(localhost / 檔案) 或網址指定 ?gps= 時才連：
+// GitHub 版在別人的手機、電腦上去連 127.0.0.1，瀏覽器會一直跳「網站想存取區域網路」的警告
+const LOCAL_OK = /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname) || location.protocol === 'file:' || TW.params.has('gps');
+const SOURCES = LOCAL_OK ? [[LOCAL, '本機'], [API, '後端']] : [[API, '後端']];
 async function fetchLive(path) {
   for (const [base, label] of SOURCES) {
     try {
@@ -148,8 +151,8 @@ function bakeByMaterial(root, frame, filter) {
 
 // ======================================================================= AI 車流 (多車種、國道 + 一般道路)
 const TV = window.TWV.TYPES;
-const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 75 : 140))));   // 塞車時要排得出一整排車
-const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 35 : 75))));
+const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 50 : 140))));   // 塞車時要排得出一整排車
+const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 28 : 75))));
 const COLORS = [ // 線性色彩；權重
   [[0.80, 0.80, 0.78], 24], [[0.45, 0.46, 0.48], 18], [[0.012, 0.012, 0.014], 14], [[0.09, 0.095, 0.10], 10],
   [[0.50, 0.02, 0.02], 7], [[0.03, 0.08, 0.36], 7], [[0.04, 0.17, 0.07], 4], [[0.48, 0.40, 0.28], 5], [[0.65, 0.66, 0.70], 3],
@@ -257,7 +260,7 @@ const distToEnd = (c) => c.dir > 0 ? wayLen(c.w) - c.s : c.s;
 function desiredSpeed(c) {
   const w = c.w;
   let lim = TW.speedLimit(w) / 3.6;
-  if (!w.city) { const t = wayTraffic[w.k]; if (t && t.speed > 0) lim = t.speed / 3.6; }
+  if (!w.city) { const t = wayTraffic[w.k]; if (t && t.speed > 0) lim = levelOf(t) <= 1 ? Math.max(t.speed, TW.speedLimit(w)) / 3.6 : t.speed / 3.6; }   // 順暢路段照限速開 (旅行速度是平均值，偏低)
   let v = Math.min(lim * c.pers * c.mood, c.T.vmax * (HEAVY.has(c.type) ? 0.92 : 1));
   if (c.plan && c.plan.vturn < 50) {   // 路口轉彎前減速
     const d = Math.max(0, distToEnd(c) - 4);
@@ -366,13 +369,13 @@ function trySpawn(c, pool, minR, maxR) {
     const s0 = pool === 'fwy' ? Math.min(wayLen(w) - 3, Math.max(3, sm[1] + (Math.random() - 0.5) * 40)) : sm[1];   // 取樣點 40 m 一個，前後錯開才排得密
     poseAt(w, s0, lat);
     let ok = Math.hypot(POSE.x - S.x, POSE.y - S.y) > Math.min(minR, 40);
-    const gapNeed = pool === 'city' ? 14 : [28, 28, 18, 12, 8.5, 7][levelOf(wayTraffic[w.k])];   // 塞車時車距短 (含車長)
+    const gapNeed = pool === 'city' ? 14 : [28, 28, 24, 18, 13, 8][levelOf(wayTraffic[w.k])];   // 塞車時車距短 (含車長)；約等於該車速下的跟車距離，生出來才不會全部急煞
     for (const o of cars) if (ok && o.alive && o !== c && (o.x - POSE.x) ** 2 + (o.y - POSE.y) ** 2 < gapNeed * gapNeed && Math.abs(o.z - POSE.z) < 3) ok = false;
     if (!ok) continue;
     const TT = TV[type];
     const scale = type === 'sedan' ? pickW(BODY_TYPES) : [1, 1, 1];
     Object.assign(c, {
-      id: nextId++, alive: true, pool, type, T: TT, w, s: s0, dir, lane, lat, prevLat: lat, pers: rand(0.88, 1.1), mood: 1, moodT: 1, moodTimer: rand(10, 40),
+      id: nextId++, alive: true, pool, type, T: TT, w, s: s0, dir, lane, lat, prevLat: lat, pers: pool === 'fwy' ? rand(0.95, 1.15) : rand(0.88, 1.1), mood: 1, moodT: 1, moodTimer: rand(10, 40),
       color: pick(PAINTS[type] || COLORS.map((x) => x[0])), accent: pick(ACCENTS[type] || [[0.6, 0.6, 0.6]]),
       sx: scale[0], sy: scale[1], sz: scale[2], front: TT.front * scale[0], rear: TT.rear * scale[0], wid: TT.wid * scale[2],
       lcCool: rand(2, 8), vlat: 0, brake: false, deadEnd: false, pending: null, signal: 0, sigT: 0, plan: null, roll: 0, trail: [],
@@ -524,8 +527,16 @@ function stepCar(c, dt) {
       c.s = c.dir > 0 ? wayLen(c.w) : 0; c.v = 0; c.deadEnd = true; break;
     }
     const wasLink = c.w.link;
+    // 匝道端點和主線不在同一點 (匝道車道貼在主線外側): 換路段時保留車子實際位置，再平滑移進新路段的車道，像真的切車道
+    const ow = c.w, oi = c.dir > 0 ? ow.n - 1 : 0, ni = plan.i;
+    const jump = !ow.city && !plan.o.city && Math.hypot(ow.P[oi * 3] - plan.o.P[ni * 3], ow.P[oi * 3 + 1] - plan.o.P[ni * 3 + 1]) > 0.5;
+    if (jump) poseAt(ow, c.dir > 0 ? wayLen(ow) : 0, c.lat);
     c.w = plan.o; c.dir = plan.dir;
     c.s = plan.o.s[plan.i] + c.dir * over;
+    if (jump) {
+      const nl2 = (POSE.x - plan.o.P[ni * 3]) * plan.o.nx[ni] + (POSE.y - plan.o.P[ni * 3 + 1]) * plan.o.ny[ni];
+      if (Math.abs(nl2) < 20) { c.lat = nl2; c.prevLat = c.lat; }   // poseAt 的橫向是路段點序的左法向，和行進方向無關
+    }
     const nl = TW.laneCount(c.w);
     if (c.lane >= nl) c.lane = nl - 1;
     if (wasLink && !c.w.link) c.lane = nl - 1;
@@ -674,8 +685,8 @@ function updateTraffic(dt) {
       const d = c.alive ? Math.hypot(c.x - S.x, c.y - S.y) : 1e9;
       const behind = c.alive && (c.x - S.x) * Math.cos(S.h) + (c.y - S.y) * Math.sin(S.h) < -25;
       const FR = FWY_R[fwyLv];
-      const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && d > 250)) : (d > FR[2] || (c.deadEnd && d > Math.min(700, FR[1])));
-      const jam = ((c.stuck || 0) > 20 && (d > 150 || behind)) || (c.stuck || 0) > 45;   // 卡死的車: 先在看不到的地方回收，卡太久就直接回收
+      const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && (d > 80 || behind))) : (d > FR[2] || (c.deadEnd && d > Math.min(700, FR[1])));
+      const jam = ((c.stuck || 0) > 8 && (d > 120 || behind)) || (c.stuck || 0) > 25;   // 卡死的車: 停 8 秒就在看不到的地方回收，卡太久直接回收
       if (jam && !far) stats.unjam = (stats.unjam || 0) + 1;
       if ((far || jam) && n++ < 4) {
         kill(c);
@@ -1311,13 +1322,17 @@ const sound = (() => {
       const g = ac.createGain(); g.gain.value = k * a * 0.75;
       s.connect(g); g.connect(out); s.start(t0 + dt); s.stop(t0 + dt + 0.45);
     }
+    // 疊加撞車的悶響 (較輕、隨車速變大)，前後兩個邊緣各一下
+    bump(0.42 * k, 0);
+    bump(0.26 * k, gapT);
   }
-  function bump() {
+  /** 撞擊悶響; amp = 音量倍率 (撞車 1), delay = 延遲秒數 */
+  function bump(amp = 1, delay = 0) {
     if (!ac || !enabled) return;
     const s = ac.createBufferSource(); s.buffer = nodes.nb;
     const f = ac.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = 400;
-    const g = ac.createGain(); const t = ac.currentTime;
-    g.gain.setValueAtTime(0.9, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
+    const g = ac.createGain(); const t = ac.currentTime + delay;
+    g.gain.setValueAtTime(0.9 * amp, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.35);
     s.connect(f); f.connect(g); g.connect(nodes.comp); s.start(t); s.stop(t + 0.4);
   }
   let lastBlink = false;
@@ -1620,7 +1635,7 @@ TW.HOOKS.init.push(() => {
 // 道路兩側 8 m 內、高架下方都不種。玩家移動 150 m 以上才重新排一次。
 const trees = (() => {
   if (TW.params.has('notrees')) return { update() {}, dirty() {} };
-  const CAP = TW.MOBILE ? 1800 : 7000, R = TW.MOBILE ? 450 : 900, STEP = 18;
+  const CAP = TW.MOBILE ? 700 : 7000, R = TW.MOBILE ? 320 : 900, STEP = 18;
   const crownGeo = new T.IcosahedronGeometry(1, 1);
   { // 樹冠稍微壓扁、表面不規則
     const p = crownGeo.getAttribute('position');

@@ -50,6 +50,7 @@ const GID = new Map();
 const wayByGid = (g) => { const k = GID.get(g); return k == null ? null : WAYS[k]; };
 const ptKey = (x, y) => Math.round(x * 10) + ',' + Math.round(y * 10);
 const PT_INDEX = new Map(); // 座標 -> [[way, idx], ...]
+const RAMP_PENDING = [];     // 還沒接上的匝道 (見 resolveRamps)
 // 空間索引 (路段線段)
 const CELL = 40;
 const GRID = new Map();
@@ -143,7 +144,24 @@ function ingestDetail(buf) {
   for (let b = 0, v = 0; b < hd.nb; b++) for (let i = 0; i < bcnt[b]; i++, v++) {
     bxy[v * 2] = bxy0[b * 2] + boff[v * 2] * 0.1; bxy[v * 2 + 1] = bxy0[b * 2 + 1] + boff[v * 2 + 1] * 0.1;
   }
+  if (hd.ramp) { for (const r of hd.ramp) RAMP_PENDING.push(r); resolveRamps(); }
   return { ways, piers, bld: hd.nb ? { bxy, bbase, bh, bcnt, bcol, nb: hd.nb } : null };
+}
+// 匝道接主線 (scripts/fix_clip.mjs 步驟 0): 匝道端點已移到主線外側，記錄 [匝道 gid, 端點, 在主線哪一側, 主線 gid, 原本重合的主線點]。
+// 兩條路都載入後把它們在路網上接起來 (nextOptions 用 PT_INDEX 找下一段路)，並讓匝道知道要畫槽化區。
+function resolveRamps() {
+  for (let j = RAMP_PENDING.length - 1; j >= 0; j--) {
+    const [gid, e, side, mgid, mi] = RAMP_PENDING[j];
+    const w = wayByGid(gid), m = wayByGid(mgid);
+    if (!w || !m) continue;
+    (w.ramps ||= []).push({ e, side, mgid });
+    if (mi >= 0 && mi < m.n) {
+      const add = (key, k, i) => { let a = PT_INDEX.get(key); if (!a) PT_INDEX.set(key, a = []); if (!a.some(([kk, ii]) => kk === k && ii === i)) a.push([k, i]); };
+      add(ptKey(w.P[e * 3], w.P[e * 3 + 1]), m.k, mi);
+      add(ptKey(m.P[mi * 3], m.P[mi * 3 + 1]), w.k, e);
+    }
+    RAMP_PENDING.splice(j, 1);
+  }
 }
 
 /** 找 (x,y) 處、高度不高於 zRef+climb 的最高路面。margin: 距路緣保留寬度 */
@@ -503,6 +521,29 @@ const matBarrier = patch(new T.MeshStandardMaterial({ roughness: 0.92, metalness
     diffuseColor.rgb = mix(c, vec3(0.01), slot);
   }`,
 });
+// 匝道槽化區: 舊瀝青 + 兩側白實線 + 斜向白色斑馬紋 (aUv.x = 沿線距離、aUv.y = 離主線路緣距離、aLs = 該處寬度)
+const matGore = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalness: 0, side: T.DoubleSide, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }), {
+  vert: 'attribute vec2 aUv; attribute float aLs; varying vec2 vRUv; varying float vW;',
+  vmain: 'vRUv = aUv; vW = aLs;',
+  frag: 'varying vec2 vRUv; varying float vW;' + ASPH_DECL,
+  uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
+  color: `{
+    float u = vRUv.x, v = vRUv.y, W = max(vW, 0.0), fw = max(fwidth(v), 1e-4);
+    asphUv(vObj);
+    vec3 c = asphColor() * (0.6 + 0.25 * fwyFbm(vObj * 0.015, 3));
+    float edge = min(v, W - v);
+    float line = 1.0 - smoothstep(0.12, 0.12 + fw, edge);
+    float d = (u - v * 1.25) / 3.2, fd = max(fwidth(d), 1e-4);
+    float st = abs(fract(d) - 0.5);
+    float chev = (1.0 - smoothstep(0.07, 0.07 + fd * 1.5, st)) * step(0.6, W) * step(0.2, edge);
+    gMark = max(line, chev);
+    diffuseColor.rgb = mix(c, vec3(0.78, 0.78, 0.74), gMark);
+  }`,
+});
+const matPost = new T.MeshStandardMaterial({ color: 0xff7a12, roughness: 0.5, metalness: 0 });          // 橘色導桿
+const matPostBand = new T.MeshStandardMaterial({ color: 0xf2f2ee, roughness: 0.3, metalness: 0.1, emissive: 0x222222 });   // 反光帶
+const matDrum = new T.MeshStandardMaterial({ color: 0xf2c200, roughness: 0.55, metalness: 0 });         // 黃色緩衝桶
+const matDrumBand = new T.MeshStandardMaterial({ color: 0x151515, roughness: 0.6, metalness: 0 });
 // 中央分隔護欄上的綠色防眩板 (照街景: 綠色鋼板、略褪色、底部有灰塵)
 const matGlare = patch(new T.MeshStandardMaterial({ roughness: 0.55, metalness: 0.25, side: T.DoubleSide }), {
   color: 'diffuseColor.rgb = vec3(0.045, 0.24, 0.085) * (0.8 + 0.35 * fwyFbm(vObj * 3.0, 3));',
@@ -859,6 +900,70 @@ function addRoad(c, w) {
   if (w.tunnel) addTunnel(c, w);
 }
 
+// ======================================================================= 匝道槽化區 (照街景: 白色斑馬紋、兩側白實線、橘色導桿、鼻端黃色緩衝桶)
+const GORE_MAX = 9;
+/** 最近的同向主線 (投影點、左法向、橫向距離)；搜尋周圍 3x3 格，因為槽化區離主線中心線可能 20 m 以上 */
+function projMainRT(x, y, z, tx, ty) {
+  const cx = Math.floor(x / CELL), cy = Math.floor(y / CELL);
+  let best = null;
+  for (let ix = cx - 1; ix <= cx + 1; ix++) for (let iy = cy - 1; iy <= cy + 1; iy++) {
+    const a = GRID.get(cellKey(ix, iy)); if (!a) continue;
+    for (let q = 0; q < a.length; q += 2) {
+      const w = WAYS[a[q]], i = a[q + 1];
+      if (w.link || w.city) continue;
+      const P = w.P, ax = P[i * 3], ay = P[i * 3 + 1], dx = P[i * 3 + 3] - ax, dy = P[i * 3 + 4] - ay, L = Math.hypot(dx, dy);
+      if (L < 1e-3) continue;
+      const ux = dx / L, uy = dy / L;
+      if (ux * tx + uy * ty < 0.7) continue;
+      const t = ((x - ax) * ux + (y - ay) * uy) / L;
+      if (t < -0.02 || t > 1.02) continue;
+      const tc = Math.min(1, Math.max(0, t)), pz = P[i * 3 + 2] + (P[i * 3 + 5] - P[i * 3 + 2]) * tc;
+      if (Math.abs(pz - z) > 3) continue;
+      const px = ax + dx * tc, py = ay + dy * tc, lat = (x - px) * -uy + (y - py) * ux;
+      if (!best || Math.abs(lat) < Math.abs(best.lat)) best = { w, px, py, pz, nx: -uy, ny: ux, lat };
+    }
+  }
+  return best;
+}
+function addGore(c, w, r) {
+  const { P, n } = w, dir = r.e === 0 ? 1 : -1, side = r.side, G = c.gore;
+  let along = 0, prevRow = -1, lastPost = -1e9, drums = false, prevGap = null, prevM = null;
+  for (let k = r.e; k >= 0 && k < n && along < 450; k += dir) {
+    if (k !== r.e) along += Math.hypot(P[k * 3] - P[(k - dir) * 3], P[k * 3 + 1] - P[(k - dir) * 3 + 1]);
+    const m = projMainRT(P[k * 3], P[k * 3 + 1], P[k * 3 + 2], w.ny[k], -w.nx[k]);
+    if (!m) break;
+    const gap = side * m.lat - m.w.hw - w.hw;
+    if (side * m.lat <= 0 || (prevGap != null && gap < prevGap - 1.5) || (prevM && m.w !== prevM.w && Math.abs(m.lat - prevM.lat) > 4)) break;   // 找到別條主線: 停
+    prevGap = gap; prevM = m;
+    const ex = m.px + side * m.nx * m.w.hw, ey = m.py + side * m.ny * m.w.hw, ez = m.pz;
+    const lx = P[k * 3] - side * m.nx * w.hw, ly = P[k * 3 + 1] - side * m.ny * w.hw, lz = P[k * 3 + 2];
+    const W = Math.max(0, Math.hypot(lx - ex, ly - ey));
+    const a = G.v(ex, ey, ez + 0.01); G.uv.push(along, 0); G.ls.push(W); G.ln.push(0);
+    G.v(lx, ly, lz + 0.01); G.uv.push(along, W); G.ls.push(W); G.ln.push(0);
+    if (prevRow >= 0) G.q(prevRow, prevRow + 1, a + 1, a);
+    prevRow = a;
+    // 導桿: 槽化區中線，每 2.5 m 一支 (寬度夠才放)
+    if (W > 1.2 && along - lastPost >= 2.5) {
+      lastPost = along;
+      const px = (ex + lx) / 2, py = (ey + ly) / 2, pz = (ez + lz) / 2;
+      box(c.gpost, px, py, w.ny[k], -w.nx[k], 0.045, 0.045, pz, pz + 0.75);
+      box(c.gband, px, py, w.ny[k], -w.nx[k], 0.05, 0.05, pz + 0.5, pz + 0.62);
+    }
+    if (gap > GORE_MAX) {
+      // 鼻端 (護欄開始處) 放三個黃色緩衝桶
+      if (!drums) {
+        drums = true;
+        for (let d = 0; d < 3; d++) {
+          const f = (d + 1) / 4, qx = ex + (lx - ex) * f, qy = ey + (ly - ey) * f, qz = ez + (lz - ez) * f;
+          box(c.drum, qx, qy, w.ny[k], -w.nx[k], 0.42, 0.42, qz, qz + 0.95);
+          box(c.drumb, qx, qy, w.ny[k], -w.nx[k], 0.43, 0.43, qz + 0.55, qz + 0.68);
+        }
+      }
+      break;
+    }
+  }
+}
+
 // ======================================================================= 伸縮縫 (橋梁接縫)
 // 每座橋墩上方與橋頭各一道；車輪壓過時「叩」一聲 (前輪、後輪各一下)
 const JOINTS = [], JGRID = new Map(), JCELL = 50;
@@ -1105,6 +1210,7 @@ function portalMesh(w, i) {
 }
 
 const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), lampPole: new GB(), lampHead: new GB(), glows: [], reflBlack: new GB(), reflFace: new GB('uv'), rglow: [], rnorm: [], reflR: new GB(), reflY: new GB(),
+  gore: new GB('road'), gpost: new GB(), gband: new GB(), drum: new GB(), drumb: new GB(),
   pier: new GB(), tunnel: new GB('uv'), tlight: new GB(), tcab: new GB(), portals: [] });
 
 /** 一般道路: 鋪在地形上的路面 (市區標線由材質依 aLs=路寬、aLanes=車道代碼 算出)；橋梁加梁身與橋墩 */
@@ -1204,10 +1310,11 @@ function neighborsReady(rec) {
 }
 function buildTile(rec) {
   const c = newChunk(), g = new T.Group();
-  for (const k of rec.ways) { const w = WAYS[k]; if (w.city) addCityRoad(c, w); else addRoad(c, w); }
+  for (const k of rec.ways) { const w = WAYS[k]; if (w.city) addCityRoad(c, w); else { addRoad(c, w); if (w.ramps && !params.has('nogore')) for (const r of w.ramps) addGore(c, w, r); } }
   for (let k = 0; k < rec.piers.length / 9; k++) addPier(c.pier, rec.piers, k);
   for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
                    c.barrier.mesh(matBarrier, { cast: true }), c.glare.mesh(matGlare, { cast: true }), c.lampPole.mesh(matLampPole, { cast: true }), c.lampHead.mesh(matLampHead), c.pier.mesh(matConcrete, { cast: true }),
+                   c.gore.mesh(matGore), c.gpost.mesh(matPost, { cast: true }), c.gband.mesh(matPostBand), c.drum.mesh(matDrum, { cast: true }), c.drumb.mesh(matDrumBand),
                    c.tunnel.mesh(matTunnelWall, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }), c.tcab.mesh(matCabinet),
                    c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false }), c.reflBlack.mesh(matReflBlack), c.reflFace.mesh(matRetro, { receive: false })]) if (m) g.add(m);
   for (const [w, i] of c.portals) g.add(portalMesh(w, i));
@@ -2135,6 +2242,7 @@ function update(dt) {
   a -= 0.00042 * S.v * Math.abs(S.v) + 0.12 * Math.sign(S.v);
   a -= 9.81 * Math.sin(S.pitch) * 0.9;
   S.v += a * dt;
+  if (autopilot && S.v < 0) S.v = 0;   // 自動駕駛在車陣裡停住時踩煞車，不能變成倒車
   if (!thr && !brk && Math.abs(S.v) < 0.15) S.v = 0;
   S.braking = !!(brk && S.v > 0.5) || !!keys.Space;
   // 轉向
@@ -2231,6 +2339,7 @@ renderer.domElement.addEventListener('pointerdown', (e) => { dragging = true; la
 window.addEventListener('pointerup', () => { dragging = false; });
 window.addEventListener('pointermove', (e) => { if (dragging) { orbitYaw -= (e.clientX - lastX) * 0.006; lastX = e.clientX; } });
 
+const AER = (params.get('aer') || '150,140').split(',').map(Number);   // 空拍: 後退距離, 高度 (測試可用 ?aer=30,40 近拍)
 const CAMAT = params.get('camat') ? params.get('camat').split(',').map(Number) : null;   // 測試: ?camat=x,y,z&look=x,y,z 固定攝影機 (資料座標)
 const LOOKAT = params.get('look') ? params.get('look').split(',').map(Number) : null;
 function updateCamera(dt) {
@@ -2247,10 +2356,10 @@ function updateCamera(dt) {
   if (camMode === 2) {   // 空拍
     car.visible = true;
     const back = fwd.clone().applyAxisAngle(new T.Vector3(0, 1, 0), orbitYaw);
-    const want = carP.clone().addScaledVector(back, -150).add(new T.Vector3(0, 140, 0));
+    const want = carP.clone().addScaledVector(back, -AER[0]).add(new T.Vector3(0, AER[1], 0));
     if (!camInit) { camPos.copy(want); camInit = true; }
     camPos.lerp(want, 1 - Math.exp(-dt * 3));
-    camera.position.copy(camPos); camera.lookAt(carP.clone().addScaledVector(fwd, 60));
+    camera.position.copy(camPos); camera.lookAt(carP.clone().addScaledVector(fwd, Math.min(60, AER[0] * 0.4)));
   } else if (camMode === 1) {   // 第一人稱: 只看到前方的路
     car.visible = false;
     camera.near = 0.1;
@@ -2394,13 +2503,36 @@ setTimeout(async () => {
   // 起點: 國1 南下 0K (基隆端)；網址 ?spawn=路段gid,點 或 ?at=x,y 可覆寫
   let sp0 = SPAWNS[0] || { x: 0, y: 0 };
   if (params.has('at')) { const [x, y] = params.get('at').split(',').map(Number); sp0 = { x, y }; }
-  await ensureArea(sp0.x, sp0.y, '載入地圖分區…');
-  const want = params.has('spawn') ? params.get('spawn').split(',').map(Number) : sp0.gid != null ? [sp0.gid, sp0.idx, sp0.dir] : null;
+  // 上次的位置 (關掉前存的)；網址有指定地點或在測試時不用
+  let resume = null;
+  if (!params.has('at') && !params.has('spawn') && !params.has('t') && !params.has('fresh')) {
+    try { resume = JSON.parse(localStorage.getItem('tw_pos') || 'null'); } catch (_) { resume = null; }
+    if (resume && !(Number.isFinite(resume.x) && Number.isFinite(resume.y) && Number.isFinite(resume.h))) resume = null;
+    if (resume) sp0 = { x: resume.x, y: resume.y };
+  }
+  await ensureArea(sp0.x, sp0.y, resume ? '回到上次的位置…' : '載入地圖分區…');
+  const want = params.has('spawn') ? params.get('spawn').split(',').map(Number) : (!resume && sp0.gid != null) ? [sp0.gid, sp0.idx, sp0.dir] : null;
   const w0 = want && wayByGid(want[0]);
-  if (w0) spawn(w0.k, want[1], want[2] || 1, params.has('lane') ? +params.get('lane') : null);   // ?lane=: 測試用
+  if (resume) {
+    const r = roadAt(resume.x, resume.y, (resume.z || terrainAt(resume.x, resume.y)) + 2, 0, 4);
+    if (r) {   // 接回上次那條路，方向照上次的車頭
+      const tx = r.tx, ty = r.ty, dir = Math.cos(resume.h) * tx + Math.sin(resume.h) * ty >= 0 ? 1 : -1;
+      spawn(r.w.k, r.i, dir);
+      S.x = resume.x; S.y = resume.y; S.h = resume.h; S.road = roadAt(S.x, S.y, r.z + 1, 0, 2) || S.road; if (S.road) S.z = S.road.z;
+    } else { S.x = resume.x; S.y = resume.y; S.z = terrainAt(resume.x, resume.y); respawnNearest(); }
+    if (resume.vtype) try { setVehicle(resume.vtype); } catch (_) {}
+  } else if (w0) spawn(w0.k, want[1], want[2] || 1, params.has('lane') ? +params.get('lane') : null);   // ?lane=: 測試用
   else if (params.has('at')) { S.x = sp0.x; S.y = sp0.y; S.z = terrainAt(sp0.x, sp0.y); respawnNearest(); }
   else defaultSpawn();
   if (params.has('vehicle')) setVehicle(params.get('vehicle'));
+  // 每 3 秒、切走或關掉頁面時記住目前位置 (下次打開從這裡繼續；?fresh 從預設起點開始)
+  const savePos = () => {
+    if (!S.road || !Number.isFinite(S.x + S.y + S.h) || params.has('t')) return;
+    try { localStorage.setItem('tw_pos', JSON.stringify({ x: +S.x.toFixed(2), y: +S.y.toFixed(2), z: +S.z.toFixed(2), h: +S.h.toFixed(4), vtype: S.vtype, ts: Date.now() })); } catch (_) {}
+  };
+  setInterval(savePos, 3000);
+  window.addEventListener('pagehide', savePos);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') savePos(); });
   for (const f of HOOKS.init) f();
   if (params.has('clipscan')) await clipScan();
   if (params.has('t')) { // 測試用: 先跑幾秒
