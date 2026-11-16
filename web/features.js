@@ -1711,7 +1711,7 @@ const carGlow = (() => {
     update() {
       const night = TW.NIGHT.value;
       heads.visible = tails.visible = night > 0.02;
-      beam.intensity = night * 40;
+      beam.intensity = night * 28;
       if (!heads.visible) return;
       heads.material.opacity = tails.material.opacity = night;
       hn = tn = 0;

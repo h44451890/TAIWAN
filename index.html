@@ -737,7 +737,7 @@ function renderSky() {
   if (skyEnv) skyEnv.dispose();
   skyEnv = env;
   scene.environment = env;
-  scene.environmentIntensity = 0.55;
+  // environmentIntensity 由 updateDayNight 依日夜設定
 }
 renderSky();
 scene.fog = new T.FogExp2(HORIZON.clone(), 0.000045);
@@ -796,10 +796,11 @@ function updateDayNight(dt) {
     sun.color.setRGB(1, 0.62 + 0.38 * k, 0.42 + 0.58 * k);
   } else {   // 夜晚: 月光 (淡藍、從高處照)
     SUN_DIR.copy(MOON_DIR);
-    sun.intensity = 0.25;
-    sun.color.setRGB(0.6, 0.7, 1.0);
+    sun.intensity = 0.07;   // 月光很弱
+    sun.color.setRGB(0.55, 0.65, 1.0);
   }
-  renderer.toneMappingExposure = 1 + 0.7 * NIGHT.value;
+  renderer.toneMappingExposure = 1 + 0.2 * NIGHT.value;
+  scene.environmentIntensity = 0.55 * (1 - 0.75 * NIGHT.value);   // 夜晚天空光很少
   // 霧色 = 地平線顏色
   const hz = [0.02 + 0.64 * day, 0.03 + 0.70 * day, 0.06 + 0.76 * day];
   scene.fog.color.setRGB(hz[0] + (1.0 - hz[0]) * set * 0.35, hz[1] + (0.55 - hz[1]) * set * 0.35, hz[2] + (0.3 - hz[2]) * set * 0.35);
@@ -907,8 +908,8 @@ const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness
   emis: `totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.58, 0.26) * (0.5 + 0.12 * sin(vRUv.y * 2.094)) * gTun;   // 隧道燈 (暖橘)
   if (uNight > 0.01 && gTun < 0.5) {   // 夜晚: 中央分隔島路燈照在路面 (每 40 m 一盞)
     float ds = (fract((vRUv.y - 2.0) / 40.0 + 0.5) - 0.5) * 40.0, du = vRUv.x - 1.0;
-    float L = exp(-(ds * ds * 0.5 + du * du * 0.7) / 90.0) + 0.06;
-    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.82, 0.55) * L * 2.2 * uNight;
+    float L = exp(-(ds * ds * 0.5 + du * du * 0.7) / 90.0) + 0.01;   // 燈下一圈光，燈與燈之間是暗的
+    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.82, 0.55) * L * 1.1 * uNight;
   }`,
   color: `{
     float tun = step(50.0, vLs), ls = vLs - tun * 100.0;
@@ -989,8 +990,8 @@ const matCityRoad = patch(new T.MeshStandardMaterial({ roughness: 0.88, metalnes
   uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
   emis: `if (uNight > 0.01) {   // 夜晚: 市區路燈 (兩側每 30 m)
     float ds = (fract(vRUv.y / 30.0) - 0.5) * 30.0, du = min(vRUv.x, max(vW - vRUv.x, 0.0));
-    float L = exp(-(ds * ds * 0.6 + du * du) / 70.0) + 0.08;
-    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.8, 0.5) * L * 2.0 * uNight;
+    float L = exp(-(ds * ds * 0.6 + du * du) / 70.0) + 0.015;
+    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.8, 0.5) * L * 1.3 * uNight;
   }`,
   color: `{
     float u = vRUv.x, W = vW, fw = max(fwidth(u), 1e-4);
@@ -4642,7 +4643,7 @@ const carGlow = (() => {
     update() {
       const night = TW.NIGHT.value;
       heads.visible = tails.visible = night > 0.02;
-      beam.intensity = night * 40;
+      beam.intensity = night * 28;
       if (!heads.visible) return;
       heads.material.opacity = tails.material.opacity = night;
       hn = tn = 0;
