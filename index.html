@@ -1083,8 +1083,8 @@ const matRetroGlow = new T.ShaderMaterial({
       float f = pow(max(dot(normalize(aN), toCam), 0.0), 14.0);
       vec4 mv = viewMatrix * wp;
       float d = -mv.z;
-      vA = f * (0.12 + 0.88 * uNight) * smoothstep(8.0, 25.0, d) * (1.0 - smoothstep(600.0, 900.0, d));
-      gl_PointSize = clamp(1.3 * uScale / max(d, 1.0), 2.5, 24.0) * (0.6 + 0.4 * uNight);
+      vA = f * uNight * smoothstep(40.0, 80.0, d) * (1.0 - smoothstep(600.0, 900.0, d));   // 只在晚上、反光片本體小到看不見的距離才補光點
+      gl_PointSize = clamp(0.45 * uScale / max(d, 1.0), 1.5, 5.0);
       gl_Position = projectionMatrix * mv;
       #include <logdepthbuf_vertex>
     }`,
@@ -1124,21 +1124,25 @@ const matTunnelWall = patch(new T.MeshStandardMaterial({ roughness: 0.75, metaln
 const matTunnel = concreteLike([0.55, 0.53, 0.48], 0.6, 0.2, 1.5);
 const matCabinet = new T.MeshStandardMaterial({ color: new T.Color(0.55, 0.03, 0.03), roughness: 0.45, metalness: 0.3 });   // 消防箱
 const matRail = new T.MeshStandardMaterial({ color: new T.Color(0.32, 0.34, 0.33), roughness: 0.5, metalness: 0.7 });       // 洞口欄杆
-// 洞口擋土牆: 白底彩色波浪 (綠、黃、紫、藍)，上方灰色混凝土
+// 洞口兩側翼牆 (沿道路): 面向道路那一面白底彩色波浪 (綠、黃、紫、藍)，波浪沿道路方向起伏；頂面、背面灰色混凝土
 const matPortal = patch(new T.MeshStandardMaterial({ roughness: 0.8, metalness: 0, side: T.DoubleSide }), {
+  vert: 'attribute vec2 aUv; varying float vFace; varying float vTop;',
+  vmain: 'vFace = aUv.x; vTop = aUv.y;',
+  frag: 'varying float vFace; varying float vTop;',
   color: `{
-    float x = abs(vObj.x), y = vObj.z, n = fwyFbm(vObj * 0.4, 4);
+    float u = -vObj.y, y = vObj.z, n = fwyFbm(vObj * 0.4, 4);
     vec3 c = vec3(0.42, 0.41, 0.38) * (0.8 + 0.35 * n);
-    if (y < 4.4) {
-      c = vec3(0.8, 0.8, 0.76) * (0.92 + 0.1 * n);
-      float b1 = 2.55 + 0.6 * sin(x * 0.30 + 0.4), b2 = 1.95 + 0.55 * sin(x * 0.27 + 1.5);
-      float b3 = 1.3 + 0.5 * sin(x * 0.24 + 2.6), b4 = 0.7 + 0.45 * sin(x * 0.22 + 3.4);
+    if (vFace > 0.5 && y > -0.25) {   // 路面以下 (接到地面的牆腳) 是素混凝土
+      c = vec3(0.82, 0.82, 0.78) * (0.93 + 0.1 * n);
+      float b1 = 2.75 + 0.75 * sin(u * 0.21 + 0.3), b2 = 2.1 + 0.6 * sin(u * 0.19 + 1.4);
+      float b3 = 1.45 + 0.5 * sin(u * 0.17 + 2.5), b4 = 0.8 + 0.45 * sin(u * 0.15 + 3.3);
       float e = 0.03;
-      c = mix(c, vec3(0.04, 0.42, 0.34), smoothstep(b1 - 0.45 - e, b1 - 0.45 + e, y) * (1.0 - smoothstep(b1 - e, b1 + e, y)));
-      c = mix(c, vec3(0.85, 0.66, 0.16), smoothstep(b2 - 0.5 - e, b2 - 0.5 + e, y) * (1.0 - smoothstep(b2 - e, b2 + e, y)));
-      c = mix(c, vec3(0.42, 0.3, 0.6), smoothstep(b3 - 0.55 - e, b3 - 0.55 + e, y) * (1.0 - smoothstep(b3 - e, b3 + e, y)));
-      c = mix(c, vec3(0.32, 0.52, 0.78), 1.0 - smoothstep(b4 - e, b4 + e, y));
-      c *= mix(0.7, 1.0, smoothstep(0.0, 0.6, y));
+      c = mix(c, vec3(0.04, 0.44, 0.36), smoothstep(b1 - 0.5 - e, b1 - 0.5 + e, y) * (1.0 - smoothstep(b1 - e, b1 + e, y)));
+      c = mix(c, vec3(0.86, 0.67, 0.16), smoothstep(b2 - 0.5 - e, b2 - 0.5 + e, y) * (1.0 - smoothstep(b2 - e, b2 + e, y)));
+      c = mix(c, vec3(0.44, 0.31, 0.62), smoothstep(b3 - 0.55 - e, b3 - 0.55 + e, y) * (1.0 - smoothstep(b3 - e, b3 + e, y)));
+      c = mix(c, vec3(0.32, 0.53, 0.8), 1.0 - smoothstep(b4 - e, b4 + e, y));
+      c *= mix(0.72, 1.0, smoothstep(0.0, 0.5, y));                 // 底部濺髒
+      c = mix(c, vec3(0.5, 0.49, 0.46), smoothstep(-0.12, 0.0, y - vTop));   // 牆頂壓頂
     }
     diffuseColor.rgb = c;
   }`,
@@ -1322,6 +1326,7 @@ function addRoad(c, w) {
       const t = (d - s[k]) / ((s[k + 1] - s[k]) || 1);
       const x = P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t + nx[k] * o, y = P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t + ny[k] * o;
       const z = P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t;
+      if (bit === 1) continue;   // 中央分隔島 (左側) 不放反光片
       addReflector(c, x, y, z + 0.87, ny[k], -nx[k]);
     }
   }
@@ -1517,7 +1522,35 @@ function portalMesh(w, i) {
   sh.holes.push(hole);
   const fg = new T.ExtrudeGeometry(sh, { depth: 1.0, bevelEnabled: false, curveSegments: 4 });
   fg.translate(0, 0, -1.0);
-  const face = new T.Mesh(fg, matPortal); face.castShadow = face.receiveShadow = true; face.matrixAutoUpdate = false; grp.add(face);
+  const face = new T.Mesh(fg, matConcrete); face.castShadow = face.receiveShadow = true; face.matrixAutoUpdate = false; grp.add(face);
+  // 兩側翼牆: 沿道路往外 28 m，洞口處 5 m 高、往外降到 1 m；內面 (面向道路) 畫彩色波浪
+  const ww = new GB('uv'), WL = 28, steps = 14;
+  const hAt = (zl) => Math.max(1.0, 5.0 - 4.0 * zl / WL);
+  // 牆底往下接到地面 (洞口外常直接接高架橋，牆不能懸空)
+  const px0 = w.P[i * 3], py0 = w.P[i * 3 + 1], pz0 = w.P[i * 3 + 2], sg = i === 0 ? -1 : 1;
+  const Xd = [w.nx[i] * sg, w.ny[i] * sg], Zd = [w.ny[i] * sg, -w.nx[i] * sg];
+  const baseAt = (lat, zl) => Math.min(-0.3, terrainAt(px0 + Xd[0] * lat + Zd[0] * zl, py0 + Xd[1] * lat + Zd[1] * zl) - pz0 - 0.5);
+  for (const sd of [-1, 1]) {
+    const xi = sd * (a + 0.15), xo = sd * (a + 0.7);
+    const strip = (x, face, z0) => {
+      const b = ww.n;
+      for (let k = 0; k <= steps; k++) {
+        const zl = WL * k / steps, h = hAt(zl);
+        ww.v(x, -zl, Math.max(z0, baseAt(x, zl))); ww.uv.push(face, h);
+        ww.v(x, -zl, h); ww.uv.push(face, h);
+      }
+      return b;
+    };
+    const fi = strip(xi, 1, -60), fo = strip(xo, 0, -60);
+    for (let k = 0; k < steps; k++) {
+      ww.q(fi + k * 2, fi + k * 2 + 2, fi + k * 2 + 3, fi + k * 2 + 1);   // 內面
+      ww.q(fo + k * 2, fo + k * 2 + 1, fo + k * 2 + 3, fo + k * 2 + 2);   // 外面
+      ww.q(fi + k * 2 + 1, fi + k * 2 + 3, fo + k * 2 + 3, fo + k * 2 + 1); // 頂面
+    }
+    const e = steps * 2;   // 末端封口
+    ww.q(fi + e, fo + e, fo + e + 1, fi + e + 1);
+  }
+  const wing = ww.mesh(matPortal, { cast: true }); if (wing) grp.add(wing);
   // 弧形欄杆: 沿遮罩前端頂部，立柱每 1.1 m、上下兩根橫桿
   const r = new GB();
   const arch = outer.filter(([l, u]) => u > H * 0.55);
