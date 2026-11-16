@@ -1685,7 +1685,7 @@ function buildTile(rec) {
                    c.tunnel.mesh(matTunnelWall, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }), c.tcab.mesh(matCabinet),
                    c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false }), c.reflBlack.mesh(matReflBlack), c.reflFace.mesh(matRetro, { receive: false })]) if (m) g.add(m);
   for (const [w, i] of c.portals) g.add(portalMesh(w, i));
-  if (c.rglow.length) {
+  if (c.rglow.length && params.has('rglow')) {   // 遠方反光點: 預設關閉 (晚上遠處高架橋看不見時，光點像飄在空中)
     const rg = new T.BufferGeometry();
     rg.setAttribute('position', new T.Float32BufferAttribute(c.rglow, 3)); rg.setAttribute('aN', new T.Float32BufferAttribute(c.rnorm, 3)); rg.computeBoundingSphere();
     const rp = new T.Points(rg, matRetroGlow); rp.matrixAutoUpdate = false; g.add(rp);
