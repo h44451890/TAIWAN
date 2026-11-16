@@ -2541,8 +2541,10 @@ function recomputeTraffic(ks) {
       if (d < bd) { bd = d; best = x; }
     }
     if (best && bd < 1500) wayTraffic[k] = best;
+    if (FAKE_LV && wayTraffic[k]) wayTraffic[k] = Object.assign({}, wayTraffic[k], { level: FAKE_LV, speed: [90, 90, 70, 50, 30, 12][FAKE_LV] });
   }
 }
+const FAKE_LV = +TW.params.get('fakelv') || 0;   // 測試: ?fakelv=5 把國道路況全部當成嚴重壅塞
 indexSections();
 TW.HOOKS.wayColor = (w) => {
   if (w.link) return null;
@@ -2621,7 +2623,7 @@ function bakeByMaterial(root, frame, filter) {
 
 // ======================================================================= AI 車流 (多車種、國道 + 一般道路)
 const TV = window.TWV.TYPES;
-const MAX_FWY = Math.max(0, Math.min(200, +(TW.params.get('cars') || (TW.MOBILE ? 45 : 90))));
+const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 75 : 140))));   // 塞車時要排得出一整排車
 const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 35 : 75))));
 const COLORS = [ // 線性色彩；權重
   [[0.80, 0.80, 0.78], 24], [[0.45, 0.46, 0.48], 18], [[0.012, 0.012, 0.014], 14], [[0.09, 0.095, 0.10], 10],
@@ -2721,10 +2723,13 @@ function densityWeight(w) {
   return FWY_DENS[levelOf(wayTraffic[w.k])];
 }
 // 國道車流密度跟著即時路況: 順暢 1、車多 3~5、壅塞 7~9 倍 (大約是真實每車道每公里車數的比例)
-const FWY_DENS = [1, 1, 3, 5, 7, 9];
+const FWY_DENS = [1, 1, 4, 6, 8, 10];
 // 車子總數固定，所以玩家所在路段越塞，就把國道車集中在越小的範圍 (車距變短)，塞車時眼前真的是一排車
-const FWY_R = [[750, 1500, 1800], [750, 1500, 1800], [450, 950, 1150], [300, 650, 800], [220, 480, 600], [160, 380, 480]];
-let fwyLv = 1;
+const FWY_R = [[750, 1500, 1800], [750, 1500, 1800], [330, 780, 930], [210, 520, 640], [140, 360, 450], [110, 280, 360]];
+// 車多 / 壅塞時，大部分的車直接生在玩家這條路的同方向 (前後都有)，眼前才會是一整排車
+const FOCUS = [0, 0, 0.45, 0.65, 0.8, 0.88];
+let fwyLv = 1, seedLv = 0;
+const seedPos = [0, 0];
 function playerFwyLevel() {
   const r = S.road;
   if (!r || r.w.city) return 1;
@@ -2785,10 +2790,22 @@ function trySpawn(c, pool, minR, maxR) {
     }
   }
   if (!cand.length) return false;
+  let pickFrom = cand, focused = false;
+  if (pool === 'fwy' && S.road && !S.road.w.city && Math.random() < FOCUS[fwyLv]) {
+    // 玩家這條路、同方向 (同一條國道、行進方向一致、高度接近)
+    const pw = S.road.w, hx = Math.cos(S.h), hy = Math.sin(S.h);
+    const mine = cand.filter((sm) => {
+      const w = WAYS[sm[0]];
+      if (w.link || (w !== pw && (w.ref || '') !== (pw.ref || ''))) return false;
+      const i = Math.min(seek(w, sm[1]), w.n - 2);
+      return w.ny[i] * hx - w.nx[i] * hy > 0.8 && Math.abs(w.P[i * 3 + 2] - S.z) < 8;
+    });
+    if (mine.length) { pickFrom = mine; focused = true; }
+  }
   for (let attempt = 0; attempt < 16; attempt++) {
-    const sm = cand[(Math.random() * cand.length) | 0];
+    const sm = pickFrom[(Math.random() * pickFrom.length) | 0];
     const w = WAYS[sm[0]];
-    if (Math.random() > densityWeight(w) / (w.city ? 4.5 : 9)) continue;
+    if (!focused && Math.random() > densityWeight(w) / (w.city ? 4.5 : 10)) continue;
     let type = pickW(pool === 'city' ? MIX_CITY : MIX_FWY);
     if ((typeCount[type] || 0) >= CAP[type] || (type === 'semi' && (typeCount.semiTrailer || 0) >= CAP.semiTrailer)) type = 'sedan';
     if ((typeCount[type] || 0) >= CAP[type]) return false;
@@ -2799,15 +2816,16 @@ function trySpawn(c, pool, minR, maxR) {
     let lane = (Math.random() * lc) | 0;
     if (HEAVY.has(type) && !w.city) lane = Math.max(lane, lc - 2, 0);
     const lat = laneLatC(tc, lane);
-    poseAt(w, sm[1], lat);
+    const s0 = pool === 'fwy' ? Math.min(wayLen(w) - 3, Math.max(3, sm[1] + (Math.random() - 0.5) * 40)) : sm[1];   // 取樣點 40 m 一個，前後錯開才排得密
+    poseAt(w, s0, lat);
     let ok = Math.hypot(POSE.x - S.x, POSE.y - S.y) > Math.min(minR, 40);
-    const gapNeed = pool === 'city' ? 14 : [28, 28, 22, 16, 12, 10][levelOf(wayTraffic[w.k])];   // 塞車時車距短
+    const gapNeed = pool === 'city' ? 14 : [28, 28, 18, 12, 8.5, 7][levelOf(wayTraffic[w.k])];   // 塞車時車距短 (含車長)
     for (const o of cars) if (ok && o.alive && o !== c && (o.x - POSE.x) ** 2 + (o.y - POSE.y) ** 2 < gapNeed * gapNeed && Math.abs(o.z - POSE.z) < 3) ok = false;
     if (!ok) continue;
     const TT = TV[type];
     const scale = type === 'sedan' ? pickW(BODY_TYPES) : [1, 1, 1];
     Object.assign(c, {
-      id: nextId++, alive: true, pool, type, T: TT, w, s: sm[1], dir, lane, lat, prevLat: lat, pers: rand(0.88, 1.1), mood: 1, moodT: 1, moodTimer: rand(10, 40),
+      id: nextId++, alive: true, pool, type, T: TT, w, s: s0, dir, lane, lat, prevLat: lat, pers: rand(0.88, 1.1), mood: 1, moodT: 1, moodTimer: rand(10, 40),
       color: pick(PAINTS[type] || COLORS.map((x) => x[0])), accent: pick(ACCENTS[type] || [[0.6, 0.6, 0.6]]),
       sx: scale[0], sy: scale[1], sz: scale[2], front: TT.front * scale[0], rear: TT.rear * scale[0], wid: TT.wid * scale[2],
       lcCool: rand(2, 8), brake: false, deadEnd: false, pending: null, signal: 0, sigT: 0, plan: null, roll: 0, trail: [],
@@ -3074,6 +3092,14 @@ function updateTraffic(dt) {
   if (respawnClock <= 0) {
     respawnClock = 0.25;
     fwyLv = playerFwyLevel();
+    // 剛載入路況、傳送或剛開進車多/壅塞路段: 國道車直接重排到玩家周圍 (前後都排滿)，不然生車最小距離會在眼前留一段空的
+    const jumped = Math.hypot(S.x - seedPos[0], S.y - seedPos[1]) > 600;
+    seedPos[0] = S.x; seedPos[1] = S.y;
+    if (fwyLv >= 3 && (seedLv < 3 || jumped)) {
+      for (const c of cars) if (c.pool === 'fwy') { kill(c); trySpawn(c, 'fwy', 12, FWY_R[fwyLv][1]); }
+      stats.reseed = (stats.reseed || 0) + 1;
+    }
+    seedLv = fwyLv;
     let n = 0;
     for (const c of cars) {
       const d = c.alive ? Math.hypot(c.x - S.x, c.y - S.y) : 1e9;
