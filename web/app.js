@@ -334,6 +334,7 @@ function updateDayNight(dt) {
     renderSky();
   }
   matLampHead.emissiveIntensity = 5 * NIGHT.value;
+  GLOW_LAMP_TEX_HOOK();
   GLOW_LAMP.opacity = NIGHT.value; GLOW_LAMP.visible = NIGHT.value > 0.02;
 }
 const timeToast = document.createElement('div');
@@ -355,6 +356,7 @@ const GLOW_TEX = (() => {
   g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
   const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; return t;
 })();
+const GLOW_LAMP_TEX_HOOK = () => { matRetroGlow.uniforms.map.value = GLOW_TEX; matRetroGlow.uniforms.uScale.value = renderer.domElement.height / (2 * Math.tan(camera.fov * Math.PI / 360)); };
 const GLOW_LAMP = new T.PointsMaterial({ map: GLOW_TEX, color: new T.Color(1, 0.8, 0.5), size: 4.5, sizeAttenuation: true, transparent: true, depthWrite: false, blending: T.AdditiveBlending, opacity: 0, toneMapped: false, fog: false });
 const matLampPole = new T.MeshStandardMaterial({ color: new T.Color(0.42, 0.44, 0.46), metalness: 0.6, roughness: 0.45 });
 const matLampHead = new T.MeshStandardMaterial({ color: new T.Color(0.08, 0.08, 0.08), emissive: new T.Color(1, 0.82, 0.55), emissiveIntensity: 0, roughness: 0.4 });
@@ -425,15 +427,18 @@ const ASPH_ROUGH = `roughnessFactor = mix(mix(0.72, 0.98, mix(texture2D(tAsR, gU
 const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness: 0 }), {
   vert: 'attribute vec2 aUv; attribute float aLs; attribute float aLanes; varying vec2 vRUv; varying float vLs; varying float vLanes;',
   vmain: 'vRUv = aUv; vLs = aLs; vLanes = aLanes;',
-  frag: 'varying vec2 vRUv; varying float vLs; varying float vLanes;' + ASPH_DECL,
+  frag: 'varying vec2 vRUv; varying float vLs; varying float vLanes; float gTun;' + ASPH_DECL,
   uniforms: ASPH_U, normal: ASPH_NORMAL, rough: ASPH_ROUGH,
-  emis: `if (uNight > 0.01) {   // 夜晚: 中央分隔島路燈照在路面 (每 40 m 一盞)
+  emis: `totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.58, 0.26) * (0.5 + 0.12 * sin(vRUv.y * 2.094)) * gTun;   // 隧道燈 (暖橘)
+  if (uNight > 0.01 && gTun < 0.5) {   // 夜晚: 中央分隔島路燈照在路面 (每 40 m 一盞)
     float ds = (fract((vRUv.y - 2.0) / 40.0 + 0.5) - 0.5) * 40.0, du = vRUv.x - 1.0;
     float L = exp(-(ds * ds * 0.5 + du * du * 0.7) / 90.0) + 0.06;
     totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.82, 0.55) * L * 2.2 * uNight;
   }`,
   color: `{
-    float k = (vRUv.x - vLs) / ${LANE_W.toFixed(2)};
+    float tun = step(50.0, vLs), ls = vLs - tun * 100.0;
+    gTun = tun;
+    float k = (vRUv.x - ls) / ${LANE_W.toFixed(2)};
     float kr = floor(k + 0.5);
     float dist = abs(k - kr) * ${LANE_W.toFixed(2)};
     float fw = max(fwidth(dist), 1e-4);
@@ -446,6 +451,11 @@ const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness
     float dash = 1.0 - smoothstep(0.4 - fv, 0.4 + fv, ph);
     float white = onLine * max(isRight, inner * dash);
     float yellow = onLine * isLeft;
+    if (tun > 0.5) {   // 隧道: 車道線是雙白實線 (禁止變換車道)、左側邊線白色
+      float dd = abs(dist - 0.14), onD = 1.0 - smoothstep(0.055 - fw, 0.055 + fw, dd);
+      white = max(onLine * max(isRight, isLeft), onD * inner);
+      yellow = 0.0;
+    }
     asphUv(vObj);
     vec3 base = asphColor() * (0.62 + 0.22 * fwyFbm(vObj * 0.012, 3));
     // 輪跡: 每個車道中心左右約 0.85 m 被輪胎磨得較暗、較平滑；車道中央有一點油漬
@@ -564,9 +574,101 @@ const matRoof = patch(new T.MeshStandardMaterial({ roughness: 0.9, metalness: 0,
 const matJointSteel = new T.MeshStandardMaterial({ color: new T.Color(0.32, 0.33, 0.34), metalness: 0.85, roughness: 0.38 });
 const matJointRubber = new T.MeshStandardMaterial({ color: new T.Color(0.01, 0.01, 0.012), roughness: 0.9 });
 const matReflR = new T.MeshBasicMaterial({ color: new T.Color(0.75, 0.02, 0.02), toneMapped: false, side: T.DoubleSide });
+const matReflBlack = new T.MeshStandardMaterial({ color: new T.Color(0.012, 0.012, 0.013), roughness: 0.45, metalness: 0 });   // 黑色塑膠外框、支柱、底座
+// 黃色稜鏡反光面: 蜂巢狀微稜鏡紋 + 中央鉚釘；回歸反射 = 視線越正對反光面越亮 (光源和眼睛幾乎同方向時最亮)，晚上被車燈照到時大幅變亮
+const matRetro = patch(new T.MeshStandardMaterial({ roughness: 0.3, metalness: 0, side: T.DoubleSide }), {
+  vert: 'attribute vec2 aUv; varying vec2 vRU;',
+  vmain: 'vRU = aUv;',
+  frag: 'varying vec2 vRU; uniform float uNight; float gRet;',
+  uniforms: { uNight: NIGHT },
+  emis: 'totalEmissiveRadiance += vec3(1.0, 0.5, 0.0) * gRet * (0.25 + 0.75 * uNight) / (1.0 + pow(length(vViewPosition) / 140.0, 2.0));',   // 夜晚亮成飽和的黃，不過曝
+  color: `{
+    vec2 q = vRU * 10.0, rr = vec2(1.0, 1.7320508), hh = rr * 0.5;
+    vec2 a = mod(q, rr) - hh, b = mod(q - hh, rr) - hh, gv = dot(a, a) < dot(b, b) ? a : b;
+    float hx = max(dot(abs(gv), vec2(0.5, 0.8660254)), abs(gv.x));
+    float facet = smoothstep(0.38, 0.5, hx);
+    float rad = length(vRU);
+    vec3 c = vec3(0.96, 0.62, 0.015) * (1.0 - 0.32 * facet) * (0.9 + 0.2 * fract(sin(dot(floor(q), vec2(12.9, 78.2))) * 43758.5));
+    c = mix(c, vec3(0.7, 0.7, 0.68), 1.0 - smoothstep(0.07, 0.1, rad));      // 中央鉚釘
+    c = mix(c, c * 0.75, smoothstep(0.9, 1.0, rad));                          // 外圈壓邊
+    diffuseColor.rgb = c;
+    gRet = pow(abs(dot(normalize(vNormal), normalize(vViewPosition))), 12.0);
+  }`,
+});
+// 遠處的反光點: 只有正對攝影機 (= 車燈照得到) 的那些會亮，晚上才明顯；對向車道的反光片背對你所以不亮
+const matRetroGlow = new T.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: T.AdditiveBlending,
+  uniforms: { map: { value: null }, uNight: NIGHT, uScale: { value: 600 } },
+  vertexShader: `#include <common>
+    #include <logdepthbuf_pars_vertex>
+    attribute vec3 aN; uniform float uNight; uniform float uScale; varying float vA;
+    void main() {
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vec3 toCam = normalize(cameraPosition - wp.xyz);
+      float f = pow(max(dot(normalize(aN), toCam), 0.0), 14.0);
+      vec4 mv = viewMatrix * wp;
+      float d = -mv.z;
+      vA = f * (0.12 + 0.88 * uNight) * smoothstep(8.0, 25.0, d) * (1.0 - smoothstep(600.0, 900.0, d));
+      gl_PointSize = clamp(1.3 * uScale / max(d, 1.0), 2.5, 24.0) * (0.6 + 0.4 * uNight);
+      gl_Position = projectionMatrix * mv;
+      #include <logdepthbuf_vertex>
+    }`,
+  fragmentShader: `#include <common>
+    #include <logdepthbuf_pars_fragment>
+    uniform sampler2D map; varying float vA;
+    void main() {
+      #include <logdepthbuf_fragment>
+      float a = texture2D(map, gl_PointCoord).a * vA; if (a < 0.01) discard; gl_FragColor = vec4(vec3(1.0, 0.7, 0.1) * a * 3.0, a);
+    }`,
+});
 const matReflY = new T.MeshBasicMaterial({ color: new T.Color(0.85, 0.55, 0.02), toneMapped: false, side: T.DoubleSide });
+// 隧道內壁 (照國道 3 號隧道街景): 下半部米白磁磚牆 (2.4 m 一格)、上半部拱頂灰色混凝土 (有燻黑)，整體被暖橘隧道燈照亮
+const matTunnelWall = patch(new T.MeshStandardMaterial({ roughness: 0.75, metalness: 0, side: T.DoubleSide }), {
+  vert: 'attribute vec2 aUv; varying vec2 vTU;',
+  vmain: 'vTU = aUv;',
+  frag: 'varying vec2 vTU; float gLit;',
+  emis: 'totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.58, 0.26) * gLit;',
+  color: `{
+    float s = vTU.x, h = vTU.y, n = fwyFbm(vObj * 0.35, 4);
+    float fw = max(fwidth(s), 1e-3);
+    vec3 c;
+    if (h < 0.3) { c = vec3(0.3, 0.29, 0.27) * (0.85 + 0.3 * n); gLit = 0.45; }                       // 檢修步道、路緣
+    else if (h < 2.9) {                                                                            // 米白磁磚牆
+      c = vec3(0.58, 0.56, 0.5) * (0.92 + 0.12 * n);
+      float jx = abs(fract(s / 2.4 + 0.5) - 0.5) * 2.4, jy = abs(fract((h - 0.3) / 0.65 + 0.5) - 0.5) * 0.65;
+      c *= mix(0.72, 1.0, smoothstep(0.012, 0.012 + fw * 1.5, min(jx, jy)));
+      c *= mix(0.75, 1.0, smoothstep(0.3, 0.9, h));                                                  // 底部較髒
+      gLit = 0.5 + 0.15 * smoothstep(1.5, 2.9, h);
+    } else {                                                                                       // 拱頂混凝土
+      c = vec3(0.16, 0.155, 0.15) * (0.75 + 0.45 * n);
+      gLit = 0.3;
+    }
+    diffuseColor.rgb = c;
+  }`,
+});
 const matTunnel = concreteLike([0.55, 0.53, 0.48], 0.6, 0.2, 1.5);
-const matTunnelLight = new T.MeshStandardMaterial({ color: 0x000000, emissive: new T.Color(1.0, 0.82, 0.55), emissiveIntensity: 2.5 });
+const matCabinet = new T.MeshStandardMaterial({ color: new T.Color(0.55, 0.03, 0.03), roughness: 0.45, metalness: 0.3 });   // 消防箱
+const matRail = new T.MeshStandardMaterial({ color: new T.Color(0.32, 0.34, 0.33), roughness: 0.5, metalness: 0.7 });       // 洞口欄杆
+// 洞口擋土牆: 白底彩色波浪 (綠、黃、紫、藍)，上方灰色混凝土
+const matPortal = patch(new T.MeshStandardMaterial({ roughness: 0.8, metalness: 0, side: T.DoubleSide }), {
+  color: `{
+    float x = abs(vObj.x), y = vObj.z, n = fwyFbm(vObj * 0.4, 4);
+    vec3 c = vec3(0.42, 0.41, 0.38) * (0.8 + 0.35 * n);
+    if (y < 4.4) {
+      c = vec3(0.8, 0.8, 0.76) * (0.92 + 0.1 * n);
+      float b1 = 2.55 + 0.6 * sin(x * 0.30 + 0.4), b2 = 1.95 + 0.55 * sin(x * 0.27 + 1.5);
+      float b3 = 1.3 + 0.5 * sin(x * 0.24 + 2.6), b4 = 0.7 + 0.45 * sin(x * 0.22 + 3.4);
+      float e = 0.03;
+      c = mix(c, vec3(0.04, 0.42, 0.34), smoothstep(b1 - 0.45 - e, b1 - 0.45 + e, y) * (1.0 - smoothstep(b1 - e, b1 + e, y)));
+      c = mix(c, vec3(0.85, 0.66, 0.16), smoothstep(b2 - 0.5 - e, b2 - 0.5 + e, y) * (1.0 - smoothstep(b2 - e, b2 + e, y)));
+      c = mix(c, vec3(0.42, 0.3, 0.6), smoothstep(b3 - 0.55 - e, b3 - 0.55 + e, y) * (1.0 - smoothstep(b3 - e, b3 + e, y)));
+      c = mix(c, vec3(0.32, 0.52, 0.78), 1.0 - smoothstep(b4 - e, b4 + e, y));
+      c *= mix(0.7, 1.0, smoothstep(0.0, 0.6, y));
+    }
+    diffuseColor.rgb = c;
+  }`,
+});
+const matTunnelLight = new T.MeshStandardMaterial({ color: 0x000000, emissive: new T.Color(1.0, 0.5, 0.12), emissiveIntensity: 1.7 });   // 暖橘隧道燈
 // 水面: 海 (藍綠) / 河、湖 (帶泥的綠褐)；法線用會流動的雜訊做波紋，低粗糙度反射天空與太陽
 const WATER_T = { value: 0 };
 const matWater = patch(new T.MeshStandardMaterial({ roughness: 0.07, metalness: 0, color: 0xffffff }), {
@@ -662,8 +764,9 @@ function addRoad(c, w) {
   const r = c.road, b0 = r.n;
   for (let i = 0; i < n; i++) {
     const x = P[i * 3], y = P[i * 3 + 1], z = P[i * 3 + 2];
-    r.v(x + nx[i] * hw, y + ny[i] * hw, z); r.uv.push(0, s[i]); r.ls.push(w.ls); r.ln.push(w.lanes);
-    r.v(x - nx[i] * hw, y - ny[i] * hw, z); r.uv.push(w.width, s[i]); r.ls.push(w.ls); r.ln.push(w.lanes);
+    const lsT = w.ls + (w.tunnel ? 100 : 0);   // 隧道旗標: 著色器用 aLs >= 50 判斷
+    r.v(x + nx[i] * hw, y + ny[i] * hw, z); r.uv.push(0, s[i]); r.ls.push(lsT); r.ln.push(w.lanes);
+    r.v(x - nx[i] * hw, y - ny[i] * hw, z); r.uv.push(w.width, s[i]); r.ls.push(lsT); r.ln.push(w.lanes);
   }
   for (let i = 0; i < n - 1; i++) { const a = b0 + i * 2; r.q(a, a + 1, a + 3, a + 2); }
   // 側面 / 梁底
@@ -682,7 +785,7 @@ function addRoad(c, w) {
     if (w.bridge) k.q(a + 2, bb + 2, bb + 3, a + 3);                 // 梁底
   }
   // 紐澤西護欄 (左右；分合流處落在別條路面上的段落不放)
-  for (const [edge, inward, bit] of [[hw, -1, 1], [-hw, 1, 2]]) {
+  for (const [edge, inward, bit] of (w.tunnel ? [] : [[hw, -1, 1], [-hw, 1, 2]])) {   // 隧道內是檢修步道，不放護欄
     // 每個斷面線段各自一組頂點 (稜角分明)；UV: u = 沿線距離、v = 高度 (給接縫、排水孔、髒污用)
     const g = c.barrier, g0 = g.n, segs = BARRIER.length - 1, per = segs * 2;
     const o = edge + inward * BARRIER_INSET;
@@ -737,16 +840,14 @@ function addRoad(c, w) {
         }
       }
     }
-    // 反光片: 每 24 m 一片，外側紅色、中央分隔黃色
-    const R = bit === 1 ? c.reflY : c.reflR;
+    // 反光片: 每 24 m 一支 (照實物: 黃色圓形稜鏡反光片、黑色外框、黑色支柱、橢圓底座)，反光面朝來車
     for (let d = 12; d < s[n - 1]; d += 24) {
       let k = 0; while (k < n - 2 && s[k + 1] < d) k++;
       if ((M[k] | M[k + 1]) & bit) continue;
       const t = (d - s[k]) / ((s[k + 1] - s[k]) || 1);
       const x = P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t + nx[k] * o, y = P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t + ny[k] * o;
       const z = P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t;
-      disc(R, x, y, z + 0.97, ny[k], -nx[k], 0.07, 0.025);                    // 圓形反光片，面向來車
-      box(R, x, y, ny[k], -nx[k], 0.012, 0.012, z + 0.86, z + 0.9);           // 底座
+      addReflector(c, x, y, z + 0.87, ny[k], -nx[k]);
     }
   }
   if (w.tunnel) addTunnel(c, w);
@@ -817,6 +918,25 @@ function crossedJoint(ax, ay, bx, by, z) {
   return false;
 }
 
+/** 反光片一支: 底座 (橢圓) → 支柱 (含束環) → 黑色圓框 → 黃色反光面 (面向 -t，也就是迎著來車)；(x, y, z0) 是護欄頂 */
+function addReflector(c, x, y, z0, tx, ty) {
+  const K = c.reflBlack, F = c.reflFace, nx = -ty, ny = tx;
+  // 橢圓底座: 12 邊形壓扁
+  const b0 = K.n, seg = 12;
+  for (const zz of [z0, z0 + 0.018]) for (let i = 0; i < seg; i++) { const a = i / seg * Math.PI * 2; K.v(x + tx * Math.cos(a) * 0.085 + nx * Math.sin(a) * 0.055, y + ty * Math.cos(a) * 0.085 + ny * Math.sin(a) * 0.055, zz); }
+  for (let i = 0; i < seg; i++) { const j = (i + 1) % seg; K.q(b0 + i, b0 + j, b0 + seg + j, b0 + seg + i); K.i.push(b0 + seg, b0 + seg + j, b0 + seg + i); }
+  box(K, x, y, tx, ty, 0.022, 0.022, z0 + 0.018, z0 + 0.15);            // 支柱
+  box(K, x, y, tx, ty, 0.03, 0.03, z0 + 0.07, z0 + 0.11);               // 束環
+  const zc = z0 + 0.24;
+  disc(K, x, y, zc, tx, ty, 0.1, 0.034, 20);                            // 黑色圓框
+  // 黃色反光面 (略突出在圓框前方 = 迎向來車那一面)
+  const fx = x - tx * 0.019, fy = y - ty * 0.019, r = 0.083, fs = 24, f0 = F.n;
+  F.v(fx, fy, zc); F.uv.push(0, 0);
+  for (let i = 0; i < fs; i++) { const a = i / fs * Math.PI * 2; F.v(fx + nx * Math.cos(a) * r, fy + ny * Math.cos(a) * r, zc + Math.sin(a) * r); F.uv.push(Math.cos(a), Math.sin(a)); }
+  for (let i = 0; i < fs; i++) F.i.push(f0, f0 + 1 + ((i + 1) % fs), f0 + 1 + i);
+  // 遠處的反光點 (位置 + 面向)
+  c.rglow.push(fx, zc, -fy); c.rnorm.push(-tx, 0, ty);
+}
 /** 圓片 (軸沿路線方向 tx,ty，面向來車)：中心 (cx, cy, cz)、半徑 r、厚 th */
 function disc(g, cx, cy, cz, tx, ty, r, th, seg = 12) {
   const nx = -ty, ny = tx, b = g.n;
@@ -864,47 +984,94 @@ function addPier(g, A, k) {
 /** 隧道口: 端點沒有接另一段隧道 */
 const isTunnelEnd = (w, i) => !(PT_INDEX.get(ptKey(w.P[i * 3], w.P[i * 3 + 1])) || []).some(([k]) => k !== w.k && WAYS[k].tunnel);
 
+/** 隧道內壁斷面 [橫向 (左正), 高度]：路緣 → 檢修步道 → 直牆 2.9 m → 橢圓拱頂 (頂高 7.2 m) → 另一側 */
+function tunnelProfile(hw) {
+  const a = hw + 0.9, H = 7.2, Hw = 2.9, out = [[-hw, 0], [-hw, 0.25], [-a, 0.25], [-a, Hw]];
+  for (let j = 1; j < 20; j++) { const t = Math.PI * j / 20; out.push([-Math.cos(t) * a, Hw + Math.sin(t) * (H - Hw)]); }
+  out.push([a, Hw], [a, 0.25], [hw, 0.25], [hw, 0]);
+  return { pts: out, a, H, Hw };
+}
 function addTunnel(c, w) {
-  const { P, nx, ny, n, hw } = w;
-  const R = hw + 0.8, H = 6.8, M = 18;
+  const { P, nx, ny, n, hw, s } = w;
+  const { pts, a, H, Hw } = tunnelProfile(hw), M = pts.length;
   const g = c.tunnel, g0 = g.n;
-  for (let i = 0; i < n; i++) for (let j = 0; j <= M; j++) {
-    const ph = Math.PI * j / M, lat = -Math.cos(ph) * R, up = Math.sin(ph) * H;
-    g.v(P[i * 3] + nx[i] * lat, P[i * 3 + 1] + ny[i] * lat, P[i * 3 + 2] + up - 0.3);
+  for (let i = 0; i < n; i++) for (const [lat, up] of pts) {
+    g.v(P[i * 3] + nx[i] * lat, P[i * 3 + 1] + ny[i] * lat, P[i * 3 + 2] + up); g.uv.push(s[i], up);
   }
-  for (let i = 0; i < n - 1; i++) for (let j = 0; j < M; j++) {
-    const a = g0 + i * (M + 1) + j; g.q(a, a + M + 1, a + M + 2, a + 1);
+  for (let i = 0; i < n - 1; i++) for (let j = 0; j < M - 1; j++) { const q = g0 + i * M + j; g.q(q, q + M, q + M + 1, q + 1); }
+  // 兩排隧道燈 (拱頂兩側 45°)，每 3 m 一盞
+  const th = Math.PI / 4, lampLat = Math.sin(th) * a * 0.97, lampUp = Hw + Math.cos(th) * (H - Hw) * 0.97;
+  for (let d = 1.5; d < s[n - 1]; d += 3) {
+    let k = 0; while (k < n - 2 && s[k + 1] < d) k++;
+    const t = (d - s[k]) / ((s[k + 1] - s[k]) || 1);
+    const x = P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t, y = P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t, z = P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t;
+    for (const sd of [-1, 1]) box(c.tlight, x + nx[k] * lampLat * sd, y + ny[k] * lampLat * sd, ny[k], -nx[k], 0.6, 0.16, z + lampUp - 0.08, z + lampUp + 0.04);
+    if (Math.round(d / 3) % 17 === 0) {   // 消防箱: 每 51 m 一個，右側牆面
+      const cx = x - nx[k] * (a - 0.09), cy = y - ny[k] * (a - 0.09);
+      box(c.tcab, cx, cy, ny[k], -nx[k], 0.4, 0.09, z + 0.85, z + 1.85);
+    }
   }
-  const L = c.tlight, l0 = L.n;
-  for (let i = 0; i < n; i++) for (const o of [0.25, -0.25]) L.v(P[i * 3] + nx[i] * o, P[i * 3 + 1] + ny[i] * o, P[i * 3 + 2] + H - 0.45);
-  for (let i = 0; i < n - 1; i++) { const a = l0 + i * 2; L.q(a, a + 2, a + 3, a + 1); }
   for (const i of [0, n - 1]) if (isTunnelEnd(w, i)) c.portals.push([w, i]);
 }
 
+/** 隧道洞口 (照國道 3 號街景): 外凸的拱形遮罩 (洞口往外延伸 3.5 m)、上方弧形鐵欄杆、兩側白底彩色波浪擋土牆 */
 function portalMesh(w, i) {
-  const R = w.hw + 0.8, H = 6.8;
+  const { pts, a, H } = tunnelProfile(w.hw);
+  const LH = 3.5, T0 = 0.7;                        // 遮罩長度、厚度
+  const kx = (a + T0) / a, ky = (H + T0) / H;
+  const outer = pts.map(([l, u]) => [l * (Math.abs(l) > w.hw + 0.5 ? kx : 1), u * ky]);
+  // 區域座標: GB.v(橫向, -外推距離, 高度) -> three (橫向, 高度, 外推)
+  const g = new GB(), M = pts.length;
+  const ring = (P, zl) => { const b = g.n; for (const [l, u] of P) g.v(l, -zl, u); return b; };
+  const i0 = ring(pts, 0), i1 = ring(pts, LH), o0 = ring(outer, -0.4), o1 = ring(outer, LH);
+  for (let j = 0; j < M - 1; j++) {
+    g.q(i0 + j, i1 + j, i1 + j + 1, i0 + j + 1);   // 內面
+    g.q(o0 + j, o0 + j + 1, o1 + j + 1, o1 + j);   // 外面
+    g.q(i1 + j, o1 + j, o1 + j + 1, i1 + j + 1);   // 前端環
+  }
+  const grp = new T.Group();
+  const hood = g.mesh(matConcrete, { cast: true }); grp.add(hood);
+  // 擋土牆 (梯形，中間挖遮罩的外形)
+  const W = a + 10;
   const sh = new T.Shape();
-  sh.moveTo(-R - 4, -2.5); sh.lineTo(R + 4, -2.5); sh.lineTo(R + 4, H + 3.5); sh.lineTo(-R - 4, H + 3.5); sh.lineTo(-R - 4, -2.5);
+  sh.moveTo(-W, -1.5); sh.lineTo(W, -1.5); sh.lineTo(W, 4.4); sh.lineTo(a + 1.5, H + 2.4); sh.lineTo(-(a + 1.5), H + 2.4); sh.lineTo(-W, 4.4); sh.lineTo(-W, -1.5);
   const hole = new T.Path();
-  hole.moveTo(-R, -0.3);
-  for (let j = 0; j <= 24; j++) { const ph = Math.PI * j / 24; hole.lineTo(-Math.cos(ph) * R, Math.sin(ph) * H - 0.3); }
-  hole.lineTo(-R, -0.3);
+  hole.moveTo(outer[0][0], -0.2);
+  for (const [l, u] of outer) hole.lineTo(l, Math.max(u, -0.2));
+  hole.lineTo(outer[0][0], -0.2);
   sh.holes.push(hole);
-  const geo = new T.ExtrudeGeometry(sh, { depth: 1.6, bevelEnabled: false, curveSegments: 4 });
-  geo.translate(0, 0, -0.8);
-  const m = new T.Mesh(geo, matConcrete);
+  const fg = new T.ExtrudeGeometry(sh, { depth: 1.0, bevelEnabled: false, curveSegments: 4 });
+  fg.translate(0, 0, -1.0);
+  const face = new T.Mesh(fg, matPortal); face.castShadow = face.receiveShadow = true; face.matrixAutoUpdate = false; grp.add(face);
+  // 弧形欄杆: 沿遮罩前端頂部，立柱每 1.1 m、上下兩根橫桿
+  const r = new GB();
+  const arch = outer.filter(([l, u]) => u > H * 0.55);
+  const post = (l, u, zl) => box(r, l, -zl, 1, 0, 0.025, 0.025, u, u + 1.05);
+  const beam = (p, q, zl, dz) => {   // p, q: [橫向, 高度] 兩點之間的細桿
+    const dl = q[0] - p[0], du = q[1] - p[1], L = Math.hypot(dl, du) || 1;
+    const nl = -du / L * 0.022, nu = dl / L * 0.022, b = r.n;
+    for (const [aa, bb] of [[p, 0], [q, 0]]) for (const [sl, su, sz] of [[1, 1, 1], [-1, -1, 1], [-1, -1, -1], [1, 1, -1]]) r.v(aa[0] + nl * sl, -(zl + 0.022 * sz), aa[1] + dz + nu * su);
+    for (let f = 0; f < 4; f++) { const f2 = (f + 1) % 4; r.q(b + f, b + f2, b + 4 + f2, b + 4 + f); }
+  };
+  const zl = LH - 0.3;
+  let acc = 1e9;
+  for (let j = 0; j < arch.length; j++) {
+    if (j > 0) { acc += Math.hypot(arch[j][0] - arch[j - 1][0], arch[j][1] - arch[j - 1][1]); beam(arch[j - 1], arch[j], zl, 1.0); beam(arch[j - 1], arch[j], zl, 0.5); }
+    if (acc > 1.1) { post(arch[j][0], arch[j][1], zl); acc = 0; }
+  }
+  const rail = r.mesh(matRail, { cast: true }); if (rail) grp.add(rail);
+  // 擺到洞口: 外推方向 = 離開隧道的方向
   const x = w.P[i * 3], y = w.P[i * 3 + 1], z = w.P[i * 3 + 2];
-  const nX = new T.Vector3(w.nx[i], 0, -w.ny[i]);          // 左 (three)
-  const tZ = new T.Vector3(w.ny[i], 0, w.nx[i]);           // 切線 (three)
-  const mtx = new T.Matrix4().makeBasis(nX, new T.Vector3(0, 1, 0), tZ);
-  mtx.setPosition(x, z, -y);
-  m.applyMatrix4(mtx);
-  m.castShadow = true; m.receiveShadow = true;
-  return m;
+  const sgn = i === 0 ? -1 : 1;
+  const Z = new T.Vector3(w.ny[i] * sgn, 0, w.nx[i] * sgn);          // 外推 (three)
+  const Y = new T.Vector3(0, 1, 0), X = new T.Vector3().crossVectors(Y, Z);
+  const mtx = new T.Matrix4().makeBasis(X, Y, Z); mtx.setPosition(x, z, -y);
+  grp.matrixAutoUpdate = false; grp.matrix.copy(mtx);
+  return grp;
 }
 
-const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), lampPole: new GB(), lampHead: new GB(), glows: [], reflR: new GB(), reflY: new GB(),
-  pier: new GB(), tunnel: new GB(), tlight: new GB(), portals: [] });
+const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), lampPole: new GB(), lampHead: new GB(), glows: [], reflBlack: new GB(), reflFace: new GB('uv'), rglow: [], rnorm: [], reflR: new GB(), reflY: new GB(),
+  pier: new GB(), tunnel: new GB('uv'), tlight: new GB(), tcab: new GB(), portals: [] });
 
 /** 一般道路: 鋪在地形上的路面 (市區標線由材質依 aLs=路寬、aLanes=車道代碼 算出)；橋梁加梁身與橋墩 */
 function addCityRoad(c, w) {
@@ -973,6 +1140,11 @@ function requestDetail(key, tx, ty) {
   return whenBuf('d', key, (buf) => {
     Object.assign(rec, ingestDetail(buf));
     rec.state = 'data';
+    // 有隧道: 周圍已建好的地形網格重建 (挖掉穿進隧道的山坡，見 buildTerrainMesh)
+    if (rec.ways.some((k) => WAYS[k].tunnel)) for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+      const tr = TERR_REC.get(tkey(tx + dx, ty + dy));
+      if (tr && tr.mesh) { if (tr.mesh !== 'none') disposeGroup(tr.mesh); tr.mesh = null; }
+    }
     for (const f of HOOKS.tile) f(rec);
   }, (e) => { console.warn('分區載入失敗', key, e); setTimeout(() => TILES.delete(key), 3000); });
 }
@@ -1002,9 +1174,14 @@ function buildTile(rec) {
   for (let k = 0; k < rec.piers.length / 9; k++) addPier(c.pier, rec.piers, k);
   for (const m of [c.road.mesh(matAsphalt, { cast: true }), (params.has('nocr') ? null : c.city.mesh(matCityRoad)), c.skirt.mesh(matConcrete, { cast: true }),
                    c.barrier.mesh(matBarrier, { cast: true }), c.glare.mesh(matGlare, { cast: true }), c.lampPole.mesh(matLampPole, { cast: true }), c.lampHead.mesh(matLampHead), c.pier.mesh(matConcrete, { cast: true }),
-                   c.tunnel.mesh(matTunnel, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }),
-                   c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false })]) if (m) g.add(m);
+                   c.tunnel.mesh(matTunnelWall, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }), c.tcab.mesh(matCabinet),
+                   c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false }), c.reflBlack.mesh(matReflBlack), c.reflFace.mesh(matRetro, { receive: false })]) if (m) g.add(m);
   for (const [w, i] of c.portals) g.add(portalMesh(w, i));
+  if (c.rglow.length) {
+    const rg = new T.BufferGeometry();
+    rg.setAttribute('position', new T.Float32BufferAttribute(c.rglow, 3)); rg.setAttribute('aN', new T.Float32BufferAttribute(c.rnorm, 3)); rg.computeBoundingSphere();
+    const rp = new T.Points(rg, matRetroGlow); rp.matrixAutoUpdate = false; g.add(rp);
+  }
   if (c.glows.length) {
     const pg = new T.BufferGeometry(); pg.setAttribute('position', new T.Float32BufferAttribute(c.glows, 3)); pg.computeBoundingSphere();
     const pts = new T.Points(pg, GLOW_LAMP); pts.matrixAutoUpdate = false; g.add(pts);
@@ -1038,8 +1215,25 @@ function buildTerrainMesh(key, tx, ty) {
     const L = Math.hypot(hx, hy, 1);
     g.nrm.push(-hx / L, 1 / L, hy / L);
   }
+  // 隧道口附近山坡比隧道頂還低的地形方格挖掉 (不然會穿進隧道裡；洞口擋土牆會擋住這個缺口)
+  const inTunnel = (x, y, zt) => { const r = roadAt(x, y, zt + 12, -1.5, 0); return r && r.w.tunnel && zt < r.z + 8.6; };
   for (let i = 0; i < ib - ia; i++) for (let j = 0; j < jb - ja; j++) {
-    const q = i * cols + j; g.q(q, q + 1, q + cols + 1, q + cols);
+    const q = i * cols + j;
+    const I = ia + i, J = ja + j, xc = (J + 0.5) * TSTEP, yc = (I + 0.5) * TSTEP;
+    let near = false;   // 粗判: 方格中心與四角附近有沒有隧道 (空間索引以 40 m 格存，四角都查才不會漏)
+    for (const [px, py] of [[xc, yc], [J * TSTEP, I * TSTEP], [(J + 1) * TSTEP, I * TSTEP], [J * TSTEP, (I + 1) * TSTEP], [(J + 1) * TSTEP, (I + 1) * TSTEP]]) {
+      const r = roadAt(px, py, hh(I, J) + 40, -24, 0); if (r && r.w.tunnel) { near = true; break; }
+    }
+    if (near) {
+      let cut = false;   // 細判: 方格內 5x5 點 (7.5 m 間隔)，用雙線性內插的地形高度
+      for (let u = 0; u <= 4 && !cut; u++) for (let v = 0; v <= 4 && !cut; v++) {
+        const fu = u / 4, fv = v / 4;
+        const zt = (hh(I, J) * (1 - fu) + hh(I, J + 1) * fu) * (1 - fv) + (hh(I + 1, J) * (1 - fu) + hh(I + 1, J + 1) * fu) * fv;
+        cut = inTunnel((J + fu) * TSTEP, (I + fv) * TSTEP, zt);
+      }
+      if (cut) continue;
+    }
+    g.q(q, q + 1, q + cols + 1, q + cols);
   }
   const m = g.mesh(matTerrain);
   m.geometry.setAttribute('aLc0', new T.Float32BufferAttribute(W0, 4));

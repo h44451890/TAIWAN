@@ -477,7 +477,7 @@ function stepCar(c, dt) {
       else c.signal = 0;
       c.pending = null;
     }
-  } else if (c.lcCool <= 0 && Math.abs(shift) < 0.3 && lc > 1 && !w.link && c.type !== 'scooter' && distToEnd(c) > 40) {
+  } else if (c.lcCool <= 0 && Math.abs(shift) < 0.3 && lc > 1 && !w.link && !w.tunnel && c.type !== 'scooter' && distToEnd(c) > 40) {   // 隧道內雙白實線: 不換車道
     const blocked = gap < 50 && vl < c.v0 - 2.5;
     const keepRight = BIG.has(c.type) ? 0.25 : 0.08;
     const tries = blocked ? [c.lane - 1, c.lane + 1] : (gap > 90 && Math.random() < dt * keepRight ? [c.lane + 1] : []);
@@ -1581,7 +1581,7 @@ TW.HOOKS.init.push(() => {
 // 18 m 一格，依格子雜湊決定有沒有樹 (同一個地方每次都一樣)。只長在坡度 6° 以上或海拔 150 m 以上 (山區少建築)，
 // 道路兩側 8 m 內、高架下方都不種。玩家移動 150 m 以上才重新排一次。
 const trees = (() => {
-  if (TW.params.has('notrees')) return { update() {} };
+  if (TW.params.has('notrees')) return { update() {}, dirty() {} };
   const CAP = TW.MOBILE ? 1800 : 7000, R = TW.MOBILE ? 450 : 900, STEP = 18;
   const crownGeo = new T.IcosahedronGeometry(1, 1);
   { // 樹冠稍微壓扁、表面不規則
@@ -1625,19 +1625,22 @@ const trees = (() => {
     crown.instanceMatrix.needsUpdate = trunk.instanceMatrix.needsUpdate = true;
     if (crown.instanceColor) crown.instanceColor.needsUpdate = true;
   }
-  let clock = 0, since = 0, early = 0;
+  let clock = 0, since = 0, early = 0, dirtyT = 0;
   return {
     update(dt) {
       if ((clock -= dt) > 0) return; clock = 0.5;
       since += 0.5;
+      if (dirtyT > 0 && (dirtyT -= 0.5) <= 0) { rebuild(); return; }   // 分區陸續載入: 停 1 秒沒有新分區再重排
       // 移動 150 m 重排；剛開始或傳送後地形分區陸續載入，前幾次每 3 秒補排
       if (Math.hypot(S.x - cx, S.y - cy) > 150) { early = 0; since = 0; rebuild(); }
       else if (early < 6 && since > 3) { early++; since = 0; rebuild(); }
     },
     get count() { return crown.count; },
+    dirty() { dirtyT = 1.0; },
   };
 })();
 TW.HOOKS.update.push((dt) => trees.update(dt));
+TW.HOOKS.tile.push(() => trees.dirty());   // 道路分區載入後重排 (避開剛載入的道路)
 
 // ======================================================================= 夜晚車燈: 頭燈白色光暈、尾燈紅色 (煞車更亮)，玩家車頭燈照亮前方路面
 const carGlow = (() => {
@@ -1676,7 +1679,8 @@ const carGlow = (() => {
       hn = tn = 0;
       for (const c of cars) if (c.alive) lamps(c.x, c.y, c.z, c.h, c.front, c.rear, c.wid, c.brake, HEAVY.has(c.type));
       const vt = TW.S.vt || { wid: 1.85 };
-      lamps(S.x, S.y, S.zVis != null ? S.zVis : S.z, S.h, 2.25, 2.25, vt.wid || 1.85, S.brk > 0.1, false);
+      const firstPerson = Math.hypot(TW.camera.position.x - S.x, TW.camera.position.z + S.y) < 3;   // 第一人稱: 不畫自己的車燈光暈 (會擋住畫面)
+      if (!firstPerson) lamps(S.x, S.y, S.zVis != null ? S.zVis : S.z, S.h, 2.25, 2.25, vt.wid || 1.85, S.brk > 0.1, false);
       for (const p of [heads, tails]) {
         p.geometry.setDrawRange(0, p === heads ? hn : tn);
         p.geometry.attributes.position.needsUpdate = p.geometry.attributes.color.needsUpdate = true;
