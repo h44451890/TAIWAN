@@ -195,9 +195,41 @@ def run(cmd, timeout=20):
 
 
 # ---------------------------------------------------------------- Android (adb)
+_SERIAL = {"v": None}
+
+
+def adb_serial():
+    """要用哪一台: --serial 指定的；否則從 adb devices 挑第一台 (無線 ADB 常把同一支手機公告兩次，
+    名稱帶「(2)」的是重複的，優先用另一個)。只有一台或沒有裝置時回傳 None (讓 adb 自己處理)。"""
+    if ARGS.serial:
+        return ARGS.serial
+    if _SERIAL["v"]:
+        return _SERIAL["v"]
+    try:
+        out = subprocess.run([ARGS.adb, "devices"], capture_output=True, text=True, timeout=10).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    devs = [l.split("	")[0] for l in out.splitlines()[1:] if l.strip().endswith("	device")]
+    if len(devs) <= 1:
+        return None
+    devs.sort(key=lambda d: ("(2)" in d or "(3)" in d, d))
+    _SERIAL["v"] = devs[0]
+    return devs[0]
+
+
+def adb_base():
+    sn = adb_serial()
+    return [ARGS.adb] + (["-s", sn] if sn else [])
+
+
 def adb(*args, timeout=15):
-    base = [ARGS.adb] + (["-s", ARGS.serial] if ARGS.serial else [])
-    return run(base + list(args), timeout=timeout)
+    try:
+        return run(adb_base() + list(args), timeout=timeout)
+    except RuntimeError as ex:
+        if "more than one device" in str(ex) or "not found" in str(ex):   # 裝置清單變了: 重新挑一次再試
+            _SERIAL["v"] = None
+            return run(adb_base() + list(args), timeout=timeout)
+        raise
 
 
 def android_prepare():
@@ -212,8 +244,7 @@ def android_set(lat, lon, speed, course):
 
 def android_clear():
     # am stopservice 成功時也可能回傳 255 ("Service stopped")；服務本來就沒在跑也算清除成功
-    base = [ARGS.adb] + (["-s", ARGS.serial] if ARGS.serial else [])
-    r = subprocess.run(base + ["shell", "am", "stopservice", f"{APPIUM}/.LocationService"], capture_output=True, text=True, timeout=15)
+    r = subprocess.run(adb_base() + ["shell", "am", "stopservice", f"{APPIUM}/.LocationService"], capture_output=True, text=True, timeout=15)
     out = (r.stdout or "") + (r.stderr or "")
     if "Service stopped" not in out and "not found" not in out.lower() and r.returncode not in (0, 255):
         raise RuntimeError(out.strip().splitlines()[-1] if out.strip() else f"exit {r.returncode}")

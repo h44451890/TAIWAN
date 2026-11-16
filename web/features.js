@@ -190,7 +190,17 @@ function buildInstances() {
       if (m === ud.headMat) return new T.MeshBasicMaterial({ color: new T.Color(1.6, 1.55, 1.4) });
       return m.clone();
     };
-    const meshes = bakeByMaterial(r.group, r.group).map(([m, g]) => {
+    // 輪子: 依形狀 (外框大小) 分組，每組烘一個輪子 (輪軸在原點)，車上每個同形狀的輪子共用
+    const inWheel = new Set(), groups = new Map();
+    r.group.updateMatrixWorld(true);
+    for (const wh of ud.wheels || []) {
+      wh.pivot.traverse((o) => { if (o.isMesh) inWheel.add(o); });
+      const sz = new T.Box3().setFromObject(wh.spin).getSize(new T.Vector3());
+      const key = [sz.x, sz.y, sz.z].map((v) => v.toFixed(2)).join(',');
+      if (!groups.has(key)) groups.set(key, { spin: wh.spin, list: [] });
+      groups.get(key).list.push({ pos: wh.pivot.position.clone(), r: wh.r || 0.35 });
+    }
+    const meshes = bakeByMaterial(r.group, r.group, (o) => !inWheel.has(o)).map(([m, g]) => {
       const im = new T.InstancedMesh(g, conv(m), cap);
       im.instanceMatrix.setUsage(T.DynamicDrawUsage);
       im.frustumCulled = false; im.castShadow = true; im.receiveShadow = true; im.count = 0;
@@ -198,7 +208,19 @@ function buildInstances() {
       TW.scene.add(im);
       return im;
     });
-    INST[name] = { meshes, n: 0, cap };
+    const wheels = [];
+    for (const gr of groups.values()) {
+      const wcap = cap * gr.list.length;
+      const wm = bakeByMaterial(gr.spin, gr.spin).map(([m, g]) => {
+        const im = new T.InstancedMesh(g, m.clone(), wcap);
+        im.instanceMatrix.setUsage(T.DynamicDrawUsage);
+        im.frustumCulled = false; im.castShadow = true; im.receiveShadow = true; im.count = 0;
+        TW.scene.add(im);
+        return im;
+      });
+      wheels.push({ meshes: wm, list: gr.list, n: 0, cap: wcap });
+    }
+    INST[name] = { meshes, n: 0, cap, wheels };
   }
 }
 
@@ -253,7 +275,7 @@ const FWY_DENS = [1, 1, 4, 6, 8, 10];
 const FWY_R = [[750, 1500, 1800], [750, 1500, 1800], [330, 780, 930], [210, 520, 640], [140, 360, 450], [110, 280, 360]];
 // 車多 / 壅塞時，大部分的車直接生在玩家這條路的同方向 (前後都有)，眼前才會是一整排車
 const FOCUS = [0, 0, 0.45, 0.65, 0.8, 0.88];
-let fwyLv = 1, seedLv = 0;
+let fwyLv = 1, seedLv = 0, lvCand = 1, lvCandT = 0, lowT = 0, lowWas = 1e9;
 const seedPos = [0, 0];
 function playerFwyLevel() {
   const r = S.road;
@@ -463,6 +485,7 @@ function stepCar(c, dt) {
   }
   a = Math.max(-9, Math.min(A, a));
   c.v = Math.max(0, c.v + a * dt);
+  c.odo = (c.odo || 0) + c.v * dt;   // 里程 (輪子轉動用)
   if (gap < 0.6) c.v = Math.min(c.v, vl * 0.9);
   c.stuck = c.v < 0.3 ? (c.stuck || 0) + dt : 0;
   let ds = c.v * dt;
@@ -591,6 +614,7 @@ const TAIL_ON = new T.Color(1, 0.02, 0.01), TAIL_OFF = new T.Color(0.45, 0.004, 
 const SIG_ON = new T.Color(1.0, 0.42, 0.0), SIG_OFF = new T.Color(0.18, 0.07, 0.0);
 const FL_R = new T.Color(1, 0.02, 0.02), FL_B = new T.Color(0.05, 0.15, 1), FL_OFF = new T.Color(0.05, 0.02, 0.02);
 let respawnClock = 0;
+const _wm = new T.Matrix4();
 function drawInstance(name, c, x, y, z, h, pitch, roll, sx, sy, sz, blink, flash) {
   const ins = INST[name];
   if (!ins || ins.n >= ins.cap || !Number.isFinite(x + y + z + h + pitch + roll)) return;
@@ -598,6 +622,13 @@ function drawInstance(name, c, x, y, z, h, pitch, roll, sx, sy, sz, blink, flash
   _e.set(roll, h, pitch, 'YZX');
   _q.setFromEuler(_e);
   _m.compose(_p.set(x, z, -y), _q, _s.set(sx, sy, sz));
+  for (const wg of ins.wheels) for (const wl of wg.list) {   // 輪子轉動
+    if (wg.n >= wg.cap) break;
+    _wm.makeRotationZ(-(c.odo || 0) / wl.r).setPosition(wl.pos);
+    _wm.premultiply(_m);
+    for (const im of wg.meshes) im.setMatrixAt(wg.n, _wm);
+    wg.n++;
+  }
   for (const im of ins.meshes) {
     im.setMatrixAt(i, _m);
     const kind = im.material.userData.kind;
@@ -623,14 +654,20 @@ function updateTraffic(dt) {
   respawnClock -= dt;
   if (respawnClock <= 0) {
     respawnClock = 0.25;
-    fwyLv = playerFwyLevel();
-    // 剛載入路況、傳送或剛開進車多/壅塞路段: 國道車直接重排到玩家周圍 (前後都排滿)，不然生車最小距離會在眼前留一段空的
+    // 路況等級加遲滯: 新等級要維持 3 秒才採用 (玩家所在路段偶爾會瞬間判到旁邊的匝道、平面道路，不能跟著跳)
+    const rawLv = playerFwyLevel();
+    if (rawLv !== lvCand) { lvCand = rawLv; lvCandT = 0; } else lvCandT += 0.25;
+    if (lvCandT >= 3 || seedLv === 0) fwyLv = lvCand;
+    lowT = fwyLv >= 3 ? 0 : lowT + 0.25;
+    // 傳送、或離開壅塞 15 秒以上後再開進車多/壅塞路段: 國道車直接重排到玩家周圍 (不然生車最小距離會在眼前留一段空的)
     const jumped = Math.hypot(S.x - seedPos[0], S.y - seedPos[1]) > 600;
     seedPos[0] = S.x; seedPos[1] = S.y;
-    if (fwyLv >= 3 && (seedLv < 3 || jumped)) {
+    if (fwyLv >= 3 && (jumped || (seedLv < 3 && lowWas >= 15) || seedLv === 0)) {
       for (const c of cars) if (c.pool === 'fwy') { kill(c); trySpawn(c, 'fwy', 12, FWY_R[fwyLv][1]); }
       stats.reseed = (stats.reseed || 0) + 1;
     }
+    lowWas = lowT > 0 ? lowT : lowWas;
+    if (fwyLv >= 3) lowWas = 0;
     seedLv = fwyLv;
     let n = 0;
     for (const c of cars) {
@@ -648,7 +685,7 @@ function updateTraffic(dt) {
   }
   // 繪製
   const now = performance.now(), blink = (now % 666) < 333, flash = (now % 500) < 250;
-  for (const k in INST) INST[k].n = 0;
+  for (const k in INST) { INST[k].n = 0; for (const wg of INST[k].wheels) wg.n = 0; }
   for (const c of cars) {
     if (!c.alive) continue;
     drawInstance(c.type, c, c.x, c.y, c.z, c.h, c.pitch, c.roll, c.sx, c.sy, c.sz, blink, flash);
@@ -660,8 +697,9 @@ function updateTraffic(dt) {
       drawInstance('semiTrailer', c, tp[0], tp[1], tp[2], th, c.pitch, 0, 1, 1, 1, blink, flash);
     }
   }
-  for (const k in INST) for (const im of INST[k].meshes) {
-    im.count = INST[k].n; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true;
+  for (const k in INST) {
+    for (const im of INST[k].meshes) { im.count = INST[k].n; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; }
+    for (const wg of INST[k].wheels) for (const im of wg.meshes) { im.count = wg.n; im.instanceMatrix.needsUpdate = true; }
   }
 }
 // 智行地圖路況圖層 (Smart-Nav-Map /api/traffic/segments): 國道 + 臺北、桃園市區官方路況 + 手機回報，順暢的不送
