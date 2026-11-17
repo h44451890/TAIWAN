@@ -83,6 +83,7 @@ fetch_cameras / places     ──► build_nav.mjs    導航路網、目的地�
 | 地名里程牌 | `web/extra/distsigns.json`：`[主線 gid, 點, [[地名, 公里]...], 路線]` | `build_nav.mjs` |
 | 測速照相 | `web/extra/cameras.json`：`cams [x,y,z,方向,速限]`、`sections [名稱,速限,起訖座標,方向]` | `fetch_cameras.py` → `build_nav.mjs` |
 | 導航 | `tiles/n/nav.bin`（格式寫在 `build_nav.mjs` 開頭）+ 目的地清單 | `fetch_places.py` → `build_nav.mjs` |
+| ETC 通行費 | `web/extra/live.json` 的 `etc`（門架 id、里程 m、所在路段 gid / 點），門架間距 = 計費里程 | `build_live.py` |
 | 天氣（即時） | Open-Meteo（只送遊戲中車子位置的經緯度，取到小數 2 位） | 執行時 |
 
 ### 導航演算法
@@ -101,7 +102,7 @@ fetch_cameras / places     ──► build_nav.mjs    導航路網、目的地�
 - 效能：手機版 AI 車、樹、陰影都降級（`TW.MOBILE`）；新功能要記得手機也能跑。
 - 本機測試：`python scripts/phone_location.py` 後開 `http://127.0.0.1:8765/`。測試參數見 README。
   無頭測試：`chrome --headless=new --use-angle=swiftshader --virtual-time-budget=... --screenshot "http://127.0.0.1:8765/?t=90&..."`，`?t=秒數` 會先模擬再截圖，主控台會印 `[test]` 統計（碰撞、AI 重疊、換車道）。
-- 設定與存檔都在 localStorage：`tw_pos`（上次位置）、`tw_ctrl`（操控）、`tw_weather`、`tw_manual`、`tw_wallet`、`tw_tickets`、`tw_voice`、`tw_onboard`。
+- 設定與存檔都在 localStorage：`tw_pos`（上次位置）、`tw_ctrl`（操控）、`tw_weather`、`tw_manual`、`tw_wallet`、`tw_tickets`、`tw_voice`、`tw_onboard`、`tw_etc`（今日 ETC 里程與通行費）。
 
 ## 6. 授權
 OpenStreetMap（ODbL）、AWS Terrain Tiles、Poly Haven（CC0）、交通部高速公路局、警察廣播電台、Open-Meteo（CC BY 4.0）、three.js（MIT）、hls.js（Apache-2.0）。

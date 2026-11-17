@@ -62,6 +62,11 @@
   body.touch #radio { left: auto; right: calc(10px + env(safe-area-inset-right)); top: calc(64px + env(safe-area-inset-top)); bottom: auto; transform: none; padding: 5px 8px; gap: 6px; font-size: 11px; }
   body.touch #radio .info, body.touch #radio input { display: none; }
   body.touch #radio button { width: 30px; height: 30px; font-size: 11px; }
+  /* 橫向: 上排按鈕 (含全螢幕、天氣、定速、升降檔) 排成每排 5 個，路名 / 路況 / 導航框讓出空間；電台移到小地圖下面 */
+  body.touch #touch .row { flex-wrap: wrap; width: 254px; justify-content: flex-end; gap: 6px; }
+  body.touch #touch .row .tb { width: 46px; height: 40px; font-size: 12px; box-sizing: border-box; }
+  body.touch #hud-road, body.touch #traffic, body.touch #nav-box { max-width: calc(100vw - 430px); }
+  body.touch #radio { left: calc(10px + env(safe-area-inset-left)); right: auto; top: 186px; }
   @media (orientation: portrait) {
     body.touch #touch .row { flex-wrap: wrap; width: 160px; justify-content: flex-end; gap: 6px; }
     body.touch #touch .row .tb { width: 48px; height: 40px; font-size: 12px; }
@@ -75,7 +80,7 @@
     body.touch #hud-speed { bottom: calc(118px + env(safe-area-inset-bottom)); }
   }
   #rotate { display: none; }
-  @media (orientation: portrait) { body.touch #rotate { display: flex; position: fixed; left: 0; right: 0; bottom: 40%; justify-content: center; z-index: 6; pointer-events: none; }
+  @media (orientation: portrait) { body.touch #rotate { display: flex; position: fixed; left: 0; right: 0; bottom: calc(222px + env(safe-area-inset-bottom)); justify-content: center; z-index: 6; pointer-events: none; }
     body.touch #rotate span { background: rgba(0,0,0,.7); padding: 8px 14px; border-radius: 10px; font-size: 14px; } }
   #menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(560px, 92vw); max-height: 80vh; overflow: auto; padding: 18px 20px; border-radius: 16px; background: rgba(12,16,22,.92); box-shadow: 0 10px 40px rgba(0,0,0,.6); z-index: 5; }
   #menu h2 { margin: 4px 0 10px; font-size: 17px; }
@@ -5115,7 +5120,7 @@ css.textContent = `
   #nav-box .arr { font-size: 34px; width: 44px; text-align: center; line-height: 1; }
   #nav-box b { display: block; font-size: 20px; } #nav-box span { font-size: 13px; opacity: .9; }
   #nav-box small { display: block; font-size: 12px; opacity: .75; }
-  body.touch #nav-box { top: 72px; left: 150px; transform: none; padding: 4px 10px 4px 6px; max-width: calc(100vw - 530px); }
+  body.touch #nav-box { top: 72px; left: 150px; transform: none; padding: 4px 10px 4px 6px; max-width: calc(100vw - 430px); }
   body.touch #nav-box .arr { font-size: 22px; width: 28px; } body.touch #nav-box b { font-size: 14px; } body.touch #nav-box span, body.touch #nav-box small { font-size: 10px; }
   #exit-box { position: fixed; top: 108px; left: 50%; transform: translateX(-50%); padding: 4px 12px; border-radius: 8px; background: rgba(11,96,52,.88); border: 2px solid #fff; font-size: 14px; white-space: nowrap; z-index: 4; }
   #cam-box { position: fixed; right: 22px; bottom: 132px; padding: 8px 12px; border-radius: 12px; background: rgba(15,15,18,.85); border: 3px solid #f2c200; font-size: 15px; text-align: center; z-index: 5; min-width: 150px; }
@@ -5128,14 +5133,17 @@ css.textContent = `
   #mission-box h4 { margin: 0 0 4px; font-size: 15px; } #mission-box .big { font-size: 20px; font-weight: 800; }
   #mission-box .bar { height: 6px; border-radius: 3px; background: rgba(255,255,255,.15); overflow: hidden; margin: 4px 0; } #mission-box .bar i { display: block; height: 100%; background: #3fd07a; }
   #mission-box button { margin-top: 6px; padding: 4px 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,.3); background: rgba(255,255,255,.1); color: #fff; cursor: pointer; font-size: 12px; }
-  body.touch #mission-box { top: auto; bottom: calc(150px + env(safe-area-inset-bottom)); right: 10px; width: 190px; font-size: 11px; padding: 6px 10px; }
+  body.touch #mission-box { top: calc(104px + env(safe-area-inset-top)); bottom: auto; right: 10px; width: 190px; font-size: 11px; padding: 6px 10px; }
+  @media (orientation: portrait) { body.touch #mission-box { top: auto; bottom: calc(268px + env(safe-area-inset-bottom)); } body.touch #nav-box { top: 262px; left: 10px; max-width: calc(100vw - 20px); } }
   #wiper { position: fixed; inset: 0; pointer-events: none; z-index: 3; }
   #menu .gp input[type=search] { width: 100%; box-sizing: border-box; padding: 9px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,.25); background: rgba(255,255,255,.08); color: #fff; font-size: 15px; margin-bottom: 8px; }
   #menu .gp .list { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 6px; max-height: 240px; overflow: auto; margin-bottom: 12px; }
   #menu .gp .list button small { opacity: .6; margin-left: 4px; }
   #menu .gp .note { font-size: 12px; opacity: .7; margin: -4px 0 10px; }
   #menu .gp .wallet { font-size: 14px; margin-bottom: 8px; }
-  #touch .row .tb.gp-man { display: none; } body.manual #touch .row .tb.gp-man { display: flex; }
+  #touch .tb.gp-man { display: none; width: 52px; height: 40px; border-radius: 12px; font-size: 12px; bottom: calc(26px + env(safe-area-inset-bottom)); } body.manual #touch .tb.gp-man { display: flex; }
+  #touch .tb.gp-up, #touch .tb.gp-dn { right: calc(240px + env(safe-area-inset-right)); } #touch .tb.gp-up { bottom: calc(76px + env(safe-area-inset-bottom)); }
+  @media (orientation: portrait) { #touch .tb.gp-up, #touch .tb.gp-dn { right: calc(37px + env(safe-area-inset-right)); } #touch .tb.gp-up { bottom: calc(186px + env(safe-area-inset-bottom)); } #touch .tb.gp-dn { bottom: calc(140px + env(safe-area-inset-bottom)); } }
 `;
 document.head.appendChild(css);
 const el = (tag, attrs = {}, html = '') => { const e = document.createElement(tag); Object.assign(e, attrs); if (html) e.innerHTML = html; return e; };
@@ -5184,6 +5192,7 @@ const sfx = (() => {
     warn() { tone(1760, 0, 0.09, 0.1, 'square'); tone(1760, 0.14, 0.09, 0.1, 'square'); },
     shutter() { noise(0, 0.05, 3000, 0.5); noise(0.07, 0.08, 1800, 0.35); },
     coin() { tone(1046, 0, 0.12, 0.1); tone(1568, 0.1, 0.35, 0.1); },
+    beep() { tone(2093, 0, 0.12, 0.07, 'triangle'); },                  // ETC 車機「嗶」
     wipe(v) { noise(0, 0.12, 380, 0.09 * v); },
     rain(v, inside) { if (rainG) rainG.gain.setTargetAtTime(v * (inside ? 0.22 : 0.12), ac.currentTime, 0.4); },
   };
@@ -5934,7 +5943,66 @@ const missions = (() => {
     missionBox.innerHTML = `<h4>${a.title}</h4>${body}<br><button id="ms-abort">放棄任務</button>`;
     $('ms-abort').onclick = () => abort();
   }
-  return { start, frame, abort, get active() { return active; }, get wallet() { return wallet; }, get done() { return done; } };
+  // ETC 等扣款: 不算完成任務、不跳金額提示 (由呼叫端自己顯示)
+  const charge = (n) => { wallet -= n; store.set('tw_wallet', wallet); };
+  return { start, frame, abort, charge, get active() { return active; }, get wallet() { return wallet; }, get done() { return done; } };
+})();
+
+// ======================================================================= ETC 通行費 (國道計程收費)
+// 費率 (高公局現行): 小型車 1.2 元/km、大型車 1.5、聯結車 1.8；每車每日前 20 公里免費，超過 200 公里的部分打 75 折。
+// 每座門架收「它負責的那一段」: 用同一條國道、同方向的前一座門架到這一座的距離 (資料: live.json etc，m = 里程公尺)。
+const etc = (() => {
+  const L = extra('live'), list = (L && L.etc) || [], byWay = new Map(), seg = new Map();
+  for (const g of list) { if (!byWay.has(g.way)) byWay.set(g.way, []); byWay.get(g.way).push(g); }
+  // 每座門架負責的路段長
+  const grp = new Map();
+  for (const g of list) { const k = g.road + g.dir; if (!grp.has(k)) grp.set(k, []); grp.get(k).push(g); }
+  for (const arr of grp.values()) {
+    arr.sort((a, b) => a.m - b.m);
+    const inc = !/N|W/.test(arr[0].dir);   // 南下 / 東向里程遞增
+    arr.forEach((g, i) => { const p = inc ? arr[i - 1] : arr[i + 1]; seg.set(g.id, p ? Math.min(15000, Math.max(500, Math.abs(g.m - p.m))) : 2000); });
+  }
+  const RATE = { small: [1.2, 0.9], big: [1.5, 1.13], trailer: [1.8, 1.35] };
+  const cls = () => ['citybus', 'coach', 'boxtruck', 'minibus'].includes(S.vtype) ? 'big' : ['bigtruck', 'semi'].includes(S.vtype) ? 'trailer' : 'small';
+  const today = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' });
+  let day = store.get('tw_etc', null);
+  const fresh = () => { if (!day || day.d !== today()) day = { d: today(), km: { small: 0, big: 0, trailer: 0 }, paid: 0, n: 0 }; return day; };
+  function feeOf(d) {   // 今日應付總額 (各車種分開算，四捨五入到元)
+    let f = 0;
+    for (const c of Object.keys(RATE)) {
+      const km = d.km[c] || 0, [r1, r2] = RATE[c];
+      f += Math.max(0, Math.min(km, 200) - 20) * r1 + Math.max(0, km - 200) * r2;
+    }
+    return Math.round(f);
+  }
+  let last = null;   // { gid, s } 上一格的位置
+  const recent = new Map();   // 門架 id -> 上次收費的里程 (同一座 2 公里內不重複收；在門架下倒車、來回也不會一直扣)
+  let odo = 0;
+  function frame() {
+    const r = S.road;
+    if (!r || r.w.city || S.vtype === 'scooter') { last = null; return; }
+    const w = r.w, s = w.s[r.i] + (w.s[r.i + 1] - w.s[r.i]) * r.t, gs = byWay.get(w.gid);
+    if (last && last.gid === w.gid) odo += Math.abs(s - last.s);
+    if (gs && last && last.gid === w.gid && Math.abs(s - last.s) < 60 && s > last.s) {   // 只算順向通過
+      for (const g of gs) {
+        const at = w.s[Math.min(g.idx, w.n - 1)];
+        if (last.s < at && s >= at && !(odo - (recent.get(g.id) ?? -1e9) < 2000)) { recent.set(g.id, odo); pass(g); }
+      }
+    }
+    last = { gid: w.gid, s };
+  }
+  function pass(g) {
+    const d = fresh(), c = cls(), km = seg.get(g.id) / 1000;
+    d.km[c] += km; d.n++;
+    const due = feeOf(d), add = due - d.paid; d.paid = due;
+    store.set('tw_etc', d);
+    if (add > 0) missions.charge(add);
+    sfx.beep();
+    const tot = Object.values(d.km).reduce((a, b) => a + b, 0);
+    if (TEST) console.log('[etc]', g.id, km.toFixed(1), 'km; today', tot.toFixed(1), 'km NT$' + due, 'wallet', missions.wallet);
+    TW.toast(`🛣 ETC 嗶　門架 ${g.id}　本段 ${km.toFixed(1)} 公里　今日 ${tot.toFixed(1)} 公里 · NT$${due}${tot <= 20 ? '（前 20 公里免費）' : ''}`, 2600);
+  }
+  return { frame, get today() { return fresh(); }, feeOf, count: list.length };
 })();
 
 // ======================================================================= 選單: 導航 / 任務 / 駕駛與天氣
@@ -5991,7 +6059,8 @@ const missions = (() => {
     $('gp-weather').textContent = '🌦 天氣：' + weather.name + ' (Y)';
     $('gp-voice').textContent = '🔊 語音提示：' + (voice.on ? '開' : '關');
     $('gp-cam').textContent = '📷 測速提醒：' + (cams.on ? '開' : '關');
-    $('ms-wallet').innerHTML = `💰 NT$ ${missions.wallet.toLocaleString()}　完成任務 ${missions.done} 個`;
+    const ed = etc.today, ekm = Object.values(ed.km).reduce((a, b) => a + b, 0);
+    $('ms-wallet').innerHTML = `💰 NT$ ${missions.wallet.toLocaleString()}　完成任務 ${missions.done} 個<br><small style="opacity:.7">🛣 今日 ETC：${ekm.toFixed(1)} 公里，通行費 NT$${ed.paid}（每日前 20 公里免費）</small>`;
     const tk = cams.tickets;
     $('gp-tickets').textContent = tk.length ? `罰單 ${tk.length} 張，共 NT$${tk.reduce((a, t) => a + t.f, 0).toLocaleString()}（最近：${tk[tk.length - 1].where} 限速 ${tk[tk.length - 1].max} 開 ${tk[tk.length - 1].spd}）` : '目前沒有罰單 👍';
   };
@@ -6015,9 +6084,10 @@ const missions = (() => {
   $('gp-b-fs').onclick = toggleFullscreen;
   const row = document.querySelector('#touch .row');
   if (row) {
-    const add = (html, fn, cls = '') => { const b = el('div', { className: 'tb ' + cls }, html); b.addEventListener('pointerdown', (e) => { e.preventDefault(); fn(); }); row.appendChild(b); };
+    const add = (html, fn, cls = '', parent = row) => { const b = el('div', { className: 'tb ' + cls }, html); b.addEventListener('pointerdown', (e) => { e.preventDefault(); fn(); }); parent.appendChild(b); return b; };
     add('全螢幕', toggleFullscreen); add('天氣', () => weather.cycle()); add('定速', () => TW.toggleCruise());
-    add('升檔', () => TW.shift(1), 'gp-man'); add('降檔', () => TW.shift(-1), 'gp-man');
+    // 手排的升 / 降檔放在煞車正上方 (右手拇指順手，也不會被任務框蓋住)
+    add('升檔 ▲', () => TW.shift(1), 'gp-man gp-up', row.parentNode); add('降檔 ▼', () => TW.shift(-1), 'gp-man gp-dn', row.parentNode);
   }
 })();
 TW.HOOKS.key.push((e) => {
@@ -6030,6 +6100,7 @@ TW.HOOKS.frame.push((dt) => {
   weather.frame(dt); cams.frame(dt); distSigns.frame(dt); navFrame(dt); missions.frame(dt);
   document.body.classList.toggle('manual', !!S.manual && S.vtype !== 'scooter');
 });
+if (!TW.params.has('noetc')) TW.HOOKS.update.push(() => etc.frame());   // 物理更新後檢查有沒有通過 ETC 門架 (測試模式 ?t 也會跑)
 // 測試: ?navtest=目的地名稱 自動規劃並開自動駕駛；?weather=大雨
 if (TW.params.get('navtest')) setTimeout(async () => {
   const N = await loadNav(), q = TW.params.get('navtest');
@@ -6041,7 +6112,7 @@ if (TW.params.get('navtest')) setTimeout(async () => {
   const t0 = performance.now(); const ok = await navigateTo(dd);
   console.log('[navtest]', d[0], 'ok', ok, route.r ? route.r.steps.length + ' steps ' + (route.r.len / 1000).toFixed(1) + ' km ' + (route.r.time / 60).toFixed(1) + ' min' : '', (performance.now() - t0).toFixed(0) + 'ms');
 }, 4000);
-window.TWG = { weather, cams, distSigns, missions, route, navigateTo, stopNav, loadNav, plan, toggleFullscreen, voice };
+window.TWG = { weather, cams, etc, distSigns, missions, route, navigateTo, stopNav, loadNav, plan, toggleFullscreen, voice };
 })();
 </script>
 </body>

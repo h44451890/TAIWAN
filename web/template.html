@@ -62,6 +62,11 @@
   body.touch #radio { left: auto; right: calc(10px + env(safe-area-inset-right)); top: calc(64px + env(safe-area-inset-top)); bottom: auto; transform: none; padding: 5px 8px; gap: 6px; font-size: 11px; }
   body.touch #radio .info, body.touch #radio input { display: none; }
   body.touch #radio button { width: 30px; height: 30px; font-size: 11px; }
+  /* 橫向: 上排按鈕 (含全螢幕、天氣、定速、升降檔) 排成每排 5 個，路名 / 路況 / 導航框讓出空間；電台移到小地圖下面 */
+  body.touch #touch .row { flex-wrap: wrap; width: 254px; justify-content: flex-end; gap: 6px; }
+  body.touch #touch .row .tb { width: 46px; height: 40px; font-size: 12px; box-sizing: border-box; }
+  body.touch #hud-road, body.touch #traffic, body.touch #nav-box { max-width: calc(100vw - 430px); }
+  body.touch #radio { left: calc(10px + env(safe-area-inset-left)); right: auto; top: 186px; }
   @media (orientation: portrait) {
     body.touch #touch .row { flex-wrap: wrap; width: 160px; justify-content: flex-end; gap: 6px; }
     body.touch #touch .row .tb { width: 48px; height: 40px; font-size: 12px; }
@@ -75,7 +80,7 @@
     body.touch #hud-speed { bottom: calc(118px + env(safe-area-inset-bottom)); }
   }
   #rotate { display: none; }
-  @media (orientation: portrait) { body.touch #rotate { display: flex; position: fixed; left: 0; right: 0; bottom: 40%; justify-content: center; z-index: 6; pointer-events: none; }
+  @media (orientation: portrait) { body.touch #rotate { display: flex; position: fixed; left: 0; right: 0; bottom: calc(222px + env(safe-area-inset-bottom)); justify-content: center; z-index: 6; pointer-events: none; }
     body.touch #rotate span { background: rgba(0,0,0,.7); padding: 8px 14px; border-radius: 10px; font-size: 14px; } }
   #menu { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(560px, 92vw); max-height: 80vh; overflow: auto; padding: 18px 20px; border-radius: 16px; background: rgba(12,16,22,.92); box-shadow: 0 10px 40px rgba(0,0,0,.6); z-index: 5; }
   #menu h2 { margin: 4px 0 10px; font-size: 17px; }
