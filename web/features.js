@@ -98,7 +98,7 @@ async function pollSpeed() {
       liveSrc = src; liveOkAt = Date.now(); liveAt = Date.now() - (Number.isFinite(age) ? age : 0);
       indexSections(); recomputeTraffic();
       for (const c of cars) if (c.alive) c.v0 = desiredSpeed(c);
-      wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);   // 國道路況時時更新: 最多 30 秒抓一次
+      wait = Math.max(5000, Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500));   // 國道路況時時更新: 最多 30 秒、至少 5 秒抓一次 (後端回 0 或負數時不要每秒狂抓)
     }
   } catch (e) { /* 連不到後端: 沿用快照 */ }
   setTimeout(pollSpeed, wait);
@@ -305,9 +305,13 @@ function choosePlan(c) {
     for (const o of opts) {
       const dot = hx * o.hx + hy * o.hy;
       if (dot < -0.2) continue;
-      cand.push([o, (dot > 0.9 ? 3 : 1) * (o.o.cls === 5 ? 0.35 : o.o.cls <= 3 ? 1.6 : 1)]);
+      cand.push([o, (dot > 0.9 ? 3 : 1) * (o.o.cls === 5 ? 0.35 : o.o.cls <= 3 ? 1.6 : 1) * (TW.deadEndAhead(o) ? 0.03 : 1)]);   // 盡頭沒路接的少走
     }
     if (cand.length) best = pickW(cand);
+    else {   // 只剩急轉 (單行道尾端接 V 字路口): 挑最順的那條，總比停在路尾擋路好
+      let bd = -1e9;
+      for (const o of opts) { const dot = hx * o.hx + hy * o.hy; if (dot > bd) { bd = dot; best = o; } }
+    }
   }
   if (!best) return null;
   const dot = hx * best.hx + hy * best.hy, cross = hx * best.hy - hy * best.hx;
@@ -418,11 +422,12 @@ function eachOther(me, fn) {
   if (me !== PLAYER) fn(syncPlayer());
 }
 /** 前車: shift = 目標車道相對目前位置的橫向位移 (行進方向左正)；一般道路另外檢查路口橫向來車 */
+const onRing = (w) => !!(w && w.city && w.name && w.name.includes('圓環'));   // 圓環 (路名有「圓環」的一般道路)
 function leaderFor(me, shift) {
   const fx = Math.cos(me.h), fy = Math.sin(me.h);
   const lo = Math.min(0, shift), hi = Math.max(0, shift);
   const inCity = me.w && me.w.city;
-  let gap = 1e9, vl = 40;
+  let gap = 1e9, vl = 40, who = null, why = 0;   // who / why: 測試追蹤用 (誰擋住、1 跟車 2 路口讓車)
   eachOther(me, (o) => {
     if (Math.abs(o.z - me.z) > 3) return;
     const dx = o.x - me.x, dy = o.y - me.y;
@@ -435,17 +440,22 @@ function leaderFor(me, shift) {
     if (cs >= 0.3) {
       if (d <= 0 || d > 160) return;
       if (meStuck && oStuck && cs < 0.9 && (o.id < me.id || (me.stuck || 0) > 12)) return;
-      const hw = (me.wid + o.wid) / 2 + 0.05;
+      // 前車斜著 (正在轉彎、換路段) 時車身橫向佔得比較寬: 用轉過的車身寬度算，不然後車看不到、直接追撞 (基隆義一路→中正路)
+      const sn = Math.sqrt(Math.max(0, 1 - cs * cs));
+      const hw = (me.wid + o.wid * cs + (o.front + o.rear) * sn) / 2 + 0.05;
       if (lat < lo - hw || lat > hi + hw) return;
       const g = d - me.front - o.rear;
-      if (g < gap) { gap = g; vl = Math.max(0, o.v * cs); }
+      if (g < gap) { gap = g; vl = Math.max(0, o.v * cs); who = o; why = 1; }
     } else if (inCity && Math.abs(cs) < 0.75 && d > 1 && d < 22 && Math.abs(lat) < 7) {
       // 路口: 橫向來車在前方，對方在動 (或編號較小) 就讓
       if (meStuck && oStuck) return;
-      if (o.v > 1.5 || o.id < me.id) { const g = d - me.front - 2; if (g < gap) { gap = g; vl = 0; } }
+      // 圓環: 環道內的車先行，不讓還沒進圓環的車 (以前環道裡的車一直讓路口進來的車，整個圓環塞死，例如台北東門圓環)
+      if (onRing(me.w) && !onRing(o.w)) return;
+      // 玩家沒有編號 (o.id undefined 比大小永遠 false): 以前玩家停在路口時 AI 不讓、直接撞上來。AI 一律讓玩家
+      if (o.isPlayer || o.v > 1.5 || o.id < me.id) { const g = d - me.front - 2; if (g < gap) { gap = g; vl = 0; who = o; why = 2; } }
     }
   });
-  return { gap, v: vl };
+  return { gap, v: vl, who, why };
 }
 /** 目標車道安全嗎: 前後留距離；附近有車要切進同一車道也先不切 */
 function laneSafeFor(me, shift) {
@@ -585,8 +595,9 @@ function trailPoint(tr, x, y, dist) {
 }
 
 let bumpCooldown = 0;
+let touchClock = 0;
 function collidePlayer(dt) {
-  bumpCooldown -= dt;
+  bumpCooldown -= dt; touchClock += dt;
   const pl = syncPlayer();
   const fx = Math.cos(S.h), fy = Math.sin(S.h);
   const pOff = (pl.front - pl.rear) / 2, pHalf = (pl.front + pl.rear) / 2;
@@ -606,17 +617,26 @@ function collidePlayer(dt) {
     if (Math.abs(ax) >= hl || Math.abs(ay) >= hw) continue;
     const px = hl - Math.abs(ax), py = hw - Math.abs(ay);
     let nx = S.x, ny = S.y;
-    if (px < py) {
+    // 對向會車只擦到一點邊 (窄的雙向道、大車): 當側面擦撞往旁邊推開；不然第一幀縱向重疊比較小，會被當成正面撞、被對向車推著倒退
+    const passing = Math.cos(c.h - S.h) < -0.5 && py < 0.9;
+    if (px < py && !passing) {
       const sg = Math.sign(ax) || 1;
       nx -= fx * sg * px; ny -= fy * sg * px;
-      if (ax > 0) S.v = Math.min(S.v, c.v * Math.cos(c.h - S.h) * 0.9); else S.v = Math.max(S.v, c.v * 0.9);
+      // 正面撞上: 最多被往後推一點 (以前直接變成對向車速的反方向，對撞公車會被推著倒退 45 km/h)
+      if (ax > 0) S.v = Math.min(S.v, Math.max(-1, c.v * Math.cos(c.h - S.h) * 0.9)); else S.v = Math.max(S.v, c.v * 0.9);
     } else {
       const sg = Math.sign(ay) || 1;
       nx += fy * sg * py; ny -= fx * sg * py;
       S.v *= 0.97;
     }
     if (TW.roadAt(nx, ny, S.z, 0.5)) { S.x = nx; S.y = ny; }
-    if (bumpCooldown <= 0) { bumpCooldown = 0.6; stats.bumps++; sound.bump(); }
+    // 同一台車一直貼著 (路口互卡、排隊) 只算一次碰撞、響一次；離開 0.5 秒以上再碰到才算新的一次
+    const fresh = touchClock - (c.touchAt ?? -9) > 0.5;
+    c.touchAt = touchClock;
+    if (fresh && bumpCooldown <= 0) {
+      bumpCooldown = 0.6; stats.bumps++; sound.bump();
+      if (TW.params.has('bumpdbg')) console.log('[bump]', c.type, 'front/side', px < py ? (ax > 0 ? 'front' : 'rear') : 'side', 'dh', Math.round(((c.h - S.h) * 180 / Math.PI) % 360), 'v', (S.v * 3.6).toFixed(0), 'ai v', (c.v * 3.6).toFixed(0), 'ai w', c.w.k, c.w.name || '', 'me', S.road ? S.road.w.k + ' ' + (S.road.w.name || '') : '-', 'ai plan', c.plan ? (c.plan.none ? 'none' : c.plan.o.k) : '-', 'pos', S.x.toFixed(0), S.y.toFixed(0));
+    }
   }
 }
 
@@ -680,13 +700,19 @@ function updateTraffic(dt) {
     lowWas = lowT > 0 ? lowT : lowWas;
     if (fwyLv >= 3) lowWas = 0;
     seedLv = fwyLv;
-    let n = 0;
+    // 空車位 (之前生不出來) 跟要回收的活車分開算額度: 不然生車點少的地方 (基隆市區) 空車位每輪都先用光 4 個額度，卡死的車永遠收不掉
+    let n = 0, nDead = 0;
     for (const c of cars) {
-      const d = c.alive ? Math.hypot(c.x - S.x, c.y - S.y) : 1e9;
+      if (!c.alive) {
+        if (nDead++ < 4) { if (c.pool === 'city') trySpawn(c, 'city', 280, 550); else trySpawn(c, 'fwy', FWY_R[fwyLv][0], FWY_R[fwyLv][1]); }
+        continue;
+      }
+      const d = Math.hypot(c.x - S.x, c.y - S.y);
       const behind = c.alive && (c.x - S.x) * Math.cos(S.h) + (c.y - S.y) * Math.sin(S.h) < -25;
       const FR = FWY_R[fwyLv];
       const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && (d > 80 || behind))) : (d > FR[2] || (c.deadEnd && d > Math.min(700, FR[1])));
-      const jam = ((c.stuck || 0) > 8 && (d > 120 || behind)) || (c.stuck || 0) > 25;   // 卡死的車: 停 8 秒就在看不到的地方回收，卡太久直接回收
+      // 開到死路 (單行道尾端沒路接) 的車停 5 秒就回收，不然後面的車 (包括玩家) 會一直排在它後面
+      const jam = ((c.stuck || 0) > 8 && (d > 120 || behind)) || (c.stuck || 0) > 25 || (c.deadEnd && (c.stuck || 0) > 5);   // 卡死的車: 停 8 秒就在看不到的地方回收，卡太久直接回收
       if (jam && !far) stats.unjam = (stats.unjam || 0) + 1;
       if ((far || jam) && n++ < 4) {
         kill(c);
@@ -773,7 +799,7 @@ function splitLines(t) {
 const COLS = 192, ROWS = 60, PITCH = 4;
 function boardCanvas(p) {
   const lo = document.createElement('canvas'); lo.width = COLS; lo.height = ROWS;
-  const lx = lo.getContext('2d'), lines = splitLines(p.text), col = pageColor(p);
+  const lx = lo.getContext('2d', { willReadFrequently: true }), lines = splitLines(p.text), col = pageColor(p);   // 只拿來讀像素: CPU 畫布，不用每次從 GPU 讀回
   let fs = lines.length > 1 ? 26 : 34;
   const font = (n) => '700 ' + n + 'px "PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif';
   lx.font = font(fs);
@@ -944,7 +970,7 @@ async function pollCms() {
           if (sg.model && pages.length) { const t = sg.model.faceMat.map; t.image = boardCanvas(pages[0]); t.needsUpdate = true; }
         }
       }
-      wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);
+      wait = Math.max(5000, Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500));   // 至少隔 5 秒 (後端回 0 或負數時不要每秒狂抓)
     }
   } catch (e) { /* 沿用快照 */ }
   setTimeout(pollCms, wait);
@@ -1350,6 +1376,12 @@ const sound = (() => {
   const unlock = () => { init(); if (ac.state === 'suspended') ac.resume(); if (!jointBufs) jointBufs = makeJointBufs(); };
   window.addEventListener('keydown', unlock, { once: false });
   window.addEventListener('pointerdown', unlock, { once: false });
+  // 切到別的分頁: 畫面停了但 AudioContext 會照最後的參數一直響 (引擎聲嗡嗡叫)，跟著暫停 / 回來再繼續
+  document.addEventListener('visibilitychange', () => {
+    if (!ac) return;
+    if (document.visibilityState === 'hidden') { if (ac.state === 'running') ac.suspend(); }
+    else if (ac.state === 'suspended' && enabled) ac.resume();
+  });
   if (TW.params.has('audiotest')) { unlock(); setTimeout(() => { let err = null; try { for (let i = 0; i < 6; i++) knock(10 + i * 5, i & 1); } catch (e) { err = String(e); } console.log('[audiotest] knock ok', !err, err || '', 'bufs', jointBufs ? jointBufs.length : 0, 'state', ac.state); }, 500); }
   return { update, bump, knock, blinker, toggle, get on() { return enabled; } };
 })();

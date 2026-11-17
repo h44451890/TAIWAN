@@ -619,7 +619,11 @@ function ingestDetail(buf) {
   p = 0;
   for (let q = 0; q < ncw; q++) {
     const m = hd.cw[q], n = hd.cc[q];
-    ways.push(makeWay({ gid: m[0], ref: '', name: m[6], cls: m[1], lanes: m[2], oneway: !!m[3], width: m[4], bridge: !!m[5], tunnel: false,
+    // 雙向一般道路 (非巷道) 被標成 1 線道 (OSM lanes=1，例如中壢中山東路一段有一小段): 兩個方向的車道中心只差 1.6 m，
+    // 對向車每台都會擦撞。至少當 2 線道 (每向 1 線)、寬 7.1 m；巷道另有 6 m 下限 (city_web.py)
+    let lanes = m[2], width = m[4];
+    if (!m[3] && m[1] <= 4 && lanes < 2) { lanes = 2; width = Math.max(width, 7.1); }
+    ways.push(makeWay({ gid: m[0], ref: '', name: m[6], cls: m[1], lanes, oneway: !!m[3], width, bridge: !!m[5], tunnel: false,
       link: m[1] === 6, ls: 0.3, rs: 0.3, maxspeed: 0, city: true, P: cp.subarray(p * 3, (p + n) * 3) }).k);
     p += n;
   }
@@ -2338,8 +2342,10 @@ let WB = 2.8, MARGIN = 1.25;
 function setVehicle(type) {
   const TV = window.TWV && window.TWV.TYPES;
   if (!TV || !TV[type]) return;
-  scene.remove(car);
-  if (trailer) { scene.remove(trailer.group); trailer = null; }
+  // 舊車的幾何每次建車都是新的 (材質有些是共用的，不動)：移除時釋放，不然每換一次車就漏一份 GPU 記憶體
+  const dropGeo = (g) => { scene.remove(g); g.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); };
+  if (car) dropGeo(car);
+  if (trailer) { dropGeo(trailer.group); trailer = null; }
   const r = window.TWV.build(type);
   car = r.group;
   car.userData = Object.assign({}, car.userData, r.ud);
@@ -2375,9 +2381,28 @@ function laneOffDir(w, lane, dir = 1) {
 /** 速限: OSM maxspeed，沒有就依道路等級 */
 const speedLimit = (w) => w.maxspeed || (w.city ? (w.cls === 5 ? 30 : 50) : w.trunk ? (w.link ? 50 : 80) : (w.link ? 60 : 100));
 /** 路口 (路段端點 node) 可以接續的路段與方向；雙向一般道路兩個方向都能走 */
+function nodeLinks(w, node) {
+  const x = w.P[node * 3], y = w.P[node * 3 + 1];
+  const own = PT_INDEX.get(ptKey(x, y)) || [];
+  // 一般道路的點是「各路段自己的起點 + 0.1 m 整數位移」存的，同一個路口在不同路段上會差幾公分，四捨五入常落到隔壁格子:
+  // 載入範圍內約 29% 的端點因此接不到任何路、另外 20% 少接幾條。隔壁格子 20 公分內的點也算進來 (兩邊至少一條是一般道路；國道之間的點完全一致)
+  const gx = Math.round(x * 10), gy = Math.round(y * 10);
+  let res = own;
+  for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+    if (!ox && !oy) continue;
+    for (const e of PT_INDEX.get((gx + ox) + ',' + (gy + oy)) || []) {
+      const o = WAYS[e[0]];
+      if (e[0] !== w.k && (o.city || w.city) && Math.hypot(o.P[e[1] * 3] - x, o.P[e[1] * 3 + 1] - y) < 0.2 && !res.some(([k, i]) => k === e[0] && i === e[1])) {
+        if (res === own) res = own.slice();
+        res.push(e);
+      }
+    }
+  }
+  return res;
+}
 function nextOptions(w, node) {
   const res = [];
-  for (const [k, i] of PT_INDEX.get(ptKey(w.P[node * 3], w.P[node * 3 + 1])) || []) {
+  for (const [k, i] of nodeLinks(w, node)) {
     if (k === w.k) continue;
     const o = WAYS[k];
     if (Math.abs(o.P[i * 3 + 2] - w.P[node * 3 + 2]) > 2.5) continue;   // 不同樓層剛好重疊，不相連
@@ -2385,6 +2410,12 @@ function nextOptions(w, node) {
     if (o.city && !o.oneway && i > 0) res.push({ o, i, dir: -1, hx: -o.ny[i], hy: o.nx[i] });
   }
   return res.sort((a, b) => a.o.gid - b.o.gid);   // 依全域編號排序: 選路結果不受分區載入順序影響
+}
+/** 接續選項 o (nextOptions 的一項) 走到底以後還有沒有路: 一般道路才看 (林口文化一路、羅東巷子裡只有 2 個點的死路，
+ *  以前自動駕駛和 AI 都會直接開進去卡住)。只往前看一層，走不出去就算死路 */
+function deadEndAhead(o) {
+  if (!o.o.city) return false;
+  return nextOptions(o.o, o.dir > 0 ? o.o.n - 1 : 0).length === 0;
 }
 /** 玩家自動駕駛選路: 國道優先同一條主線；一般道路直行，打方向燈就在路口轉彎 */
 function chooseNext(w, node, dir, signal) {
@@ -2395,10 +2426,15 @@ function chooseNext(w, node, dir, signal) {
     if (dot < (w.city || o.o.city ? -0.2 : 0.3)) continue;
     let sc = dot * 2 + (o.o.ref && o.o.ref === w.ref ? 3 : 0) + (o.o.link && !w.link ? -2 : 0) + (w.link && !o.o.link ? 2 : 0)
       + (!!o.o.city !== !!w.city ? -1 : 0) + (o.o.city && o.o.cls === 5 ? -1 : 0);
+    if (deadEndAhead(o)) sc -= 6;   // 下一段的盡頭沒有路接 (死巷、資料斷掉): 除非沒別條，不要鑽進去
     if (HOOKS.navBias) sc += HOOKS.navBias(w, o);   // 導航路線上的下一段
     if (signal < 0 && cross > 0.3) sc += 6;
     if (signal > 0 && cross < -0.3) sc += 6;
     if (sc > bs) { bs = sc; best = o; }
+  }
+  if (!best && w.city) {   // 市區只剩急轉出得去 (單行道尾端接 V 字路口): 挑最順的那條，不要停在路尾
+    let bd = -1e9;
+    for (const o of nextOptions(w, node)) if (o.o.city) { const dot = hx * o.hx + hy * o.hy; if (dot > bd) { bd = dot; best = o; } }
   }
   return best;
 }
@@ -2416,6 +2452,8 @@ function spawn(wayIdx, idx, dir = 1, lane = null) {
   S.h = Math.atan2(by - ay, bx - ax) + (dir < 0 ? Math.PI : 0); S.v = 0; S.vz = 0; S.steer = 0;
   S.road = roadAt(S.x, S.y, S.z, 0, 2); S.zVis = null;
   S.rt = null; S.apLane = null; S.apPending = null;
+  // 傳送 / 回到路上: 停在原地重新出發 — 定速巡航取消 (不然會自己從 0 衝到設定速度)、手排回 1 檔、方向燈與脫困狀態清掉
+  S.cruise = null; S.gear = 1; S.signal = 0; S.signalAuto = false; S.sigArmed = false; S.apStuck = 0; S.apUnstickAt = null;
   if (trailer) trailer.h = S.h;
   if (typeof camInit !== 'undefined') camInit = false;
 }
@@ -2506,6 +2544,8 @@ window.addEventListener('keydown', (e) => {
   if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+// 按著油門切到別的視窗 (Alt+Tab、點到別的程式) 時收不到 keyup: 失去焦點就全部放開，回來車子才不會自己一直衝
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
 
 // ---- 自動駕駛路線: { w 路段, i 線段, dir 行進方向 }，沿路網推進，雙向道路可反向行駛
 function updateRoute() {
@@ -2564,6 +2604,25 @@ function routeNext(dist) {
   if (d > dist) return null;
   const nx = chooseNext(w, dir > 0 ? w.n - 1 : 0, dir, S.signal || 0);
   return nx ? { w: nx.o, dir: nx.dir, d } : null;
+}
+/** 自動駕駛走到死路時找前方可以接著開的路: 60 m 內、在車頭前方、高度差 3 m 內、可以順著車頭方向行駛的點 (取最近) */
+function gapJump(x, y, z, h) {
+  const fx = Math.cos(h), fy = Math.sin(h), cur = S.road && S.road.w;
+  let best = null, bd = 1e9;
+  for (const o of WAYS) {
+    if (!o || o === cur || o.n < 2) continue;
+    if (Math.abs(o.P[0] - x) > 400 && Math.abs(o.P[(o.n - 1) * 3] - x) > 400) continue;   // 粗篩
+    for (let i = 0; i < o.n - 1; i++) {
+      const px = o.P[i * 3], py = o.P[i * 3 + 1], dx = px - x, dy = py - y, d = Math.hypot(dx, dy);
+      if (d < 4 || d > 60 || d >= bd || dx * fx + dy * fy < d * 0.7 || Math.abs(o.P[i * 3 + 2] - z) > 3) continue;
+      const tx = o.P[i * 3 + 3] - px, ty = o.P[i * 3 + 4] - py, L = Math.hypot(tx, ty) || 1, c = (tx * fx + ty * fy) / L;
+      const dir = c > 0.3 ? 1 : (c < -0.3 && o.city && !o.oneway) ? -1 : 0;
+      if (!dir) continue;
+      const lc = laneCount(o), off = laneOffDir(o, o.city ? lc - 1 : Math.floor(lc / 2), dir);
+      bd = d; best = { x: px + o.nx[i] * off, y: py + o.ny[i] * off, h: Math.atan2(ty * dir, tx * dir) };
+    }
+  }
+  return best;
 }
 function lookAhead(dist) {
   const rt = S.rt;
@@ -2712,7 +2771,20 @@ function update(dt) {
         const tx = P[i * 3 + 3] - P[i * 3], ty = P[i * 3 + 4] - P[i * 3 + 1], L = Math.hypot(tx, ty) || 1;
         S.x = P[i * 3] + tx * t + w0.nx[i] * off; S.y = P[i * 3 + 1] + ty * t + w0.ny[i] * off;
         S.h = Math.atan2(ty, tx) + (dir < 0 ? Math.PI : 0); S.steer = 0;
+        // 同一個地方又卡住 (窄巷急轉彎轉不過去): 直接擺到路線前方 6 公尺、已經轉過去的位置
+        const again = S.apUnstickAt && Math.hypot(S.apUnstickAt[0] - S.x, S.apUnstickAt[1] - S.y) < 6;
+        S.apUnstickAt = [S.x, S.y];
+        const a1 = again && lookAhead(6), a2 = a1 && lookAhead(9);
+        if (a1 && a2 && Math.hypot(a2.x - a1.x, a2.y - a1.y) > 0.5) {
+          const r3 = roadAt(a1.x, a1.y, S.z, 0, 2);
+          if (r3) { S.x = a1.x; S.y = a1.y; S.h = Math.atan2(a2.y - a1.y, a2.x - a1.x); S.v = 0; S.apUnstickAt = null; }
+        }
+        else if (again) {   // 前面沒路 (原始資料斷掉的死路，例如地下道後半段缺資料): 跳到前方 60 m 內方向順的路
+          const j = gapJump(S.x, S.y, S.z, S.h);
+          if (j) { S.x = j.x; S.y = j.y; S.h = j.h; S.v = 0; S.apUnstickAt = null; S.apGapJumps = (S.apGapJumps || 0) + 1; }
+        }
         const r2 = roadAt(S.x, S.y, S.z, 0, 2); if (r2) S.road = r2;
+        if (S.apUnstickAt === null) S.rt = null;
         S.apStuck = 0; S.apUnstick = (S.apUnstick || 0) + 1;
       }
       // 換車道
@@ -2739,6 +2811,7 @@ function update(dt) {
           S.apPending = must; S.apSigT = 0.8; S.signal = must < S.apLane ? -1 : 1; S.signalAuto = true; S.apCool = 3;
         } else if (nxt.d < 90) { thr = 0; brk = Math.max(brk, 0.35); }
       }
+      S.apShift = shift;   // 測試追蹤用
       if (S.apPending != null) {
         S.apSigT -= dt;
         if (S.apSigT <= 0) {
@@ -2749,6 +2822,7 @@ function update(dt) {
       } else if (S.apCool <= 0 && lc > 1 && Math.abs(shift) < 0.4 && !w0.link && S.vtype !== 'scooter') {
         const blocked = ld.gap < 70 && ld.v < vtg - 2;
         const tries = blocked ? [S.apLane - 1, S.apLane + 1] : (ld.gap > 100 && Math.random() < dt * 0.1 ? [S.apLane + 1] : []);
+        if (params.has('trace')) S.apDbg = 'blk ' + blocked + ' gap ' + ld.gap.toFixed(0) + ' lv ' + (ld.v * 3.6).toFixed(0) + ' vtg ' + (vtg * 3.6).toFixed(0) + ' lc ' + lc + ' ln ' + S.apLane + ' ' + tries.map((ln) => ln + ':' + (laneOkP(ln) ? 'ok' : 'X') + (fitsNext(ln) ? 'f' : 'nf') + (HOOKS.laneFree && laneOkP(ln) ? (HOOKS.laneFree(dir * (laneOffDir(w0, ln, dir) - curLat)) ? 'free' : 'busy') : '')).join(',');
         for (const ln of tries) {
           if (!laneOkP(ln) || !fitsNext(ln)) continue;
           if (!HOOKS.laneFree || HOOKS.laneFree(dir * (laneOffDir(w0, ln, dir) - curLat))) {
@@ -3065,7 +3139,7 @@ window.addEventListener('resize', () => {
 // ---- 給擴充模組 (features.js: 車流、電台、看板) 用的介面
 const HOOKS = { init: [], update: [], frame: [], minimap: [], tile: [], key: [], wayColor: null, navBias: null };
 window.TW = { T, scene, camera, renderer, NIGHT, GLOW_TEX, landcoverAt, WAYS, wayByGid, TILES, TS, tilesNear, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
-  laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: INDEX.origin_twd97, MOBILE, WEATHER, keys, tileBuf, roadLabel, toast, toggleMenu,
+  laneCount, laneOffDir, nextOptions, deadEndAhead, speedLimit, setVehicle, spawn, ORIGIN: INDEX.origin_twd97, MOBILE, WEATHER, keys, tileBuf, roadLabel, toast, toggleMenu,
   toggleManual, shift, toggleCruise, ensureArea, respawnNearest, SPAWNS: () => SPAWNS, sun,
   get camMode() { return camMode; }, get autopilot() { return autopilot; }, set autopilot(v) { autopilot = !!v; },
   get mapScale() { return MAP_SCALES[mapScaleIdx]; }, MAP_PX: 200 };
@@ -3078,6 +3152,10 @@ setTimeout(async () => {
   // 起點: 國1 南下 0K (基隆端)；網址 ?spawn=路段gid,點 或 ?at=x,y 可覆寫
   let sp0 = SPAWNS[0] || { x: 0, y: 0 };
   if (params.has('at')) { const [x, y] = params.get('at').split(',').map(Number); sp0 = { x, y }; }
+  else if (params.has('spawn')) {   // ?spawn= 指定的路段可能離預設起點很遠 (沒載入就找不到): 是傳送地點的話先載入那裡
+    const g = +params.get('spawn').split(',')[0], hit = SPAWNS.find((p) => p.gid === g);
+    if (hit) sp0 = { x: hit.x, y: hit.y };
+  }
   // 上次的位置 (關掉前存的)；網址有指定地點或在測試時不用
   let resume = null;
   if (!params.has('at') && !params.has('spawn') && !params.has('t') && !params.has('fresh')) {
@@ -3128,12 +3206,13 @@ setTimeout(async () => {
         if (i % 300 === 0) console.log('[lc]', (i / 30).toFixed(0) + 's', r ? (r.w.name || r.w.k) : '-', 'v', (S.v * 3.6).toFixed(0), 'on', S.lcOn, 'lane', S.lcLane, 'err', r && S.lcLane != null ? (laneOffDir(r.w, S.lcLane, S.lcDir || 1) - r.lat).toFixed(2) : '-');
       }
       update(1 / 30); for (const f of HOOKS.update) f(1 / 30);
-      if (params.has('trace') && i % 150 === 0 && S.rt) console.log('[trace]', (i / 30).toFixed(0) + 's', S.rt.w.k, S.rt.w.ref, S.rt.w.name, S.rt.w.link ? 'link' : '', 'dir', S.rt.dir, 'i', S.rt.i, '/', S.rt.w.n, 'v', (S.v * 3.6).toFixed(0),
+      if (params.has('trace') && i % 150 === 0 && S.rt) console.log('[trace]', (i / 30).toFixed(0) + 's', S.rt.w.k, S.rt.w.ref, S.rt.w.name, S.rt.w.link ? 'link' : '', 'dir', S.rt.dir, 'i', S.rt.i, '/', S.rt.w.n, 'v', (S.v * 3.6).toFixed(0), 'pos', S.x.toFixed(0) + ',' + S.y.toFixed(0), 'road', S.road ? S.road.w.k : '-', 'unst', S.apUnstick || 0, 'thr', (S.thr || 0).toFixed(2), 'brk', (S.brk || 0).toFixed(2), 'apSt', (S.apStuck || 0).toFixed(1), 'lat', S.rt.lat != null ? S.rt.lat.toFixed(1) : '-', 'lc[', S.apDbg || '', ']', 'shift', S.apShift != null ? S.apShift.toFixed(2) : '-', 'pend', S.apPending, 'cool', (S.apCool || 0).toFixed(1),
+        HOOKS.leader ? (() => { const l = HOOKS.leader(0); return l.gap < 1e8 ? `lead gap=${l.gap.toFixed(1)} ${l.why === 2 ? 'YIELD' : 'follow'} ${l.who ? l.who.type + '#' + l.who.id + ' v=' + (l.who.v * 3.6).toFixed(0) + ' stuck=' + (l.who.stuck || 0).toFixed(0) + ' dh=' + Math.round(((l.who.h - S.h) * 180 / Math.PI) % 360) : ''}` : 'lead -'; })() : '',
         window.TWX ? (() => { let b = null, bd = 1e9; for (const c of TWX.cars) if (c.alive) { const d = Math.hypot(c.x - S.x, c.y - S.y); if (d < bd) { bd = d; b = c; } }
           return b ? `| nearest AI ${b.type} d=${bd.toFixed(1)} v=${(b.v * 3.6).toFixed(0)} w=${b.w.k} s=${b.s.toFixed(0)}/${b.w.s[b.w.n - 1].toFixed(0)} dir=${b.dir} dead=${b.deadEnd} plan=${b.plan ? (b.plan.none ? 'none' : b.plan.o.k) : '-'} dh=${(((b.h - S.h) * 180 / Math.PI) % 360).toFixed(0)}` : ''; })() : '');
     }
     autopilot = params.has('demo') || params.has('keep');
-    if (params.has('trace') && S.road) { const w = S.road.w; const ends = [0, w.n - 1].map(n => nextOptions(w, n).map(o => o.o.gid + '/' + o.dir + (o.o.city ? 'c' : '') + (o.o.oneway ? 'o' : ''))); console.log('[end]', 'unstick', S.apUnstick || 0, 'apStuck', (S.apStuck || 0).toFixed(1), 'v', S.v.toFixed(2), 'gid', w.gid, 'n', w.n, 'city', !!w.city, 'oneway', !!w.oneway, 'i', S.road.i, 't', S.road.t.toFixed(2), 'lat', S.road.lat.toFixed(2), 'hw', w.hw, 'rt', S.rt ? S.rt.dir + ' ' + S.rt.i : '-', 'ends', JSON.stringify(ends), 'thr', S.thr, 'brk', S.brk, 'h', S.h.toFixed(2), 'tan', Math.atan2(S.road.ty, S.road.tx).toFixed(2)); }
+    if (params.has('trace') && S.road) { const w = S.road.w; const ends = [0, w.n - 1].map(n => nextOptions(w, n).map(o => o.o.gid + '/' + o.dir + (o.o.city ? 'c' : '') + (o.o.oneway ? 'o' : ''))); console.log('[end]', 'unstick', S.apUnstick || 0, 'gapjump', S.apGapJumps || 0, 'apStuck', (S.apStuck || 0).toFixed(1), 'v', S.v.toFixed(2), 'gid', w.gid, 'n', w.n, 'city', !!w.city, 'oneway', !!w.oneway, 'i', S.road.i, 't', S.road.t.toFixed(2), 'lat', S.road.lat.toFixed(2), 'hw', w.hw, 'rt', S.rt ? S.rt.dir + ' ' + S.rt.i : '-', 'ends', JSON.stringify(ends), 'thr', S.thr, 'brk', S.brk, 'h', S.h.toFixed(2), 'tan', Math.atan2(S.road.ty, S.road.tx).toFixed(2)); }
     if (params.has('trace') && S.rt) { const o = S.rt.w, P = o.P; console.log('[end2] rt gid', o.gid, 'n', o.n, 'hw', o.hw, 'lanes', o.lanes, 'width', o.width, 'pts', JSON.stringify(Array.from(P).map(v => +v.toFixed(1))), 'car', S.x.toFixed(1), S.y.toFixed(1), S.z.toFixed(1), 'cur end', JSON.stringify(Array.from(S.road.w.P.slice(-6)).map(v => +v.toFixed(1))), 'cur width', S.road.w.width, 'lanes', S.road.w.lanes, 'la', JSON.stringify(lookAhead(10))); }
     if (LCT) { keys.KeyW = keys.KeyA = keys.KeyD = keys.KeyS = false; console.log('[lc] settled err max', lcMax.toFixed(2), 'mean', (lcSum / Math.max(lcN, 1)).toFixed(2), 'off frames', lcOff, '/', n); }
     console.log('[test] simulated', params.get('t'), 's; speed', (S.v * 3.6).toFixed(0), 'km/h; lane', S.apLane,
@@ -3262,7 +3341,7 @@ async function pollSpeed() {
       liveSrc = src; liveOkAt = Date.now(); liveAt = Date.now() - (Number.isFinite(age) ? age : 0);
       indexSections(); recomputeTraffic();
       for (const c of cars) if (c.alive) c.v0 = desiredSpeed(c);
-      wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);   // 國道路況時時更新: 最多 30 秒抓一次
+      wait = Math.max(5000, Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500));   // 國道路況時時更新: 最多 30 秒、至少 5 秒抓一次 (後端回 0 或負數時不要每秒狂抓)
     }
   } catch (e) { /* 連不到後端: 沿用快照 */ }
   setTimeout(pollSpeed, wait);
@@ -3469,9 +3548,13 @@ function choosePlan(c) {
     for (const o of opts) {
       const dot = hx * o.hx + hy * o.hy;
       if (dot < -0.2) continue;
-      cand.push([o, (dot > 0.9 ? 3 : 1) * (o.o.cls === 5 ? 0.35 : o.o.cls <= 3 ? 1.6 : 1)]);
+      cand.push([o, (dot > 0.9 ? 3 : 1) * (o.o.cls === 5 ? 0.35 : o.o.cls <= 3 ? 1.6 : 1) * (TW.deadEndAhead(o) ? 0.03 : 1)]);   // 盡頭沒路接的少走
     }
     if (cand.length) best = pickW(cand);
+    else {   // 只剩急轉 (單行道尾端接 V 字路口): 挑最順的那條，總比停在路尾擋路好
+      let bd = -1e9;
+      for (const o of opts) { const dot = hx * o.hx + hy * o.hy; if (dot > bd) { bd = dot; best = o; } }
+    }
   }
   if (!best) return null;
   const dot = hx * best.hx + hy * best.hy, cross = hx * best.hy - hy * best.hx;
@@ -3582,11 +3665,12 @@ function eachOther(me, fn) {
   if (me !== PLAYER) fn(syncPlayer());
 }
 /** 前車: shift = 目標車道相對目前位置的橫向位移 (行進方向左正)；一般道路另外檢查路口橫向來車 */
+const onRing = (w) => !!(w && w.city && w.name && w.name.includes('圓環'));   // 圓環 (路名有「圓環」的一般道路)
 function leaderFor(me, shift) {
   const fx = Math.cos(me.h), fy = Math.sin(me.h);
   const lo = Math.min(0, shift), hi = Math.max(0, shift);
   const inCity = me.w && me.w.city;
-  let gap = 1e9, vl = 40;
+  let gap = 1e9, vl = 40, who = null, why = 0;   // who / why: 測試追蹤用 (誰擋住、1 跟車 2 路口讓車)
   eachOther(me, (o) => {
     if (Math.abs(o.z - me.z) > 3) return;
     const dx = o.x - me.x, dy = o.y - me.y;
@@ -3599,17 +3683,22 @@ function leaderFor(me, shift) {
     if (cs >= 0.3) {
       if (d <= 0 || d > 160) return;
       if (meStuck && oStuck && cs < 0.9 && (o.id < me.id || (me.stuck || 0) > 12)) return;
-      const hw = (me.wid + o.wid) / 2 + 0.05;
+      // 前車斜著 (正在轉彎、換路段) 時車身橫向佔得比較寬: 用轉過的車身寬度算，不然後車看不到、直接追撞 (基隆義一路→中正路)
+      const sn = Math.sqrt(Math.max(0, 1 - cs * cs));
+      const hw = (me.wid + o.wid * cs + (o.front + o.rear) * sn) / 2 + 0.05;
       if (lat < lo - hw || lat > hi + hw) return;
       const g = d - me.front - o.rear;
-      if (g < gap) { gap = g; vl = Math.max(0, o.v * cs); }
+      if (g < gap) { gap = g; vl = Math.max(0, o.v * cs); who = o; why = 1; }
     } else if (inCity && Math.abs(cs) < 0.75 && d > 1 && d < 22 && Math.abs(lat) < 7) {
       // 路口: 橫向來車在前方，對方在動 (或編號較小) 就讓
       if (meStuck && oStuck) return;
-      if (o.v > 1.5 || o.id < me.id) { const g = d - me.front - 2; if (g < gap) { gap = g; vl = 0; } }
+      // 圓環: 環道內的車先行，不讓還沒進圓環的車 (以前環道裡的車一直讓路口進來的車，整個圓環塞死，例如台北東門圓環)
+      if (onRing(me.w) && !onRing(o.w)) return;
+      // 玩家沒有編號 (o.id undefined 比大小永遠 false): 以前玩家停在路口時 AI 不讓、直接撞上來。AI 一律讓玩家
+      if (o.isPlayer || o.v > 1.5 || o.id < me.id) { const g = d - me.front - 2; if (g < gap) { gap = g; vl = 0; who = o; why = 2; } }
     }
   });
-  return { gap, v: vl };
+  return { gap, v: vl, who, why };
 }
 /** 目標車道安全嗎: 前後留距離；附近有車要切進同一車道也先不切 */
 function laneSafeFor(me, shift) {
@@ -3749,8 +3838,9 @@ function trailPoint(tr, x, y, dist) {
 }
 
 let bumpCooldown = 0;
+let touchClock = 0;
 function collidePlayer(dt) {
-  bumpCooldown -= dt;
+  bumpCooldown -= dt; touchClock += dt;
   const pl = syncPlayer();
   const fx = Math.cos(S.h), fy = Math.sin(S.h);
   const pOff = (pl.front - pl.rear) / 2, pHalf = (pl.front + pl.rear) / 2;
@@ -3770,17 +3860,26 @@ function collidePlayer(dt) {
     if (Math.abs(ax) >= hl || Math.abs(ay) >= hw) continue;
     const px = hl - Math.abs(ax), py = hw - Math.abs(ay);
     let nx = S.x, ny = S.y;
-    if (px < py) {
+    // 對向會車只擦到一點邊 (窄的雙向道、大車): 當側面擦撞往旁邊推開；不然第一幀縱向重疊比較小，會被當成正面撞、被對向車推著倒退
+    const passing = Math.cos(c.h - S.h) < -0.5 && py < 0.9;
+    if (px < py && !passing) {
       const sg = Math.sign(ax) || 1;
       nx -= fx * sg * px; ny -= fy * sg * px;
-      if (ax > 0) S.v = Math.min(S.v, c.v * Math.cos(c.h - S.h) * 0.9); else S.v = Math.max(S.v, c.v * 0.9);
+      // 正面撞上: 最多被往後推一點 (以前直接變成對向車速的反方向，對撞公車會被推著倒退 45 km/h)
+      if (ax > 0) S.v = Math.min(S.v, Math.max(-1, c.v * Math.cos(c.h - S.h) * 0.9)); else S.v = Math.max(S.v, c.v * 0.9);
     } else {
       const sg = Math.sign(ay) || 1;
       nx += fy * sg * py; ny -= fx * sg * py;
       S.v *= 0.97;
     }
     if (TW.roadAt(nx, ny, S.z, 0.5)) { S.x = nx; S.y = ny; }
-    if (bumpCooldown <= 0) { bumpCooldown = 0.6; stats.bumps++; sound.bump(); }
+    // 同一台車一直貼著 (路口互卡、排隊) 只算一次碰撞、響一次；離開 0.5 秒以上再碰到才算新的一次
+    const fresh = touchClock - (c.touchAt ?? -9) > 0.5;
+    c.touchAt = touchClock;
+    if (fresh && bumpCooldown <= 0) {
+      bumpCooldown = 0.6; stats.bumps++; sound.bump();
+      if (TW.params.has('bumpdbg')) console.log('[bump]', c.type, 'front/side', px < py ? (ax > 0 ? 'front' : 'rear') : 'side', 'dh', Math.round(((c.h - S.h) * 180 / Math.PI) % 360), 'v', (S.v * 3.6).toFixed(0), 'ai v', (c.v * 3.6).toFixed(0), 'ai w', c.w.k, c.w.name || '', 'me', S.road ? S.road.w.k + ' ' + (S.road.w.name || '') : '-', 'ai plan', c.plan ? (c.plan.none ? 'none' : c.plan.o.k) : '-', 'pos', S.x.toFixed(0), S.y.toFixed(0));
+    }
   }
 }
 
@@ -3844,13 +3943,19 @@ function updateTraffic(dt) {
     lowWas = lowT > 0 ? lowT : lowWas;
     if (fwyLv >= 3) lowWas = 0;
     seedLv = fwyLv;
-    let n = 0;
+    // 空車位 (之前生不出來) 跟要回收的活車分開算額度: 不然生車點少的地方 (基隆市區) 空車位每輪都先用光 4 個額度，卡死的車永遠收不掉
+    let n = 0, nDead = 0;
     for (const c of cars) {
-      const d = c.alive ? Math.hypot(c.x - S.x, c.y - S.y) : 1e9;
+      if (!c.alive) {
+        if (nDead++ < 4) { if (c.pool === 'city') trySpawn(c, 'city', 280, 550); else trySpawn(c, 'fwy', FWY_R[fwyLv][0], FWY_R[fwyLv][1]); }
+        continue;
+      }
+      const d = Math.hypot(c.x - S.x, c.y - S.y);
       const behind = c.alive && (c.x - S.x) * Math.cos(S.h) + (c.y - S.y) * Math.sin(S.h) < -25;
       const FR = FWY_R[fwyLv];
       const far = c.pool === 'city' ? (d > 650 || (c.deadEnd && (d > 80 || behind))) : (d > FR[2] || (c.deadEnd && d > Math.min(700, FR[1])));
-      const jam = ((c.stuck || 0) > 8 && (d > 120 || behind)) || (c.stuck || 0) > 25;   // 卡死的車: 停 8 秒就在看不到的地方回收，卡太久直接回收
+      // 開到死路 (單行道尾端沒路接) 的車停 5 秒就回收，不然後面的車 (包括玩家) 會一直排在它後面
+      const jam = ((c.stuck || 0) > 8 && (d > 120 || behind)) || (c.stuck || 0) > 25 || (c.deadEnd && (c.stuck || 0) > 5);   // 卡死的車: 停 8 秒就在看不到的地方回收，卡太久直接回收
       if (jam && !far) stats.unjam = (stats.unjam || 0) + 1;
       if ((far || jam) && n++ < 4) {
         kill(c);
@@ -3937,7 +4042,7 @@ function splitLines(t) {
 const COLS = 192, ROWS = 60, PITCH = 4;
 function boardCanvas(p) {
   const lo = document.createElement('canvas'); lo.width = COLS; lo.height = ROWS;
-  const lx = lo.getContext('2d'), lines = splitLines(p.text), col = pageColor(p);
+  const lx = lo.getContext('2d', { willReadFrequently: true }), lines = splitLines(p.text), col = pageColor(p);   // 只拿來讀像素: CPU 畫布，不用每次從 GPU 讀回
   let fs = lines.length > 1 ? 26 : 34;
   const font = (n) => '700 ' + n + 'px "PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif';
   lx.font = font(fs);
@@ -4108,7 +4213,7 @@ async function pollCms() {
           if (sg.model && pages.length) { const t = sg.model.faceMat.map; t.image = boardCanvas(pages[0]); t.needsUpdate = true; }
         }
       }
-      wait = Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500);
+      wait = Math.max(5000, Math.min(30000, (j.data.nextUpdateIn || 30000) + Math.random() * 1500));   // 至少隔 5 秒 (後端回 0 或負數時不要每秒狂抓)
     }
   } catch (e) { /* 沿用快照 */ }
   setTimeout(pollCms, wait);
@@ -4514,6 +4619,12 @@ const sound = (() => {
   const unlock = () => { init(); if (ac.state === 'suspended') ac.resume(); if (!jointBufs) jointBufs = makeJointBufs(); };
   window.addEventListener('keydown', unlock, { once: false });
   window.addEventListener('pointerdown', unlock, { once: false });
+  // 切到別的分頁: 畫面停了但 AudioContext 會照最後的參數一直響 (引擎聲嗡嗡叫)，跟著暫停 / 回來再繼續
+  document.addEventListener('visibilitychange', () => {
+    if (!ac) return;
+    if (document.visibilityState === 'hidden') { if (ac.state === 'running') ac.suspend(); }
+    else if (ac.state === 'suspended' && enabled) ac.resume();
+  });
   if (TW.params.has('audiotest')) { unlock(); setTimeout(() => { let err = null; try { for (let i = 0; i < 6; i++) knock(10 + i * 5, i & 1); } catch (e) { err = String(e); } console.log('[audiotest] knock ok', !err, err || '', 'bufs', jointBufs ? jointBufs.length : 0, 'state', ac.state); }, 500); }
   return { update, bump, knock, blinker, toggle, get on() { return enabled; } };
 })();
@@ -5175,6 +5286,11 @@ const sfx = (() => {
     src.connect(hp); hp.connect(lp); lp.connect(rainG); rainG.connect(ac.destination); src.start();
   };
   window.addEventListener('keydown', init); window.addEventListener('pointerdown', init);
+  // 切到別的分頁時雨聲不要一直下 (畫面停了，雨量不會再更新)
+  document.addEventListener('visibilitychange', () => {
+    if (!ac) return;
+    if (document.visibilityState === 'hidden') { if (ac.state === 'running') ac.suspend(); } else if (ac.state === 'suspended') ac.resume();
+  });
   function tone(f, t0, dur, vol = 0.12, type = 'sine') {
     if (!ac) return;
     const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime + t0;
@@ -5203,12 +5319,12 @@ const sfx = (() => {
 const WMODES = [['即時', null], ['晴', [0, 0, 0]], ['陰', [0.8, 0, 0]], ['小雨', [0.85, 0.35, 0.05]], ['大雨', [1, 1, 0.15]], ['起霧', [0.55, 0, 1]], ['雨霧', [0.95, 0.5, 0.7]]];
 const weather = (() => {
   const W = TW.WEATHER;
-  let mode = store.get('tw_weather', 0), live = [0, 0, 0], liveAt = 0, liveTxt = '', cur = [0, 0, 0];
+  let mode = store.get('tw_weather', 0), live = [0, 0, 0], liveAt = 0, liveTxt = '', cur = [0, 0, 0], liveX = 0, liveY = 0;
   if (TW.params.get('weather')) { const i = WMODES.findIndex((m) => m[0] === TW.params.get('weather')); if (i >= 0) mode = i; }
   const target = () => WMODES[mode][1] || live;
   async function fetchLive() {
     if (TEST) return;
-    liveAt = performance.now();
+    liveAt = performance.now(); liveX = S.x; liveY = S.y;
     try {
       const [lat, lon] = TWX.gpsSync.toLatLon(S.x, S.y);
       const u = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(2)}&longitude=${lon.toFixed(2)}&current=precipitation,cloud_cover,visibility,weather_code`;
@@ -5242,7 +5358,8 @@ const weather = (() => {
     // 下雨慢慢變濕，停雨慢慢變乾
     W.wet.value = Math.max(0, Math.min(1, W.wet.value + (rain > 0.05 ? (0.04 + rain * 0.25) * dt : -0.012 * dt)));
     if (Math.abs(W.over - over) > 0.01 || Math.abs(W.fog - fog) > 0.01 || Math.abs(W.rain - rain) > 0.01) { W.over = over; W.fog = fog; W.rain = rain; W.dirty = true; }
-    if (mode === 0 && performance.now() - liveAt > 600000) fetchLive();
+    // 即時天氣: 10 分鐘更新一次；傳送 / 開到 20 km 外 (例如台北 → 宜蘭) 就提早重抓 (至少隔 1 分鐘)
+    if (mode === 0 && (performance.now() - liveAt > 600000 || (performance.now() - liveAt > 60000 && Math.hypot(S.x - liveX, S.y - liveY) > 20000))) fetchLive();
     // 雨滴
     const cam = TW.camera.position;
     cv.copy(cam).sub(lastCam).divideScalar(Math.max(dt, 1e-3)); lastCam.copy(cam);
@@ -5272,8 +5389,9 @@ const weather = (() => {
     if (inside) wiperFrame(dt, rain);
   }
   function wiperFrame(dt, rain) {
-    const Wd = wcv.width = Math.round(window.innerWidth / 2), Hd = wcv.height = Math.round(window.innerHeight / 2);
-    wcv.style.width = '100%'; wcv.style.height = '100%';
+    // 畫布大小有變才重設 (每幀設 width 會重新配置整張畫布)
+    const Wd = Math.round(window.innerWidth / 2), Hd = Math.round(window.innerHeight / 2);
+    if (wcv.width !== Wd || wcv.height !== Hd) { wcv.width = Wd; wcv.height = Hd; wcv.style.width = '100%'; wcv.style.height = '100%'; }
     // 雨珠: 雨越大、車越快越多
     const rate = rain * (60 + kmh() * 1.2);
     for (let k = 0; k < rate * dt; k++) if (drops.length < 500) drops.push({ x: Math.random() * Wd, y: Math.random() * Hd * 0.92, r: 1.2 + Math.random() * 3.2 * (0.5 + rain), a: 0 });
@@ -5312,7 +5430,8 @@ const weather = (() => {
       const bx = px - Math.cos(wang) * L, by = Hd + 10 - Math.sin(wang) * L;
       wx.strokeStyle = 'rgba(8,8,10,0.97)'; wx.lineWidth = 6; wx.lineCap = 'round';   // 雨刷臂
       wx.beginPath(); wx.moveTo(px, Hd + 10); wx.lineTo(px - Math.cos(wang) * L * 0.6, Hd + 10 - Math.sin(wang) * L * 0.6); wx.stroke();
-      wx.strokeStyle = 'rgba(20,20,22,0.95)'; wx.lineWidth = 3.5; wx.beginPath();   // 雨刷片 wx.moveTo(px - Math.cos(wang) * L * 0.2, Hd + 10 - Math.sin(wang) * L * 0.2); wx.lineTo(bx, by); wx.stroke();
+      wx.strokeStyle = 'rgba(20,20,22,0.95)'; wx.lineWidth = 3.5; wx.beginPath();   // 雨刷片
+      wx.moveTo(px - Math.cos(wang) * L * 0.2, Hd + 10 - Math.sin(wang) * L * 0.2); wx.lineTo(bx, by); wx.stroke();
     }
   }
   if (mode === 0) setTimeout(fetchLive, 3000);
@@ -5338,7 +5457,7 @@ const cams = (() => {
   const GC = 600, grid = new Map();
   for (const c of list) { const k = Math.floor(c.x / GC) * 100003 + Math.floor(c.y / GC); let a = grid.get(k); if (!a) grid.set(k, a = []); a.push(c); }
   const near = (x, y) => { const out = [], cx = Math.floor(x / GC), cy = Math.floor(y / GC); for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (const c of grid.get((cx + i) * 100003 + cy + j) || []) out.push(c); return out; };
-  let on = store.get('tw_camwarn', true), tickets = store.get('tw_tickets', []), active = null, sec = null, clock = 0, odo = 0;
+  let on = store.get('tw_camwarn', true), tickets = store.get('tw_tickets', []), active = null, sec = null, clock = 0, odo = 0, gt = 0;
   const fineOf = (over) => over <= 20 ? 3000 : over <= 40 ? 4000 : over <= 60 ? 6000 : 12000;   // 參考: 國道超速罰鍰級距 (簡化)
   function ticket(spd, max, where) {
     const f = fineOf(spd - max);
@@ -5362,20 +5481,26 @@ const cams = (() => {
     const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; return t;
   })();
   const matSign = new T.MeshStandardMaterial({ map: signTex, emissiveMap: signTex, emissive: new T.Color(0.3, 0.3, 0.3), roughness: 0.5 });
-  function camModel(c, w, side) {
+  // 幾何共用 (模型移除時不必 dispose，也不會每建一次就多佔一份 GPU 記憶體)
+  const GEO = {
+    pole: new T.CylinderGeometry(0.12, 0.15, 6.2, 10), arm: new T.BoxGeometry(2.2, 0.12, 0.12), box: new T.BoxGeometry(0.5, 0.42, 0.75),
+    lens: new T.CylinderGeometry(0.11, 0.11, 0.06, 14), flash: new T.BoxGeometry(0.34, 0.2, 0.06),
+    post: new T.CylinderGeometry(0.05, 0.05, 2.6, 8), plate: new T.PlaneGeometry(0.8, 1.0), back: new T.BoxGeometry(0.8, 1.0, 0.04),
+  };
+  function camModel() {
     const g = new T.Group();
-    const pole = new T.Mesh(new T.CylinderGeometry(0.12, 0.15, 6.2, 10), matPole); pole.position.set(0, 3.1, 0); g.add(pole);
-    const arm = new T.Mesh(new T.BoxGeometry(2.2, 0.12, 0.12), matPole); arm.position.set(-1.05, 5.9, 0); g.add(arm);
-    const bx = new T.Mesh(new T.BoxGeometry(0.5, 0.42, 0.75), matBox); bx.position.set(-1.9, 5.55, 0); g.add(bx);
-    const lens = new T.Mesh(new T.CylinderGeometry(0.11, 0.11, 0.06, 14), matLens); lens.rotation.x = Math.PI / 2; lens.position.set(-1.9, 5.55, 0.4); g.add(lens);
-    const fl = new T.Mesh(new T.BoxGeometry(0.34, 0.2, 0.06), matLens); fl.position.set(-1.9, 5.92, 0.36); g.add(fl);
+    const pole = new T.Mesh(GEO.pole, matPole); pole.position.set(0, 3.1, 0); g.add(pole);
+    const arm = new T.Mesh(GEO.arm, matPole); arm.position.set(-1.05, 5.9, 0); g.add(arm);
+    const bx = new T.Mesh(GEO.box, matBox); bx.position.set(-1.9, 5.55, 0); g.add(bx);
+    const lens = new T.Mesh(GEO.lens, matLens); lens.rotation.x = Math.PI / 2; lens.position.set(-1.9, 5.55, 0.4); g.add(lens);
+    const fl = new T.Mesh(GEO.flash, matLens); fl.position.set(-1.9, 5.92, 0.36); g.add(fl);
     return g;
   }
   function signModel() {
     const g = new T.Group();
-    const post = new T.Mesh(new T.CylinderGeometry(0.05, 0.05, 2.6, 8), matPole); post.position.y = 1.3; g.add(post);
-    const pl = new T.Mesh(new T.PlaneGeometry(0.8, 1.0), matSign); pl.position.set(0, 2.6, 0.06); g.add(pl);
-    const back = new T.Mesh(new T.BoxGeometry(0.8, 1.0, 0.04), matPole); back.position.set(0, 2.6, 0.02); g.add(back);
+    const post = new T.Mesh(GEO.post, matPole); post.position.y = 1.3; g.add(post);
+    const pl = new T.Mesh(GEO.plate, matSign); pl.position.set(0, 2.6, 0.06); g.add(pl);
+    const back = new T.Mesh(GEO.back, matPole); back.position.set(0, 2.6, 0.02); g.add(back);
     return g;
   }
   // 放在行進方向右側路肩: 物件 +z 面向來車
@@ -5391,7 +5516,7 @@ const cams = (() => {
     return true;
   }
   function frame(dt) {
-    odo += Math.abs(S.v) * dt;
+    odo += Math.abs(S.v) * dt; gt += dt;
     clock -= dt; if (clock > 0) return; clock = 0.2;
     const fx = Math.cos(S.h), fy = Math.sin(S.h);
     let best = null, bf = 1e9;
@@ -5399,10 +5524,11 @@ const cams = (() => {
       const dx = c.x - S.x, dy = c.y - S.y, d = Math.hypot(dx, dy);
       // 模型: 400 m 內、路段已載入才建
       if (!c.model && d < 450 && c.h != null) {
-        const m = camModel(c); if (placeRoadside(m, c.x, c.y, c.h, c.z)) { TW.scene.add(m); c.model = m; }
-        const sx = c.x - Math.cos(c.h) * 300, sy = c.y - Math.sin(c.h) * 300, s = signModel();
-        if (placeRoadside(s, sx, sy, c.h, c.z, 1.0)) { TW.scene.add(s); c.sign = s; }
-      } else if (c.model && d > 700) { TW.scene.remove(c.model); if (c.sign) TW.scene.remove(c.sign); c.model = c.sign = null; }
+        const m = camModel(); if (placeRoadside(m, c.x, c.y, c.h, c.z)) { TW.scene.add(m); c.model = m; }
+        // 警告牌只蓋一次 (相機那段路還沒載入時，下一輪會再試相機，但不能每 0.2 秒多蓋一面牌子)
+        if (!c.sign) { const sx = c.x - Math.cos(c.h) * 300, sy = c.y - Math.sin(c.h) * 300, s = signModel();
+          if (placeRoadside(s, sx, sy, c.h, c.z, 1.0)) { TW.scene.add(s); c.sign = s; } }
+      } else if ((c.model || c.sign) && d > 700) { if (c.model) TW.scene.remove(c.model); if (c.sign) TW.scene.remove(c.sign); c.model = c.sign = null; }
       if (Math.abs(c.z - S.z) > 8) continue;
       if (c.h != null && Math.cos(c.h - S.h) < 0.6) continue;           // 拍的是對向車道
       const f = dx * fx + dy * fy, l = Math.abs(-dx * fy + dy * fx);
@@ -5429,13 +5555,13 @@ const cams = (() => {
     if (!sec) {
       for (const q of secs) {
         if (Math.hypot(q.fx - S.x, q.fy - S.y) < 40 && Math.abs(q.fz - S.z) < 8 && Math.cos(q.h - S.h) > 0.5) {
-          sec = { q, t0: performance.now(), o0: odo };
+          sec = { q, t0: gt, o0: odo };
           if (on) { sfx.chime(); voice.say(`進入區間測速路段，限速${q.max}`); }
           break;
         }
       }
     } else {
-      const q = sec.q, t = (performance.now() - sec.t0) / 1000, dist = odo - sec.o0, avg = dist / Math.max(t, 1) * 3.6;
+      const q = sec.q, t = gt - sec.t0, dist = odo - sec.o0, avg = dist / Math.max(t, 1) * 3.6;
       const left = Math.hypot(q.tx - S.x, q.ty - S.y);
       if (on && !best) { camBox.className = avg > q.max ? 'over' : ''; camBox.innerHTML = `⏱ 區間測速 限速 ${q.max}<b>平均 ${Math.round(avg)}</b>剩 ${fmtD(left)}`; }
       if (left < 40 && Math.abs(q.tz - S.z) < 8) {
@@ -5483,6 +5609,15 @@ const distSigns = (() => {
     TW.scene.add(root);
     return root;
   }
+  // 移除牌子: 幾何、牌面貼圖與材質都要釋放 (每面牌子各有一張 CanvasTexture；共用的 backMat 不動)
+  function drop(d) {
+    TW.scene.remove(d.model);
+    d.model.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material && o.material !== G.backMat) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+    });
+    d.model = null;
+  }
   let clock = 0, exClock = 0;
   function frame(dt) {
     clock -= dt;
@@ -5490,10 +5625,10 @@ const distSigns = (() => {
       clock = 0.6; let built = 0;
       for (const d of D) {
         const w = TW.wayByGid(d.gid);
-        if (!w) { if (d.model) { TW.scene.remove(d.model); d.model = null; } continue; }
+        if (!w) { if (d.model) drop(d); continue; }
         const dd = Math.hypot(w.P[d.idx * 3] - S.x, w.P[d.idx * 3 + 1] - S.y);
         if (!d.model && dd < 1200 && built < 2) { d.model = build(d); built++; }
-        else if (d.model && dd > 1800) { TW.scene.remove(d.model); d.model.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); d.model = null; }
+        else if (d.model && dd > 1800) drop(d);
       }
     }
     // 下一個出口 (國道主線): 沿路往前找出口指示牌 (指示牌在分岔前 230 m)
@@ -5624,7 +5759,20 @@ function replan(first) {
   if (!N || !p || !route.dest) return false;
   route.lastPlan = performance.now();
   const t0 = performance.now();
-  const r = plan(N, p.g, p.s, p.dir, route.dest.g, route.dest.s);
+  let r = plan(N, p.g, p.s, p.dir, route.dest.g, route.dest.s);
+  if (!r && route.dest.x != null) {
+    // 目的地剛好在開不進去的路段上 (例如國3 起點前面沒有路接、資料斷掉的單行道): 改用 400 m 內開得到的其他路段當終點
+    const dx = route.dest.x, dy = route.dest.y, cand = [];
+    for (let g = 0; g < N.nw; g++) {
+      if (g === route.dest.g) continue;
+      const ax = N.wXY[g * 4] * 5, ay = N.wXY[g * 4 + 1] * 5, bx = N.wXY[g * 4 + 2] * 5, by = N.wXY[g * 4 + 3] * 5;
+      const L = Math.hypot(bx - ax, by - ay) || 1, t = Math.max(0, Math.min(1, ((dx - ax) * (bx - ax) + (dy - ay) * (by - ay)) / (L * L)));
+      const d = Math.hypot(ax + (bx - ax) * t - dx, ay + (by - ay) * t - dy);
+      if (d < 400) cand.push([d, g, t * N.wLen[g]]);
+    }
+    cand.sort((a, b) => a[0] - b[0]);
+    for (const [, g, s] of cand.slice(0, 10)) { r = plan(N, p.g, p.s, p.dir, g, s); if (r) { route.dest.g = g; route.dest.s = s; break; } }
+  }
   if (!r) { TW.toast('⚠ 找不到可以到達的路線'); route.r = null; route.dest = null; ribbon.clear(); return false; }
   route.r = r; route.cur = 0; route.off = 0; route.said = {};
   ribbon.dirty = true;
@@ -5831,6 +5979,7 @@ $('minimap').addEventListener('click', async (e) => {
 // ======================================================================= 任務
 const missions = (() => {
   let wallet = store.get('tw_wallet', 0), done = store.get('tw_done', 0), active = null;
+  let gt = 0;   // 遊戲時間 (切到別的分頁、畫面卡頓時不會白白扣送貨時間)
   const pay = (n, why) => { wallet += n; store.set('tw_wallet', wallet); if (n > 0) { sfx.coin(); done++; store.set('tw_done', done); } TW.toast(`${n >= 0 ? '💰 +' : '💸 '}NT$${Math.abs(n).toLocaleString()}　${why}`, 3500); };
   const bumps = () => (TWX.stats.bumps || 0);
   async function pickDest(minKm, maxKm, kinds) {
@@ -5854,11 +6003,13 @@ const missions = (() => {
       const d = await pickDest(4, 25, ['place', 'station', 'exit', 'services']);
       if (!d) { TW.toast('附近找不到目的地'); return; }
       fixS(d);
-      active = { kind, title: '📦 送貨', dest: d, t0: performance.now(), b0: bumps(), tickets: 0 };
-      if (!(await navigateTo(d, { onArrive: finish, color: 0x3fd07a }))) { active = null; return; }
-      active.limit = route.r.time * 1.4 + 60;
-      active.km = route.r.len / 1000;
-      voice.say(`送貨任務，送到${d.name}，限時${Math.round(active.limit / 60)}分鐘`);
+      const a = active = { kind, title: '📦 送貨', dest: d, t0: gt, b0: bumps(), tickets: 0 };
+      const ok = await navigateTo(d, { onArrive: finish, color: 0x3fd07a });
+      if (active !== a) return;   // 算路線途中按了放棄 / 開了別的任務
+      if (!ok || !route.r) { active = null; render(); return; }
+      a.limit = route.r.time * 1.4 + 60; a.t0 = gt;
+      a.km = route.r.len / 1000;
+      voice.say(`送貨任務，送到${d.name}，限時${Math.round(a.limit / 60)}分鐘`);
     } else if (kind === 'taxi') {
       // 乘客在附近 (已載入的一般道路，前方 200~1200 m)
       const cand = [];
@@ -5873,7 +6024,9 @@ const missions = (() => {
       const pk = { g: w.gid, s: w.s[i], x: w.P[i * 3], y: w.P[i * 3 + 1], name: '乘客 (' + (w.name || '路邊') + ')' };
       active = { kind, title: '🚕 計程車載客', stage: 'pickup', pk, t0: performance.now(), b0: bumps(), tickets: 0, odo: 0, slow: 0, hold: 0 };
       if (S.vtype !== 'taxi') TW.toast('提示：按 G 或選單換成計程車更有感覺', 2500);
+      const a = active;
       await navigateTo(pk, { color: 0xf2c200, quiet: true });
+      if (active !== a) return;
       voice.say('有乘客叫車，請到路邊載客');
     } else if (kind === 'legal') {
       active = { kind, title: '👮 守法駕駛', need: 8000, odo: 0, over: 0, b0: bumps(), tickets: 0, t0: performance.now() };
@@ -5884,7 +6037,7 @@ const missions = (() => {
   function finish() {
     const a = active; if (!a) return;
     if (a.kind === 'deliver') {
-      const t = (performance.now() - a.t0) / 1000, left = a.limit - t, hits = bumps() - a.b0;
+      const t = gt - a.t0, left = a.limit - t, hits = bumps() - a.b0;
       if (left < 0) { pay(0, '送貨超時，沒有報酬'); }
       else pay(Math.max(100, Math.round(300 + a.km * 60 + left * 2 - hits * 80 - a.tickets * 500)), `送達 ${a.dest.name}（剩 ${fmtT(left)}，碰撞 ${hits}）`);
       active = null;
@@ -5900,6 +6053,7 @@ const missions = (() => {
   function abort(silent) { if (!active) return; if (navActive()) stopNav(); active = null; if (!silent) TW.toast('任務已放棄'); render(); }
   let clock = 0;
   function frame(dt) {
+    gt += dt;
     const a = active; if (!a) return;
     if (a.kind === 'taxi') {
       if (a.stage === 'ride') { a.odo += Math.abs(S.v) * dt; if (kmh() < 5) a.slow += dt; }
@@ -5928,20 +6082,24 @@ const missions = (() => {
   }
   function render() {
     const a = active;
-    if (!a) { missionBox.classList.add('hidden'); return; }
+    if (!a) { missionBox.classList.add('hidden'); missionBox._for = null; return; }
     missionBox.classList.remove('hidden');
     let body = '';
     if (a.kind === 'deliver') {
-      const t = (performance.now() - a.t0) / 1000, left = (a.limit || 0) - t;
-      body = `送到 <b>${a.dest.name}</b><div class="big" style="color:${left < 30 ? '#ff5a4a' : '#fff'}">${fmtT(left)}</div>碰撞 ${bumps() - a.b0}　罰單 ${a.tickets}`;
+      const t = gt - a.t0, left = a.limit ? a.limit - t : 0;
+      body = !a.limit ? `送到 <b>${a.dest.name}</b><br>規劃路線中…` : `送到 <b>${a.dest.name}</b><div class="big" style="color:${left < 30 ? '#ff5a4a' : '#fff'}">${fmtT(left)}</div>碰撞 ${bumps() - a.b0}　罰單 ${a.tickets}`;
     } else if (a.kind === 'taxi') {
       body = a.stage === 'pickup' ? `到路邊載客：<b>${a.pk.name}</b><br>靠近後停車 (時速 5 以下)`
         : a.stage === 'boarding' ? '乘客上車中…' : `送乘客到 <b>${a.dest.name}</b><div class="big">NT$ ${taxiFare(a)}</div>${(a.odo / 1000).toFixed(2)} 公里`;
     } else if (a.kind === 'legal') {
       body = `連續 8 公里不超速 (速限 +5 內)、不碰撞<div class="bar"><i style="width:${Math.min(100, a.odo / a.need * 100)}%"></i></div>${(a.odo / 1000).toFixed(2)} / 8 公里${a.over > 0 ? '　<b style="color:#ff5a4a">超速！</b>' : ''}`;
     }
-    missionBox.innerHTML = `<h4>${a.title}</h4>${body}<br><button id="ms-abort">放棄任務</button>`;
-    $('ms-abort').onclick = () => abort();
+    if (missionBox._for !== a) {
+      missionBox._for = a;
+      missionBox.innerHTML = `<h4>${a.title}</h4><div id="ms-body"></div><button id="ms-abort">放棄任務</button>`;
+      $('ms-abort').onclick = () => abort();
+    }
+    $('ms-body').innerHTML = body;
   }
   // ETC 等扣款: 不算完成任務、不跳金額提示 (由呼叫端自己顯示)
   const charge = (n) => { wallet -= n; store.set('tw_wallet', wallet); };
@@ -5963,7 +6121,8 @@ const etc = (() => {
     arr.forEach((g, i) => { const p = inc ? arr[i - 1] : arr[i + 1]; seg.set(g.id, p ? Math.min(15000, Math.max(500, Math.abs(g.m - p.m))) : 2000); });
   }
   const RATE = { small: [1.2, 0.9], big: [1.5, 1.13], trailer: [1.8, 1.35] };
-  const cls = () => ['citybus', 'coach', 'boxtruck', 'minibus'].includes(S.vtype) ? 'big' : ['bigtruck', 'semi'].includes(S.vtype) ? 'trailer' : 'small';
+  // 車種 (高公局): 小型車 = 小客車、小貨車 (3.5 噸貨車總重 3.5 噸以下算小貨車)；大型車 = 大客車、大貨車；聯結車 = 聯結車
+  const cls = () => ['citybus', 'coach', 'minibus', 'bigtruck'].includes(S.vtype) ? 'big' : S.vtype === 'semi' ? 'trailer' : 'small';
   const today = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' });
   let day = store.get('tw_etc', null);
   const fresh = () => { if (!day || day.d !== today()) day = { d: today(), km: { small: 0, big: 0, trailer: 0 }, paid: 0, n: 0 }; return day; };
@@ -5985,7 +6144,8 @@ const etc = (() => {
     if (last && last.gid === w.gid) odo += Math.abs(s - last.s);
     if (gs && last && last.gid === w.gid && Math.abs(s - last.s) < 60 && s > last.s) {   // 只算順向通過
       for (const g of gs) {
-        const at = w.s[Math.min(g.idx, w.n - 1)];
+        // 門架剛好在路段頭尾: 車子在端點附近就會換到下一段路，夾到離端點 3 公尺內才收得到
+        const len = w.s[w.n - 1], e = Math.min(3, len / 2), at = Math.min(Math.max(w.s[Math.min(g.idx, w.n - 1)], e), len - e);
         if (last.s < at && s >= at && !(odo - (recent.get(g.id) ?? -1e9) < 2000)) { recent.set(g.id, odo); pass(g); }
       }
     }

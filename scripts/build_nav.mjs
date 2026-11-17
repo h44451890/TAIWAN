@@ -86,6 +86,24 @@ for (const w of W) if (w) { endKeys.add(ptKey(w.P[0], w.P[1])); endKeys.add(ptKe
 const at = new Map();   // key -> [[gid, i, z], ...]
 const addAt = (key, g, i, z) => { let a = at.get(key); if (!a) at.set(key, a = []); if (!a.some((e) => e[0] === g && e[1] === i)) a.push([g, i, z]); };
 for (const w of W) if (w) for (let i = 0; i < w.n; i++) { const k = ptKey(w.P[i * 3], w.P[i * 3 + 1]); if (endKeys.has(k)) addAt(k, w.gid, i, w.P[i * 3 + 2]); }
+// 一般道路的點是「各路段自己的起點 + 0.1 m 整數位移」存的，同一個路口在不同路段上差幾公分、四捨五入常落到隔壁格子 (遊戲的 nodeLinks 同樣處理):
+// 端點的隔壁 8 格裡、20 公分內的點也算同一個路口 (兩邊至少一條是一般道路才需要；國道之間的點本來就完全一致)
+{
+  const cityEnd = new Map();   // key -> [[x, y, 一般道路?]] (路段端點)
+  for (const w of W) if (w) for (const e of [0, w.n - 1]) {
+    const k = ptKey(w.P[e * 3], w.P[e * 3 + 1]); let a = cityEnd.get(k); if (!a) cityEnd.set(k, a = []); a.push([w.P[e * 3], w.P[e * 3 + 1], w.city]);
+  }
+  let snapped = 0;
+  for (const w of W) if (w) for (let i = 0; i < w.n; i++) {
+    const x = w.P[i * 3], y = w.P[i * 3 + 1], gx = Math.round(x * 10), gy = Math.round(y * 10);
+    for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+      if (!ox && !oy) continue;
+      const k = (gx + ox) + ',' + (gy + oy), a = cityEnd.get(k);
+      if (a && a.some(([ex, ey, ec]) => (ec || w.city) && Math.hypot(ex - x, ey - y) < 0.2)) { const n0 = (at.get(k) || []).length; addAt(k, w.gid, i, w.P[i * 3 + 2]); if ((at.get(k) || []).length > n0) snapped++; }
+    }
+  }
+  console.log('snap links', snapped);
+}
 for (const [g, e, , mg, mi] of ramps) {
   const w = W[g], m = W[mg];
   if (!w || !m || mi < 0 || mi >= m.n) continue;

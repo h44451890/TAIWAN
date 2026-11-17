@@ -83,6 +83,11 @@ const sfx = (() => {
     src.connect(hp); hp.connect(lp); lp.connect(rainG); rainG.connect(ac.destination); src.start();
   };
   window.addEventListener('keydown', init); window.addEventListener('pointerdown', init);
+  // 切到別的分頁時雨聲不要一直下 (畫面停了，雨量不會再更新)
+  document.addEventListener('visibilitychange', () => {
+    if (!ac) return;
+    if (document.visibilityState === 'hidden') { if (ac.state === 'running') ac.suspend(); } else if (ac.state === 'suspended') ac.resume();
+  });
   function tone(f, t0, dur, vol = 0.12, type = 'sine') {
     if (!ac) return;
     const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime + t0;
@@ -111,12 +116,12 @@ const sfx = (() => {
 const WMODES = [['即時', null], ['晴', [0, 0, 0]], ['陰', [0.8, 0, 0]], ['小雨', [0.85, 0.35, 0.05]], ['大雨', [1, 1, 0.15]], ['起霧', [0.55, 0, 1]], ['雨霧', [0.95, 0.5, 0.7]]];
 const weather = (() => {
   const W = TW.WEATHER;
-  let mode = store.get('tw_weather', 0), live = [0, 0, 0], liveAt = 0, liveTxt = '', cur = [0, 0, 0];
+  let mode = store.get('tw_weather', 0), live = [0, 0, 0], liveAt = 0, liveTxt = '', cur = [0, 0, 0], liveX = 0, liveY = 0;
   if (TW.params.get('weather')) { const i = WMODES.findIndex((m) => m[0] === TW.params.get('weather')); if (i >= 0) mode = i; }
   const target = () => WMODES[mode][1] || live;
   async function fetchLive() {
     if (TEST) return;
-    liveAt = performance.now();
+    liveAt = performance.now(); liveX = S.x; liveY = S.y;
     try {
       const [lat, lon] = TWX.gpsSync.toLatLon(S.x, S.y);
       const u = `https://api.open-meteo.com/v1/forecast?latitude=${lat.toFixed(2)}&longitude=${lon.toFixed(2)}&current=precipitation,cloud_cover,visibility,weather_code`;
@@ -150,7 +155,8 @@ const weather = (() => {
     // 下雨慢慢變濕，停雨慢慢變乾
     W.wet.value = Math.max(0, Math.min(1, W.wet.value + (rain > 0.05 ? (0.04 + rain * 0.25) * dt : -0.012 * dt)));
     if (Math.abs(W.over - over) > 0.01 || Math.abs(W.fog - fog) > 0.01 || Math.abs(W.rain - rain) > 0.01) { W.over = over; W.fog = fog; W.rain = rain; W.dirty = true; }
-    if (mode === 0 && performance.now() - liveAt > 600000) fetchLive();
+    // 即時天氣: 10 分鐘更新一次；傳送 / 開到 20 km 外 (例如台北 → 宜蘭) 就提早重抓 (至少隔 1 分鐘)
+    if (mode === 0 && (performance.now() - liveAt > 600000 || (performance.now() - liveAt > 60000 && Math.hypot(S.x - liveX, S.y - liveY) > 20000))) fetchLive();
     // 雨滴
     const cam = TW.camera.position;
     cv.copy(cam).sub(lastCam).divideScalar(Math.max(dt, 1e-3)); lastCam.copy(cam);
@@ -180,8 +186,9 @@ const weather = (() => {
     if (inside) wiperFrame(dt, rain);
   }
   function wiperFrame(dt, rain) {
-    const Wd = wcv.width = Math.round(window.innerWidth / 2), Hd = wcv.height = Math.round(window.innerHeight / 2);
-    wcv.style.width = '100%'; wcv.style.height = '100%';
+    // 畫布大小有變才重設 (每幀設 width 會重新配置整張畫布)
+    const Wd = Math.round(window.innerWidth / 2), Hd = Math.round(window.innerHeight / 2);
+    if (wcv.width !== Wd || wcv.height !== Hd) { wcv.width = Wd; wcv.height = Hd; wcv.style.width = '100%'; wcv.style.height = '100%'; }
     // 雨珠: 雨越大、車越快越多
     const rate = rain * (60 + kmh() * 1.2);
     for (let k = 0; k < rate * dt; k++) if (drops.length < 500) drops.push({ x: Math.random() * Wd, y: Math.random() * Hd * 0.92, r: 1.2 + Math.random() * 3.2 * (0.5 + rain), a: 0 });
@@ -220,7 +227,8 @@ const weather = (() => {
       const bx = px - Math.cos(wang) * L, by = Hd + 10 - Math.sin(wang) * L;
       wx.strokeStyle = 'rgba(8,8,10,0.97)'; wx.lineWidth = 6; wx.lineCap = 'round';   // 雨刷臂
       wx.beginPath(); wx.moveTo(px, Hd + 10); wx.lineTo(px - Math.cos(wang) * L * 0.6, Hd + 10 - Math.sin(wang) * L * 0.6); wx.stroke();
-      wx.strokeStyle = 'rgba(20,20,22,0.95)'; wx.lineWidth = 3.5; wx.beginPath();   // 雨刷片 wx.moveTo(px - Math.cos(wang) * L * 0.2, Hd + 10 - Math.sin(wang) * L * 0.2); wx.lineTo(bx, by); wx.stroke();
+      wx.strokeStyle = 'rgba(20,20,22,0.95)'; wx.lineWidth = 3.5; wx.beginPath();   // 雨刷片
+      wx.moveTo(px - Math.cos(wang) * L * 0.2, Hd + 10 - Math.sin(wang) * L * 0.2); wx.lineTo(bx, by); wx.stroke();
     }
   }
   if (mode === 0) setTimeout(fetchLive, 3000);
@@ -246,7 +254,7 @@ const cams = (() => {
   const GC = 600, grid = new Map();
   for (const c of list) { const k = Math.floor(c.x / GC) * 100003 + Math.floor(c.y / GC); let a = grid.get(k); if (!a) grid.set(k, a = []); a.push(c); }
   const near = (x, y) => { const out = [], cx = Math.floor(x / GC), cy = Math.floor(y / GC); for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (const c of grid.get((cx + i) * 100003 + cy + j) || []) out.push(c); return out; };
-  let on = store.get('tw_camwarn', true), tickets = store.get('tw_tickets', []), active = null, sec = null, clock = 0, odo = 0;
+  let on = store.get('tw_camwarn', true), tickets = store.get('tw_tickets', []), active = null, sec = null, clock = 0, odo = 0, gt = 0;
   const fineOf = (over) => over <= 20 ? 3000 : over <= 40 ? 4000 : over <= 60 ? 6000 : 12000;   // 參考: 國道超速罰鍰級距 (簡化)
   function ticket(spd, max, where) {
     const f = fineOf(spd - max);
@@ -270,20 +278,26 @@ const cams = (() => {
     const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; return t;
   })();
   const matSign = new T.MeshStandardMaterial({ map: signTex, emissiveMap: signTex, emissive: new T.Color(0.3, 0.3, 0.3), roughness: 0.5 });
-  function camModel(c, w, side) {
+  // 幾何共用 (模型移除時不必 dispose，也不會每建一次就多佔一份 GPU 記憶體)
+  const GEO = {
+    pole: new T.CylinderGeometry(0.12, 0.15, 6.2, 10), arm: new T.BoxGeometry(2.2, 0.12, 0.12), box: new T.BoxGeometry(0.5, 0.42, 0.75),
+    lens: new T.CylinderGeometry(0.11, 0.11, 0.06, 14), flash: new T.BoxGeometry(0.34, 0.2, 0.06),
+    post: new T.CylinderGeometry(0.05, 0.05, 2.6, 8), plate: new T.PlaneGeometry(0.8, 1.0), back: new T.BoxGeometry(0.8, 1.0, 0.04),
+  };
+  function camModel() {
     const g = new T.Group();
-    const pole = new T.Mesh(new T.CylinderGeometry(0.12, 0.15, 6.2, 10), matPole); pole.position.set(0, 3.1, 0); g.add(pole);
-    const arm = new T.Mesh(new T.BoxGeometry(2.2, 0.12, 0.12), matPole); arm.position.set(-1.05, 5.9, 0); g.add(arm);
-    const bx = new T.Mesh(new T.BoxGeometry(0.5, 0.42, 0.75), matBox); bx.position.set(-1.9, 5.55, 0); g.add(bx);
-    const lens = new T.Mesh(new T.CylinderGeometry(0.11, 0.11, 0.06, 14), matLens); lens.rotation.x = Math.PI / 2; lens.position.set(-1.9, 5.55, 0.4); g.add(lens);
-    const fl = new T.Mesh(new T.BoxGeometry(0.34, 0.2, 0.06), matLens); fl.position.set(-1.9, 5.92, 0.36); g.add(fl);
+    const pole = new T.Mesh(GEO.pole, matPole); pole.position.set(0, 3.1, 0); g.add(pole);
+    const arm = new T.Mesh(GEO.arm, matPole); arm.position.set(-1.05, 5.9, 0); g.add(arm);
+    const bx = new T.Mesh(GEO.box, matBox); bx.position.set(-1.9, 5.55, 0); g.add(bx);
+    const lens = new T.Mesh(GEO.lens, matLens); lens.rotation.x = Math.PI / 2; lens.position.set(-1.9, 5.55, 0.4); g.add(lens);
+    const fl = new T.Mesh(GEO.flash, matLens); fl.position.set(-1.9, 5.92, 0.36); g.add(fl);
     return g;
   }
   function signModel() {
     const g = new T.Group();
-    const post = new T.Mesh(new T.CylinderGeometry(0.05, 0.05, 2.6, 8), matPole); post.position.y = 1.3; g.add(post);
-    const pl = new T.Mesh(new T.PlaneGeometry(0.8, 1.0), matSign); pl.position.set(0, 2.6, 0.06); g.add(pl);
-    const back = new T.Mesh(new T.BoxGeometry(0.8, 1.0, 0.04), matPole); back.position.set(0, 2.6, 0.02); g.add(back);
+    const post = new T.Mesh(GEO.post, matPole); post.position.y = 1.3; g.add(post);
+    const pl = new T.Mesh(GEO.plate, matSign); pl.position.set(0, 2.6, 0.06); g.add(pl);
+    const back = new T.Mesh(GEO.back, matPole); back.position.set(0, 2.6, 0.02); g.add(back);
     return g;
   }
   // 放在行進方向右側路肩: 物件 +z 面向來車
@@ -299,7 +313,7 @@ const cams = (() => {
     return true;
   }
   function frame(dt) {
-    odo += Math.abs(S.v) * dt;
+    odo += Math.abs(S.v) * dt; gt += dt;
     clock -= dt; if (clock > 0) return; clock = 0.2;
     const fx = Math.cos(S.h), fy = Math.sin(S.h);
     let best = null, bf = 1e9;
@@ -307,10 +321,11 @@ const cams = (() => {
       const dx = c.x - S.x, dy = c.y - S.y, d = Math.hypot(dx, dy);
       // 模型: 400 m 內、路段已載入才建
       if (!c.model && d < 450 && c.h != null) {
-        const m = camModel(c); if (placeRoadside(m, c.x, c.y, c.h, c.z)) { TW.scene.add(m); c.model = m; }
-        const sx = c.x - Math.cos(c.h) * 300, sy = c.y - Math.sin(c.h) * 300, s = signModel();
-        if (placeRoadside(s, sx, sy, c.h, c.z, 1.0)) { TW.scene.add(s); c.sign = s; }
-      } else if (c.model && d > 700) { TW.scene.remove(c.model); if (c.sign) TW.scene.remove(c.sign); c.model = c.sign = null; }
+        const m = camModel(); if (placeRoadside(m, c.x, c.y, c.h, c.z)) { TW.scene.add(m); c.model = m; }
+        // 警告牌只蓋一次 (相機那段路還沒載入時，下一輪會再試相機，但不能每 0.2 秒多蓋一面牌子)
+        if (!c.sign) { const sx = c.x - Math.cos(c.h) * 300, sy = c.y - Math.sin(c.h) * 300, s = signModel();
+          if (placeRoadside(s, sx, sy, c.h, c.z, 1.0)) { TW.scene.add(s); c.sign = s; } }
+      } else if ((c.model || c.sign) && d > 700) { if (c.model) TW.scene.remove(c.model); if (c.sign) TW.scene.remove(c.sign); c.model = c.sign = null; }
       if (Math.abs(c.z - S.z) > 8) continue;
       if (c.h != null && Math.cos(c.h - S.h) < 0.6) continue;           // 拍的是對向車道
       const f = dx * fx + dy * fy, l = Math.abs(-dx * fy + dy * fx);
@@ -337,13 +352,13 @@ const cams = (() => {
     if (!sec) {
       for (const q of secs) {
         if (Math.hypot(q.fx - S.x, q.fy - S.y) < 40 && Math.abs(q.fz - S.z) < 8 && Math.cos(q.h - S.h) > 0.5) {
-          sec = { q, t0: performance.now(), o0: odo };
+          sec = { q, t0: gt, o0: odo };
           if (on) { sfx.chime(); voice.say(`進入區間測速路段，限速${q.max}`); }
           break;
         }
       }
     } else {
-      const q = sec.q, t = (performance.now() - sec.t0) / 1000, dist = odo - sec.o0, avg = dist / Math.max(t, 1) * 3.6;
+      const q = sec.q, t = gt - sec.t0, dist = odo - sec.o0, avg = dist / Math.max(t, 1) * 3.6;
       const left = Math.hypot(q.tx - S.x, q.ty - S.y);
       if (on && !best) { camBox.className = avg > q.max ? 'over' : ''; camBox.innerHTML = `⏱ 區間測速 限速 ${q.max}<b>平均 ${Math.round(avg)}</b>剩 ${fmtD(left)}`; }
       if (left < 40 && Math.abs(q.tz - S.z) < 8) {
@@ -391,6 +406,15 @@ const distSigns = (() => {
     TW.scene.add(root);
     return root;
   }
+  // 移除牌子: 幾何、牌面貼圖與材質都要釋放 (每面牌子各有一張 CanvasTexture；共用的 backMat 不動)
+  function drop(d) {
+    TW.scene.remove(d.model);
+    d.model.traverse((o) => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material && o.material !== G.backMat) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+    });
+    d.model = null;
+  }
   let clock = 0, exClock = 0;
   function frame(dt) {
     clock -= dt;
@@ -398,10 +422,10 @@ const distSigns = (() => {
       clock = 0.6; let built = 0;
       for (const d of D) {
         const w = TW.wayByGid(d.gid);
-        if (!w) { if (d.model) { TW.scene.remove(d.model); d.model = null; } continue; }
+        if (!w) { if (d.model) drop(d); continue; }
         const dd = Math.hypot(w.P[d.idx * 3] - S.x, w.P[d.idx * 3 + 1] - S.y);
         if (!d.model && dd < 1200 && built < 2) { d.model = build(d); built++; }
-        else if (d.model && dd > 1800) { TW.scene.remove(d.model); d.model.traverse((o) => { if (o.geometry) o.geometry.dispose(); }); d.model = null; }
+        else if (d.model && dd > 1800) drop(d);
       }
     }
     // 下一個出口 (國道主線): 沿路往前找出口指示牌 (指示牌在分岔前 230 m)
@@ -532,7 +556,20 @@ function replan(first) {
   if (!N || !p || !route.dest) return false;
   route.lastPlan = performance.now();
   const t0 = performance.now();
-  const r = plan(N, p.g, p.s, p.dir, route.dest.g, route.dest.s);
+  let r = plan(N, p.g, p.s, p.dir, route.dest.g, route.dest.s);
+  if (!r && route.dest.x != null) {
+    // 目的地剛好在開不進去的路段上 (例如國3 起點前面沒有路接、資料斷掉的單行道): 改用 400 m 內開得到的其他路段當終點
+    const dx = route.dest.x, dy = route.dest.y, cand = [];
+    for (let g = 0; g < N.nw; g++) {
+      if (g === route.dest.g) continue;
+      const ax = N.wXY[g * 4] * 5, ay = N.wXY[g * 4 + 1] * 5, bx = N.wXY[g * 4 + 2] * 5, by = N.wXY[g * 4 + 3] * 5;
+      const L = Math.hypot(bx - ax, by - ay) || 1, t = Math.max(0, Math.min(1, ((dx - ax) * (bx - ax) + (dy - ay) * (by - ay)) / (L * L)));
+      const d = Math.hypot(ax + (bx - ax) * t - dx, ay + (by - ay) * t - dy);
+      if (d < 400) cand.push([d, g, t * N.wLen[g]]);
+    }
+    cand.sort((a, b) => a[0] - b[0]);
+    for (const [, g, s] of cand.slice(0, 10)) { r = plan(N, p.g, p.s, p.dir, g, s); if (r) { route.dest.g = g; route.dest.s = s; break; } }
+  }
   if (!r) { TW.toast('⚠ 找不到可以到達的路線'); route.r = null; route.dest = null; ribbon.clear(); return false; }
   route.r = r; route.cur = 0; route.off = 0; route.said = {};
   ribbon.dirty = true;
@@ -739,6 +776,7 @@ $('minimap').addEventListener('click', async (e) => {
 // ======================================================================= 任務
 const missions = (() => {
   let wallet = store.get('tw_wallet', 0), done = store.get('tw_done', 0), active = null;
+  let gt = 0;   // 遊戲時間 (切到別的分頁、畫面卡頓時不會白白扣送貨時間)
   const pay = (n, why) => { wallet += n; store.set('tw_wallet', wallet); if (n > 0) { sfx.coin(); done++; store.set('tw_done', done); } TW.toast(`${n >= 0 ? '💰 +' : '💸 '}NT$${Math.abs(n).toLocaleString()}　${why}`, 3500); };
   const bumps = () => (TWX.stats.bumps || 0);
   async function pickDest(minKm, maxKm, kinds) {
@@ -762,11 +800,13 @@ const missions = (() => {
       const d = await pickDest(4, 25, ['place', 'station', 'exit', 'services']);
       if (!d) { TW.toast('附近找不到目的地'); return; }
       fixS(d);
-      active = { kind, title: '📦 送貨', dest: d, t0: performance.now(), b0: bumps(), tickets: 0 };
-      if (!(await navigateTo(d, { onArrive: finish, color: 0x3fd07a }))) { active = null; return; }
-      active.limit = route.r.time * 1.4 + 60;
-      active.km = route.r.len / 1000;
-      voice.say(`送貨任務，送到${d.name}，限時${Math.round(active.limit / 60)}分鐘`);
+      const a = active = { kind, title: '📦 送貨', dest: d, t0: gt, b0: bumps(), tickets: 0 };
+      const ok = await navigateTo(d, { onArrive: finish, color: 0x3fd07a });
+      if (active !== a) return;   // 算路線途中按了放棄 / 開了別的任務
+      if (!ok || !route.r) { active = null; render(); return; }
+      a.limit = route.r.time * 1.4 + 60; a.t0 = gt;
+      a.km = route.r.len / 1000;
+      voice.say(`送貨任務，送到${d.name}，限時${Math.round(a.limit / 60)}分鐘`);
     } else if (kind === 'taxi') {
       // 乘客在附近 (已載入的一般道路，前方 200~1200 m)
       const cand = [];
@@ -781,7 +821,9 @@ const missions = (() => {
       const pk = { g: w.gid, s: w.s[i], x: w.P[i * 3], y: w.P[i * 3 + 1], name: '乘客 (' + (w.name || '路邊') + ')' };
       active = { kind, title: '🚕 計程車載客', stage: 'pickup', pk, t0: performance.now(), b0: bumps(), tickets: 0, odo: 0, slow: 0, hold: 0 };
       if (S.vtype !== 'taxi') TW.toast('提示：按 G 或選單換成計程車更有感覺', 2500);
+      const a = active;
       await navigateTo(pk, { color: 0xf2c200, quiet: true });
+      if (active !== a) return;
       voice.say('有乘客叫車，請到路邊載客');
     } else if (kind === 'legal') {
       active = { kind, title: '👮 守法駕駛', need: 8000, odo: 0, over: 0, b0: bumps(), tickets: 0, t0: performance.now() };
@@ -792,7 +834,7 @@ const missions = (() => {
   function finish() {
     const a = active; if (!a) return;
     if (a.kind === 'deliver') {
-      const t = (performance.now() - a.t0) / 1000, left = a.limit - t, hits = bumps() - a.b0;
+      const t = gt - a.t0, left = a.limit - t, hits = bumps() - a.b0;
       if (left < 0) { pay(0, '送貨超時，沒有報酬'); }
       else pay(Math.max(100, Math.round(300 + a.km * 60 + left * 2 - hits * 80 - a.tickets * 500)), `送達 ${a.dest.name}（剩 ${fmtT(left)}，碰撞 ${hits}）`);
       active = null;
@@ -808,6 +850,7 @@ const missions = (() => {
   function abort(silent) { if (!active) return; if (navActive()) stopNav(); active = null; if (!silent) TW.toast('任務已放棄'); render(); }
   let clock = 0;
   function frame(dt) {
+    gt += dt;
     const a = active; if (!a) return;
     if (a.kind === 'taxi') {
       if (a.stage === 'ride') { a.odo += Math.abs(S.v) * dt; if (kmh() < 5) a.slow += dt; }
@@ -836,20 +879,24 @@ const missions = (() => {
   }
   function render() {
     const a = active;
-    if (!a) { missionBox.classList.add('hidden'); return; }
+    if (!a) { missionBox.classList.add('hidden'); missionBox._for = null; return; }
     missionBox.classList.remove('hidden');
     let body = '';
     if (a.kind === 'deliver') {
-      const t = (performance.now() - a.t0) / 1000, left = (a.limit || 0) - t;
-      body = `送到 <b>${a.dest.name}</b><div class="big" style="color:${left < 30 ? '#ff5a4a' : '#fff'}">${fmtT(left)}</div>碰撞 ${bumps() - a.b0}　罰單 ${a.tickets}`;
+      const t = gt - a.t0, left = a.limit ? a.limit - t : 0;
+      body = !a.limit ? `送到 <b>${a.dest.name}</b><br>規劃路線中…` : `送到 <b>${a.dest.name}</b><div class="big" style="color:${left < 30 ? '#ff5a4a' : '#fff'}">${fmtT(left)}</div>碰撞 ${bumps() - a.b0}　罰單 ${a.tickets}`;
     } else if (a.kind === 'taxi') {
       body = a.stage === 'pickup' ? `到路邊載客：<b>${a.pk.name}</b><br>靠近後停車 (時速 5 以下)`
         : a.stage === 'boarding' ? '乘客上車中…' : `送乘客到 <b>${a.dest.name}</b><div class="big">NT$ ${taxiFare(a)}</div>${(a.odo / 1000).toFixed(2)} 公里`;
     } else if (a.kind === 'legal') {
       body = `連續 8 公里不超速 (速限 +5 內)、不碰撞<div class="bar"><i style="width:${Math.min(100, a.odo / a.need * 100)}%"></i></div>${(a.odo / 1000).toFixed(2)} / 8 公里${a.over > 0 ? '　<b style="color:#ff5a4a">超速！</b>' : ''}`;
     }
-    missionBox.innerHTML = `<h4>${a.title}</h4>${body}<br><button id="ms-abort">放棄任務</button>`;
-    $('ms-abort').onclick = () => abort();
+    if (missionBox._for !== a) {
+      missionBox._for = a;
+      missionBox.innerHTML = `<h4>${a.title}</h4><div id="ms-body"></div><button id="ms-abort">放棄任務</button>`;
+      $('ms-abort').onclick = () => abort();
+    }
+    $('ms-body').innerHTML = body;
   }
   // ETC 等扣款: 不算完成任務、不跳金額提示 (由呼叫端自己顯示)
   const charge = (n) => { wallet -= n; store.set('tw_wallet', wallet); };
@@ -871,7 +918,8 @@ const etc = (() => {
     arr.forEach((g, i) => { const p = inc ? arr[i - 1] : arr[i + 1]; seg.set(g.id, p ? Math.min(15000, Math.max(500, Math.abs(g.m - p.m))) : 2000); });
   }
   const RATE = { small: [1.2, 0.9], big: [1.5, 1.13], trailer: [1.8, 1.35] };
-  const cls = () => ['citybus', 'coach', 'boxtruck', 'minibus'].includes(S.vtype) ? 'big' : ['bigtruck', 'semi'].includes(S.vtype) ? 'trailer' : 'small';
+  // 車種 (高公局): 小型車 = 小客車、小貨車 (3.5 噸貨車總重 3.5 噸以下算小貨車)；大型車 = 大客車、大貨車；聯結車 = 聯結車
+  const cls = () => ['citybus', 'coach', 'minibus', 'bigtruck'].includes(S.vtype) ? 'big' : S.vtype === 'semi' ? 'trailer' : 'small';
   const today = () => new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' });
   let day = store.get('tw_etc', null);
   const fresh = () => { if (!day || day.d !== today()) day = { d: today(), km: { small: 0, big: 0, trailer: 0 }, paid: 0, n: 0 }; return day; };
@@ -893,7 +941,8 @@ const etc = (() => {
     if (last && last.gid === w.gid) odo += Math.abs(s - last.s);
     if (gs && last && last.gid === w.gid && Math.abs(s - last.s) < 60 && s > last.s) {   // 只算順向通過
       for (const g of gs) {
-        const at = w.s[Math.min(g.idx, w.n - 1)];
+        // 門架剛好在路段頭尾: 車子在端點附近就會換到下一段路，夾到離端點 3 公尺內才收得到
+        const len = w.s[w.n - 1], e = Math.min(3, len / 2), at = Math.min(Math.max(w.s[Math.min(g.idx, w.n - 1)], e), len - e);
         if (last.s < at && s >= at && !(odo - (recent.get(g.id) ?? -1e9) < 2000)) { recent.set(g.id, odo); pass(g); }
       }
     }
