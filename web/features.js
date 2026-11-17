@@ -1199,7 +1199,6 @@ const radio = (() => {
 // ======================================================================= 引擎音效 (Web Audio 即時合成)
 const sound = (() => {
   let ac = null, nodes = null, enabled = true, gear = 1, lastV = 0, shiftDip = 0;
-  const RATIOS = [0, 3.6, 2.2, 1.5, 1.15, 0.92, 0.75], FINAL = 3.9, WHEEL_R = 0.33;
   function noiseBuffer() {
     const b = ac.createBuffer(1, ac.sampleRate * 2, ac.sampleRate), d = b.getChannelData(0);
     let last = 0;
@@ -1244,13 +1243,9 @@ const sound = (() => {
     const v = Math.abs(S.v), t = ac.currentTime;
     const acc = (S.v - lastV) / Math.max(dt, 1e-3); lastV = S.v;
     const thr = Math.max(S.thr || 0, Math.min(1, Math.max(0, acc / 3.5)));
-    // 自動變速
-    const rpmOf = (g) => v / (2 * Math.PI * WHEEL_R) * 60 * RATIOS[g] * FINAL;
-    let rpm = rpmOf(gear);
-    const up = 2600 + thr * 2400;
-    if (rpm > up && gear < 6) { gear++; shiftDip = 0.12; }
-    else if (gear > 1 && rpmOf(gear - 1) < up * 0.62) { gear--; shiftDip = 0.08; }
-    rpm = Math.max(800 + thr * 400, rpmOf(gear));
+    // 檔位、轉速由主程式的變速箱算 (自排 / 手排)
+    if (S.gear !== gear) { shiftDip = S.gear > gear ? 0.12 : 0.08; gear = S.gear; }
+    const rpm = S.rpm || 800;
     shiftDip = Math.max(0, shiftDip - dt);
     const fire = rpm / 60 * 2; // 四缸四行程
     nodes.o1.frequency.setTargetAtTime(fire, t, 0.03);
@@ -1264,7 +1259,11 @@ const sound = (() => {
     nodes.windG.gain.setTargetAtTime(enabled ? Math.min(0.5, (v / 40) ** 2 * 0.22) : 0, t, 0.2);
     const latAcc = Math.abs(S.v * S.v * Math.tan(S.steer || 0) / 2.8);
     nodes.sqG.gain.setTargetAtTime(enabled && latAcc > 6.5 ? Math.min(0.12, (latAcc - 6.5) * 0.03) : 0, t, 0.05);
-    if (gearEl) gearEl.textContent = (S.v < -0.3 ? 'R' : gear) + ' 檔 · ' + Math.round(rpm) + ' rpm';
+    if (gearEl) {
+      const red = rpm > 6000 ? ' style="color:#ff5a4a"' : '';
+      gearEl.innerHTML = (S.vtype === 'scooter' ? 'CVT' : (S.manual ? '手排 ' : '自排 ') + (S.v < -0.3 ? 'R' : gear) + ' 檔') + ' · <span' + red + '>' + Math.round(rpm) + ' rpm</span>'
+        + (S.cruise ? ' · <b style="color:#5fd0ff">定速 ' + Math.round(S.cruise * 3.6) + '</b>' : '');
+    }
   }
   // 伸縮縫「喀噔」: 模態合成 — 輪胎撞擊激發車身共振 (40~600 Hz 多個衰減模態) + 輪胎拍擊 + 內裝細碎震動 + 懸吊回彈的第二下悶響。
   // 每個輪軸壓過縫的前、後兩個邊緣各撞一次 (間隔 = 縫寬 / 車速)，左右輪差幾毫秒，每次音高、力道隨機微調，不會像機關槍。
@@ -1469,13 +1468,13 @@ const gpsSync = (() => {
 
 // ======================================================================= 操控設定: 按鈕 / 螢幕方向盤 / 重力感應 / 實體方向盤・搖桿
 const controls = (() => {
-  const DEF = { mode: TW.MOBILE ? 'buttons' : 'keys', sens: 1, lock: 180, size: 1, side: 'left', center: true, tiltMax: 35, pad: true, padInv: false, dead: 0.06 };
+  const DEF = { mode: TW.MOBILE ? 'buttons' : 'keys', sens: 1, lock: 180, size: 1, side: 'left', center: true, tiltMax: 35, pad: true, padInv: false, dead: 0.06, padMap: null };
   let C = { ...DEF };
   try { Object.assign(C, JSON.parse(localStorage.getItem('tw_ctrl') || '{}')); } catch (_) {}
   const testMode = TW.params.get('steer');   // 測試用: ?steer=wheel (不存檔)
   if (testMode) C.mode = testMode;
   const save = () => { if (testMode) return; try { localStorage.setItem('tw_ctrl', JSON.stringify(C)); } catch (_) {} };
-  let rot = 0, dragging = false, lastAng = 0, tiltZero = 0, tiltVal = null, padAxis = 0, padThr = 0, padBrk = 0, padSeen = false;
+  let rot = 0, dragging = false, lastAng = 0, tiltZero = 0, tiltVal = null, padAxis = 0, padThr = 0, padBrk = 0, padSeen = false, padPrev = [], wiz = null;
 
   // ---- 螢幕方向盤
   const css = document.createElement('style');
@@ -1561,9 +1560,25 @@ const controls = (() => {
     if (C.pad && navigator.getGamepads) {
       for (const gp of navigator.getGamepads()) {
         if (!gp || !gp.connected) continue;
-        const x = gp.axes[0] || 0;
+        if (wiz) { wizFrame(gp); break; }
+        const M = C.padMap && C.padMap.id === gp.id ? C.padMap : null;
+        const pedal = (m) => {
+          if (!m) return 0;
+          if (m.button != null) return gp.buttons[m.button] ? gp.buttons[m.button].value : 0;
+          const v = gp.axes[m.axis]; if (v == null) return 0;
+          return Math.max(0, Math.min(1, (v - m.rest) / ((m.full - m.rest) || 1)));
+        };
+        let x = gp.axes[0] || 0;
+        if (M && M.steer) x = -Math.max(-1, Math.min(1, ((gp.axes[M.steer.axis] || 0) - M.steer.rest) / M.steer.span));   // 校正後: 左 = -1 (跟標準搖桿一樣)
         const ax = Math.abs(x) < C.dead ? 0 : (x - Math.sign(x) * C.dead) / (1 - C.dead);
-        padThr = gp.buttons[7] ? gp.buttons[7].value : 0; padBrk = gp.buttons[6] ? gp.buttons[6].value : 0;
+        if (M) { padThr = pedal(M.thr); padBrk = pedal(M.brk); }
+        else { padThr = gp.buttons[7] ? gp.buttons[7].value : 0; padBrk = gp.buttons[6] ? gp.buttons[6].value : 0; }
+        const btn = (i) => !!(gp.buttons[i] && gp.buttons[i].pressed);
+        const edge = (i) => btn(i) && !padPrev[i];
+        if (edge(5)) TW.shift(1);
+        if (edge(4)) TW.shift(-1);
+        if (edge(3)) TW.toggleCruise();
+        padPrev = gp.buttons.map((b) => b.pressed);
         if (ax || padThr > 0.02 || padBrk > 0.02) padSeen = true;
         if (padSeen) { padAxis = (C.padInv ? ax : -ax) * C.sens; if (axis == null || Math.abs(padAxis) > Math.abs(axis)) axis = padAxis; }
         break;
@@ -1572,6 +1587,126 @@ const controls = (() => {
     S.steerAxis = axis == null ? null : Math.max(-1, Math.min(1, axis));
     S.padThr = padThr; S.padBrk = padBrk;
   }
+
+  // ---- 實體方向盤校正精靈: 左打到底 -> 放開踩油門 -> 踩煞車 (每個步驟自動偵測變化最大的軸 / 按鍵)
+  const wizEl = document.createElement('div');
+  wizEl.id = 'pad-wiz'; wizEl.className = 'hidden';
+  document.body.appendChild(wizEl);
+  const STEPS = [
+    ['🛞 把方向盤 (或搖桿) <b>往左打到底</b>，維持住', 'steer'],
+    ['🦶 放開方向盤，<b>把油門踩到底</b>，維持住', 'thr'],
+    ['🦶 放開油門，<b>把煞車踩到底</b>，維持住', 'brk'],
+  ];
+  function startWizard() {
+    const gps = navigator.getGamepads ? [...navigator.getGamepads()].filter((g) => g && g.connected) : [];
+    wizEl.classList.remove('hidden');
+    if (!gps.length) {
+      wizEl.innerHTML = '<h3>實體方向盤 / 搖桿設定</h3><p>還沒偵測到裝置。請插上 USB 或藍牙連線後，<b>轉一下方向盤或按任意鍵</b>（瀏覽器要先看到動作才會出現）。</p><div class="seg"><button id="wiz-retry">再試一次</button><button id="wiz-x">關閉</button></div>';
+      $('wiz-retry').onclick = startWizard; $('wiz-x').onclick = () => wizEl.classList.add('hidden');
+      return;
+    }
+    wiz = { step: 0, rest: null, hold: 0, map: { id: gps[0].id }, name: gps[0].id };
+    showStep();
+  }
+  function showStep() {
+    const [txt] = STEPS[wiz.step];
+    wizEl.innerHTML = `<h3>設定：${wiz.name.replace(/</g, '')}</h3><p class="step">步驟 ${wiz.step + 1} / 3</p><p class="big">${txt}</p>
+      <div class="bar"><i id="wiz-bar"></i></div><p class="hint">偵測到就會自動進入下一步。${wiz.step ? '沒有踏板 (用搖桿板機) 可以按「跳過」用預設的 RT / LT。' : ''}</p>
+      <div class="seg">${wiz.step ? '<button id="wiz-skip">跳過</button>' : ''}<button id="wiz-x">取消</button></div>`;
+    $('wiz-x').onclick = () => { wiz = null; wizEl.classList.add('hidden'); };
+    if ($('wiz-skip')) $('wiz-skip').onclick = () => nextStep(null);
+    wiz.rest = null; wiz.hold = 0;
+  }
+  const desc = (m) => !m ? '預設' : m.button != null ? '按鍵 ' + m.button : '第 ' + m.axis + ' 軸';
+  function nextStep(m) {
+    const key = STEPS[wiz.step][1];
+    if (m) wiz.map[key] = m;
+    wiz.step++;
+    if (wiz.step >= STEPS.length) {
+      if (!wiz.map.thr && !wiz.map.brk) { wiz.map.thr = { button: 7 }; wiz.map.brk = { button: 6 }; }
+      C.padMap = wiz.map; C.pad = true; save();
+      wizEl.innerHTML = `<h3>✅ 設定完成</h3><p>方向盤：第 ${wiz.map.steer ? wiz.map.steer.axis : '-'} 軸　油門：${desc(wiz.map.thr)}　煞車：${desc(wiz.map.brk)}</p><p class="hint">換檔撥片 / RB、LB：升降檔 (手排，按 B 切換)　Y：定速巡航。設定記在這台裝置，選單 (T) → 操控設定可以重新設定。</p><div class="seg"><button id="wiz-x">開始開車</button></div>`;
+      $('wiz-x').onclick = () => wizEl.classList.add('hidden');
+      wiz = null; padSeen = true;
+      return;
+    }
+    showStep();
+  }
+  function wizFrame(gp) {
+    const axes = [...gp.axes], btns = gp.buttons.map((b) => b.value);
+    if (!wiz.rest) { wiz.rest = { axes, btns }; return; }
+    const key = STEPS[wiz.step][1], used = new Set(['steer', 'thr', 'brk'].map((k) => wiz.map[k] && wiz.map[k].axis).filter((v) => v != null));
+    let best = null, bd = 0;
+    axes.forEach((v, i) => { if (used.has(i)) return; const d = Math.abs(v - wiz.rest.axes[i]); if (d > bd) { bd = d; best = { axis: i, v }; } });
+    let bb = null;
+    if (key !== 'steer') btns.forEach((v, i) => { if (v - wiz.rest.btns[i] > 0.5 && bb == null) bb = i; });
+    const need = key === 'steer' ? 0.45 : 0.35;
+    const bar = $('wiz-bar'); if (bar) bar.style.width = Math.min(100, (bb != null ? 1 : bd / need) * 100) + '%';
+    if (bb != null || bd > need) {
+      wiz.hold += 1 / 60;
+      if (wiz.hold > 0.6) {
+        if (bb != null) nextStep({ button: bb });
+        else if (key === 'steer') nextStep({ axis: best.axis, rest: wiz.rest.axes[best.axis], span: (best.v - wiz.rest.axes[best.axis]) || -1 });
+        else nextStep({ axis: best.axis, rest: wiz.rest.axes[best.axis], full: best.v });
+      }
+    } else wiz.hold = 0;
+  }
+  window.addEventListener('gamepadconnected', (e) => {
+    const id = e.gamepad.id || '搖桿';
+    const isWheel = /wheel|g29|g920|g923|t300|t150|tmx|thrustmaster|fanatec|moza|logitech.*racing|driving force/i.test(id);
+    if (isWheel && !(C.padMap && C.padMap.id === id)) {
+      TW.toast('🛞 偵測到方向盤：' + id.slice(0, 40) + '，開始踏板設定…', 2600);
+      setTimeout(startWizard, 900);
+    } else TW.toast('🎮 已連接：' + id.slice(0, 40) + '（轉動即可使用）', 2600);
+  });
+
+  // ---- 新手引導: 第一次開啟時選操控方式 (之後選單或「🛞 操控」按鈕可再打開)
+  const guide = document.createElement('div');
+  guide.id = 'ctrl-guide'; guide.className = 'hidden';
+  document.body.appendChild(guide);
+  function openGuide() {
+    const cards = TW.MOBILE ? [
+      ['buttons', '◀ ▶', '按鈕', '左下角 ◀ ▶ 轉向，右下角油門、煞車。最簡單。'],
+      ['wheel', '🛞', '螢幕方向盤', '用手指轉左下角的方向盤，放開會自動回正。'],
+      ['tilt', '📱', '重力感應', '橫拿手機左右傾斜轉向 (iPhone 會詢問權限)。'],
+      ['pad', '🎮', '藍牙搖桿', '連上藍牙搖桿：左搖桿轉向、RT 油門、LT 煞車。'],
+    ] : [
+      ['keys', '⌨️', '鍵盤', 'W / ↑ 油門、S / ↓ 煞車、A D / ← → 轉向。K 車道置中輔助。'],
+      ['wheel', '🛞', '螢幕方向盤', '用滑鼠拖左下角的方向盤轉向，放開會自動回正。'],
+      ['pad', '🎮', '實體方向盤 / 搖桿', '插上 USB 方向盤 (羅技、圖馬思特…) 或搖桿，跟著步驟校正方向盤與踏板。'],
+    ];
+    guide.innerHTML = `<div class="box"><h2>選擇操控方式</h2><p class="hint">之後可以在 選單 (T) → 操控設定 隨時更改，設定會記在這台裝置。</p>
+      <div class="cards">${cards.map(([k, ic, n, d]) => `<button data-k="${k}" class="${(k === C.mode || (k === 'pad' && padSeen)) ? 'on' : ''}"><span class="ic">${ic}</span><b>${n}</b><small>${d}</small></button>`).join('')}</div>
+      <p class="keys">${TW.MOBILE ? '右上角：方向燈、視角、自動駕駛、選單、全螢幕。橫拿手機比較好玩。' : 'P 自動駕駛　V 視角　B 自排/手排　U J 升降檔　I 定速巡航　Y 天氣　T 選單 (導航、任務、傳送)　H 說明'}</p>
+      <div class="seg"><button id="guide-ok">開始開車</button></div></div>`;
+    guide.classList.remove('hidden');
+    for (const b of guide.querySelectorAll('.cards button')) b.onclick = () => {
+      const k = b.dataset.k;
+      if (k === 'pad') { C.pad = true; save(); guide.classList.add('hidden'); startWizard(); return; }
+      C.mode = k; rot = 0; apply(); if (window._ctrlSync) window._ctrlSync();
+      for (const o of guide.querySelectorAll('.cards button')) o.classList.toggle('on', o === b);
+    };
+    $('guide-ok').onclick = () => guide.classList.add('hidden');
+    try { localStorage.setItem('tw_onboard', '1'); } catch (_) {}
+  }
+  css.textContent += `
+  #pad-wiz, #ctrl-guide { position: fixed; z-index: 30; color: #fff; }
+  #pad-wiz { left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(480px, 92vw); padding: 18px 22px; border-radius: 16px; background: rgba(12,16,22,.95); box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+  #pad-wiz h3 { margin: 0 0 8px; font-size: 17px; } #pad-wiz .big { font-size: 20px; margin: 14px 0; } #pad-wiz .step { opacity: .6; margin: 0; font-size: 13px; }
+  #pad-wiz .bar { height: 10px; border-radius: 5px; background: rgba(255,255,255,.12); overflow: hidden; } #pad-wiz .bar i { display: block; height: 100%; width: 0; background: #2f80ff; transition: width .1s; }
+  #pad-wiz .seg, #ctrl-guide .seg { display: flex; gap: 8px; margin-top: 12px; }
+  #pad-wiz button, #ctrl-guide button { padding: 9px 14px; border-radius: 10px; border: 1px solid rgba(255,255,255,.2); background: rgba(255,255,255,.1); color: #fff; font-size: 14px; cursor: pointer; flex: 1; }
+  #pad-wiz .hint, #ctrl-guide .hint { font-size: 12px; opacity: .65; }
+  #ctrl-guide { inset: 0; background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center; }
+  #ctrl-guide.hidden { display: none; }
+  #ctrl-guide .box { width: min(760px, 94vw); max-height: 92vh; overflow: auto; padding: 18px 22px; border-radius: 18px; background: rgba(12,16,22,.96); box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+  #ctrl-guide h2 { margin: 0 0 4px; font-size: 20px; }
+  #ctrl-guide .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 12px 0; }
+  #ctrl-guide .cards button { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 16px 10px; text-align: center; }
+  #ctrl-guide .cards button.on { background: #2f80ff; border-color: #2f80ff; }
+  #ctrl-guide .ic { font-size: 34px; } #ctrl-guide small { opacity: .8; font-size: 12px; line-height: 1.45; }
+  #ctrl-guide .keys { font-size: 13px; opacity: .85; line-height: 1.7; }
+  #ctrl-guide #guide-ok { background: #2f80ff; border-color: #2f80ff; font-size: 16px; }`;
 
   // ---- 選單: 操控設定
   function buildPanel() {
@@ -1585,7 +1720,7 @@ const controls = (() => {
       <div class="seg" data-for="wheel"><button id="ctrl-side">方向盤位置</button><button id="ctrl-center">放開自動回正</button></div>
       <div class="row2" data-for="tilt"><label>傾斜打到底</label><input type="range" id="ctrl-tilt" min="15" max="70" step="1"><output id="ctrl-tilt-o"></output></div>
       <div class="seg" data-for="tilt"><button id="ctrl-zero">以目前角度為正中 (校正)</button></div>
-      <div class="seg"><button id="ctrl-pad">實體方向盤 / 搖桿</button><button id="ctrl-padinv">搖桿方向反轉</button></div>
+      <div class="seg"><button id="ctrl-pad">實體方向盤 / 搖桿</button><button id="ctrl-padinv">搖桿方向反轉</button><button id="ctrl-wiz">🛞 校正方向盤 / 踏板</button><button id="ctrl-guide-btn">❓ 操控引導</button></div>
       <div class="hint">實體方向盤或搖桿：插上後轉一下就會偵測到；X 軸轉向、RT 油門、LT 煞車。設定會記在這台裝置。</div>`;
     menu.appendChild(p);
     const sync = () => {
@@ -1609,9 +1744,15 @@ const controls = (() => {
     $('ctrl-zero').onclick = () => { if (tiltVal != null) tiltZero = tiltVal; };
     $('ctrl-pad').onclick = () => { C.pad = !C.pad; sync(); };
     $('ctrl-padinv').onclick = () => { C.padInv = !C.padInv; sync(); };
+    $('ctrl-wiz').onclick = () => { TW.toggleMenu(false); startWizard(); };
+    $('ctrl-guide-btn').onclick = () => { TW.toggleMenu(false); openGuide(); };
+    window._ctrlSync = sync;
     sync();
   }
   buildPanel(); apply();
+  // 第一次開: 顯示操控引導 (測試時不顯示)
+  let onboarded = false; try { onboarded = localStorage.getItem('tw_onboard') === '1'; } catch (_) {}
+  if (!onboarded && !TW.params.has('t') && !TW.params.has('camat') && !TW.params.has('noguide')) setTimeout(openGuide, 1500);
   if (TW.params.has('wheeltest')) setTimeout(() => {   // 測試: 模擬手指把方向盤順時針轉 90°
     const r = wheel.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2, R = r.width * 0.42;
     const ev = (type, a) => wheel.dispatchEvent(new PointerEvent(type, { pointerId: 7, bubbles: true, clientX: cx + Math.cos(a) * R, clientY: cy + Math.sin(a) * R }));
@@ -1620,7 +1761,7 @@ const controls = (() => {
     setTimeout(() => { for (let k = 0; k < 30; k++) frame(1 / 60); console.log('[wheeltest] held rot', rot.toFixed(1), 'axis', S.steerAxis && S.steerAxis.toFixed(3), 'steer', S.steer.toFixed(3), 'h', S.h.toFixed(3));
       ev('pointerup', 0); setTimeout(() => { for (let k = 0; k < 60; k++) frame(1 / 60); console.log('[wheeltest] released rot', rot.toFixed(1), 'axis', S.steerAxis, 'steer', S.steer.toFixed(3)); }, 1500); }, 1000);
   }, 1500);
-  return { frame, get settings() { return C; } };
+  return { frame, openGuide, startWizard, get settings() { return C; } };
 })();
 
 // ======================================================================= 掛上主程式
@@ -1781,5 +1922,6 @@ function overlaps() {
   }
   return n;
 }
-window.TWX = { cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync, controls };
+window.TWX = { cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync, controls,
+  sign: { panelBase, drawSpaced, zhFont, enFont, textW, signMat, backMat, placeOnWay, drawShield, mergedGroup, SGN, ZH_SP, ZH_FONT, EN_FONT } };
 })();

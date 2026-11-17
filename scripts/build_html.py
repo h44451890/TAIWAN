@@ -46,6 +46,7 @@ def main():
         "VEHICLES_JS": safe(open(os.path.join(WEB, "vehicles.js"), encoding="utf-8").read(), "vehicles.js"),
         "HLS_JS": safe(open(os.path.join(WEB, "vendor", "hls.light.min.js"), encoding="utf-8").read(), "hls.js"),
         "FEATURES_JS": safe(open(os.path.join(WEB, "features.js"), encoding="utf-8").read(), "features.js"),
+        "GAMEPLAY_JS": safe(open(os.path.join(WEB, "gameplay.js"), encoding="utf-8").read(), "gameplay.js"),
     }
     # 額外模組 (電台、車流…) 依序附加在 app.js 之前
     extra_dir = os.path.join(WEB, "extra")
@@ -90,6 +91,10 @@ def main():
         total += size
         for kind, b64 in blobs:
             inline.append(f'<script id="tile-{kind}-{k}" type="application/octet-stream">{b64}</script>')
+    # 導航路網 (scripts/build_nav.mjs)
+    navp = os.path.join(tiles, "n", "nav.bin")
+    if os.path.exists(navp):
+        inline.append('<script id="tile-n-nav" type="application/octet-stream">' + base64.b64encode(open(navp, "rb").read()).decode("ascii") + '</script>')
     if skipped:
         print(f"台灣.html: {len(keys) - skipped} tiles inline, {skipped} tiles fetched online from GitHub Pages")
     for name, tl in (("台灣.html", "\n".join(inline)), ("index.html", "")):

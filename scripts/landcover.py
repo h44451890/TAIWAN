@@ -112,13 +112,16 @@ def main():
             seen.add(key)
             t = el.get("tags", {})
             ww = t.get("waterway", "")
+            if el["type"] == "way" and ww in ("river", "canal") and (t.get("tunnel") in ("yes", "culvert", "flooded") or t.get("covered") == "yes" or t.get("layer", "0").startswith("-")):
+                n_el += 1
+                continue   # 涵洞、加蓋、地下的河道: 地面上看不到水
             if el["type"] == "way" and ww in ("river", "canal"):   # 河道中心線 (沒有河岸多邊形時): 依寬度畫粗線
                 g = el.get("geometry") or []
                 if len(g) >= 2:
                     try:
                         wd = float(str(t.get("width", "")).replace("m", " ").split()[0])
                     except (ValueError, IndexError):
-                        wd = 35.0 if ww == "river" else 10.0
+                        wd = 20.0 if ww == "river" else 10.0
                     if wd >= 12:
                         draws[RIVER].line(px([(p["lat"], p["lon"]) for p in g]), fill=255, width=max(1, int(round(wd / STEP))))
                 n_el += 1

@@ -70,9 +70,11 @@ console.log('ways', ways.length, 'tiles', tiles.size);
 const ptKey = (x, y) => Math.round(x * 10) + ',' + Math.round(y * 10);
 // ---------------------------------------------------------------- 0. 匝道接主線
 // OSM 的匝道在交流道是從主線「中心線」岔出去的，所以前一兩百公尺整條疊在主線路面上 (穿模、高高低低)。
-// 照實際交流道: 匝道車道貼在主線最外側並行 (路緣剛好相接、高度和主線一樣)，再照原本路線慢慢分開；
-// 兩條路之間分開的三角區由網頁畫槽化線 (斑馬紋) 與橘色導桿，鼻端放緩衝桶；這段兩邊的護欄拿掉。
-// 匝道端點移開後和主線不再同一點，記在 hd.ramp，網頁用它把兩條路接起來 (AI 換路段時保留實際位置，像真的切車道)。
+// 做法 (保守版，不搬動匝道的平面位置，避免路面扭曲、錯開):
+//   - 和主線重疊的那段，匝道高度 = 主線高度 (略低 2 cm，重疊處看到的是主線路面，不會閃)；離開主線後漸漸回到原本的縱斷面
+//   - 匝道整條都在主線路面內的那幾段不畫路面 (emask bit2)，也不放護欄
+//   - 兩路緣距離小於 GORE_MAX 的範圍兩邊不放護欄；網頁在兩條路真的分開後 (路緣間有空隙) 畫槽化線、導桿、緩衝桶
+// 記在 hd.ramp: [匝道 gid, 端點, 在主線哪一側, 主線 gid, 端點在主線上的點]
 const GORE_MAX = 9;   // 兩路緣距離小於這個值的範圍是槽化區 (沒有護欄)
 const MCELL = 50, MGRID = new Map();
 const mck = (x, y) => Math.floor(x / MCELL) * 100003 + Math.floor(y / MCELL);
@@ -145,7 +147,7 @@ for (const w of ways) {
     for (const r of rec) if (Math.abs(r.m.lat) > r.m.w.hw + w.hw + 3) { side = Math.sign(r.m.lat); break; }
     if (!side) { for (let j = rec.length - 1; j >= 0; j--) if (Math.abs(rec[j].m.lat) > 1) { side = Math.sign(rec[j].m.lat); break; } }
     if (!side) continue;
-    // 橫向: 平滑取 max(原位置, 貼齊位置)；高度: 槽化區內跟主線一樣，分開後漸漸回到原本的縱斷面
+    // 高度: 重疊處跟主線一樣，分開後漸漸回到原本的縱斷面 (平面位置不動)
     const B = 8;
     let free = 0, prevM = null;
     const tipOld = [x0, y0];
@@ -156,28 +158,15 @@ for (const w of ways) {
       if (free > 0) break;   // 已經分開又「貼回」= 找到別條主線，不處理
       if (prevM && m.w !== prevM.w && Math.abs(m.lat - prevM.lat) > 4) break;   // 主線突然換一條、位置跳很多
       prevM = m;
-      const out = x <= -B ? 0 : (x + B) * (x + B) / (4 * B);
-      const ox = w.P[k * 3], oy = w.P[k * 3 + 1], oz = w.P[k * 3 + 2];
-      const nxp = m.px + side * m.nx * (R + out), nyp = m.py + side * m.ny * (R + out);
+      const out = Math.max(0, x);   // 兩路緣之間的空隙 (重疊時 0)
+      const oz = w.P[k * 3 + 2];
       const wz = 1 - smooth((out - 1) / 13);
-      const nz = m.pz * wz + oz * (1 - wz);
-      // 接在這一點上的其他路段端點 (例如匝道再分岔) 一起移
-      for (const [o, oi] of ORIG.get(ptKey(ox, oy)) || []) {
-        if (o === w || moved.has(o.gid + ':' + oi)) continue;
-        moved.add(o.gid + ':' + oi);
-        const dx = nxp - ox, dy = nyp - oy, dz = nz - oz, odir = oi === 0 ? 1 : -1;
-        let oa = 0;
-        for (let j = oi; j >= 0 && j < o.n; j += odir) {
-          if (j !== oi) oa += Math.hypot(o.P[j * 3] - o.P[(j - odir) * 3], o.P[j * 3 + 1] - o.P[(j - odir) * 3 + 1]);
-          if (oa > 40) break;
-          const f = 1 - smooth(oa / 40);
-          o.P[j * 3] += dx * f; o.P[j * 3 + 1] += dy * f; o.P[j * 3 + 2] += dz * f;
-        }
-        followMoved++;
-      }
-      w.P[k * 3] = nxp; w.P[k * 3 + 1] = nyp; w.P[k * 3 + 2] = nz;
+      const nz = (m.pz - 0.02) * wz + oz * (1 - wz);
+      w.P[k * 3 + 2] = nz;
       r.gap = out;
       rampMoved++;
+      // 匝道整條在主線路面內: 不畫路面、兩邊都不放護欄
+      if (side * m.lat + w.hw <= m.w.hw + 0.2) w.M[k] |= 1 | 2 | 4;
       // 槽化區兩邊不放護欄 / 側牆: 主線靠匝道那一側、匝道靠主線那一側
       if (out < GORE_MAX) {
         const mb = side > 0 ? 1 : 2;

@@ -227,14 +227,16 @@ const camera = new T.PerspectiveCamera(60, window.innerWidth / window.innerHeigh
 const SUN_DIR = new T.Vector3(0.486, 0.530, 0.695).normalize();
 const HORIZON = new T.Color(0.62, 0.70, 0.80);
 const NIGHT = { value: 0 };   // 0 白天 .. 1 夜晚: 路燈、大樓窗戶、車燈共用
+// 天氣 (gameplay.js 設定): wet 路面濕度 0..1、over 陰天 0..1、fog 起霧 0..1、rain 雨量 0..1 (大雨 1)
+const WEATHER = { wet: { value: 0 }, over: 0, fog: 0, rain: 0, dirty: false };
 
 // ---- 天空 (方向漸層 + 太陽光暈 + 積雲；黃昏有晚霞、夜晚有星星) -> 背景與環境光。太陽移動時重畫
-const SKY_U = { sunDir: { value: SUN_DIR }, uDay: { value: 1 }, uSet: { value: 0 } };
+const SKY_U = { sunDir: { value: SUN_DIR }, uDay: { value: 1 }, uSet: { value: 0 }, uOver: { value: 0 } };
 const skyMat = new T.ShaderMaterial({
   side: T.BackSide, depthWrite: false, uniforms: SKY_U,
   vertexShader: 'varying vec3 vDir; void main(){ vDir = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
   fragmentShader: `
-    varying vec3 vDir; uniform vec3 sunDir; uniform float uDay; uniform float uSet;
+    varying vec3 vDir; uniform vec3 sunDir; uniform float uDay; uniform float uSet; uniform float uOver;
     float h3(vec3 p){ p = fract(p*0.3183099 + 0.1); p *= 17.0; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
     float n3(vec3 x){ vec3 i=floor(x); vec3 f=fract(x); f=f*f*(3.0-2.0*f);
       return mix(mix(mix(h3(i),h3(i+vec3(1,0,0)),f.x), mix(h3(i+vec3(0,1,0)),h3(i+vec3(1,1,0)),f.x),f.y),
@@ -245,22 +247,25 @@ const skyMat = new T.ShaderMaterial({
       float e = d.y, s = max(dot(d, sunDir), 0.0);
       vec3 zenith = mix(vec3(0.0004, 0.0005, 0.0012), vec3(0.13, 0.27, 0.58), uDay);   // 夜晚天空接近全黑
       vec3 horizon = mix(vec3(0.0035, 0.003, 0.0035), vec3(0.66, 0.73, 0.82), uDay);   // 地平線只剩一點城市光
+      zenith = mix(zenith, vec3(0.30, 0.32, 0.35) * uDay + 0.0006, uOver * 0.85);       // 陰天: 整片灰
+      horizon = mix(horizon, vec3(0.46, 0.48, 0.5) * uDay + 0.003, uOver * 0.85);
       vec2 dh = normalize(d.xz + vec2(1e-5)), sh = normalize(sunDir.xz + vec2(1e-5));
       horizon = mix(horizon, vec3(1.0, 0.52, 0.25), uSet * (0.35 + 0.65 * pow(max(dot(dh, sh), 0.0), 2.0)));
       vec3 ground = mix(vec3(0.01, 0.012, 0.015), vec3(0.10, 0.11, 0.10), uDay);
       vec3 col = e > 0.0 ? mix(horizon, zenith, pow(e, 0.5)) : mix(horizon, ground, pow(min(-e*4.0,1.0),0.6));
-      col += mix(vec3(1.0,0.85,0.6), vec3(1.0,0.5,0.2), uSet) * (pow(s, 8.0) * 0.25 + pow(s, 64.0) * 0.6) * smoothstep(-0.12, 0.02, sunDir.y);
+      col += mix(vec3(1.0,0.85,0.6), vec3(1.0,0.5,0.2), uSet) * (pow(s, 8.0) * 0.25 + pow(s, 64.0) * 0.6) * smoothstep(-0.12, 0.02, sunDir.y) * (1.0 - 0.9 * uOver);
       col = mix(col, horizon * 1.05, exp(-max(e, 0.0) * 18.0) * 0.6);
       if (e > 0.0) {
         vec3 q = floor(d * 420.0);
-        float st = step(0.9975, h3(q)) * (1.0 - uDay) * smoothstep(0.05, 0.3, e);   // 星星
+        float st = step(0.9975, h3(q)) * (1.0 - uDay) * smoothstep(0.05, 0.3, e) * (1.0 - uOver);   // 星星 (陰天看不到)
         col += vec3(0.8, 0.85, 1.0) * st * (0.4 + 0.6 * h3(q + 3.1));
         vec2 uv = d.xz / (e + 0.12) * 1.6;
         float c = fbm(vec3(uv, 0.0) * 1.3) * 0.8 + fbm(vec3(uv * 4.0, 1.7)) * 0.25;
-        float cov = smoothstep(0.52, 0.78, c) * smoothstep(0.02, 0.2, e);
+        float cov = mix(smoothstep(0.52, 0.78, c), smoothstep(0.2, 0.5, c), uOver) * smoothstep(0.02, 0.2, e);
         float lit = 0.75 + 0.35 * fbm(vec3(uv * 4.0 + sunDir.xz * 0.3, 3.1)) + 0.25 * pow(s, 4.0);
         vec3 cloud = mix(vec3(0.55, 0.58, 0.63), vec3(1.0, 0.98, 0.95), clamp(lit - 0.35, 0.0, 1.0));
         cloud = mix(cloud, vec3(1.0, 0.6, 0.38) * (0.6 + 0.5 * lit), uSet * 0.8);   // 晚霞
+        cloud = mix(cloud, vec3(0.24, 0.25, 0.27) * (0.8 + 0.3 * c), uOver);   // 雨雲: 暗灰
         cloud *= mix(0.008, 1.0, uDay);
         col = mix(col, cloud, cov * 0.92);
       }
@@ -324,8 +329,9 @@ const MOON_DIR = new T.Vector3(-0.35, 0.82, 0.45).normalize();
 const smooth01 = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
 let dnClock = 0, dnSkyEl = 1e9, dnMode = -1;
 function updateDayNight(dt) {
-  if ((dnClock -= dt) > 0 && dnMode === timeMode) return;
+  if ((dnClock -= dt) > 0 && dnMode === timeMode && !WEATHER.dirty) return;
   dnClock = 2;
+  const ov = WEATHER.over, fg = WEATHER.fog;
   const { el, az } = sunPos(taiwanTime(TIME_MODES[timeMode][1]));
   const e = el * 180 / Math.PI;
   SKY_SUN.set(Math.cos(el) * Math.sin(az), Math.sin(el), -Math.cos(el) * Math.cos(az));
@@ -335,23 +341,28 @@ function updateDayNight(dt) {
     SUN_DIR.copy(SKY_SUN);
     if (SUN_DIR.y < 0.05) { SUN_DIR.y = 0.05; SUN_DIR.normalize(); }
     const k = smooth01(0, 25, e);
-    sun.intensity = 3.2 * smooth01(-2, 10, e);
+    sun.intensity = 3.2 * smooth01(-2, 10, e) * (1 - 0.82 * ov);   // 陰天、下雨: 沒有直射陽光
     sun.color.setRGB(1, 0.62 + 0.38 * k, 0.42 + 0.58 * k);
   } else {   // 夜晚: 月光 (淡藍、從高處照)
     SUN_DIR.copy(MOON_DIR);
-    sun.intensity = 0.07;   // 月光很弱
+    sun.intensity = 0.07 * (1 - 0.9 * ov);   // 月光很弱 (陰天幾乎沒有)
     sun.color.setRGB(0.55, 0.65, 1.0);
   }
   renderer.toneMappingExposure = 1 + 0.2 * NIGHT.value;
-  scene.environmentIntensity = 0.55 * (1 - 0.75 * NIGHT.value);   // 夜晚天空光很少
+  scene.environmentIntensity = 0.55 * (1 - 0.75 * NIGHT.value) * (1 + 0.25 * ov);   // 夜晚天空光很少；陰天散射光比較多 (補直射光)
   // 霧色 = 地平線顏色
   const hz = [0.003 + 0.657 * day, 0.003 + 0.727 * day, 0.004 + 0.816 * day];   // 夜晚霧色接近黑
   scene.fog.color.setRGB(hz[0] + (1.0 - hz[0]) * set * 0.35, hz[1] + (0.55 - hz[1]) * set * 0.35, hz[2] + (0.3 - hz[2]) * set * 0.35);
-  if (Math.abs(e - dnSkyEl) > 0.4 || dnMode !== timeMode) {
+  // 陰天 / 起霧: 霧變灰、變濃 (起霧 1 = 能見度約 250 m)
+  const gk = Math.max(ov * 0.8, fg), gray = 0.003 + 0.5 * day;
+  scene.fog.color.lerp(new T.Color(gray, gray * 1.02, gray * 1.06), gk);
+  scene.fog.density = 0.000045 + ov * 0.00022 + WEATHER.rain * 0.0006 + fg * 0.0115;
+  if (Math.abs(e - dnSkyEl) > 0.4 || dnMode !== timeMode || Math.abs(SKY_U.uOver.value - ov) > 0.04) {
     dnSkyEl = e; dnMode = timeMode;
-    SKY_U.uDay.value = day; SKY_U.uSet.value = set;
+    SKY_U.uDay.value = day; SKY_U.uSet.value = set; SKY_U.uOver.value = ov;
     renderSky();
   }
+  WEATHER.dirty = false;
   matLampHead.emissiveIntensity = 5 * NIGHT.value;
   GLOW_LAMP_TEX_HOOK();
   GLOW_LAMP.opacity = NIGHT.value; GLOW_LAMP.visible = NIGHT.value > 0.02;
@@ -425,9 +436,9 @@ const ASPH_U = {
   tAsD: { value: texFrom('tex-asphalt_diff', true) },
   tAsN: { value: texFrom('tex-asphalt_nor_gl', false) },
   tAsR: { value: texFrom('tex-asphalt_rough', false) },
-  uNight: NIGHT,
+  uNight: NIGHT, uWet: WEATHER.wet,
 };
-const ASPH_DECL = `uniform sampler2D tAsD; uniform sampler2D tAsN; uniform sampler2D tAsR; uniform float uNight; float gMark; vec2 gUv1; vec2 gUv2; float gMix;
+const ASPH_DECL = `uniform sampler2D tAsD; uniform sampler2D tAsN; uniform sampler2D tAsR; uniform float uNight; uniform float uWet; float gPud; float gMark; vec2 gUv1; vec2 gUv2; float gMix;
   void asphUv(vec3 p) {
     gUv1 = p.xy / 4.04;
     gUv2 = mat2(0.866, -0.5, 0.5, 0.866) * p.xy / 5.3 + vec2(0.37, 0.71);
@@ -437,10 +448,16 @@ const ASPH_DECL = `uniform sampler2D tAsD; uniform sampler2D tAsN; uniform sampl
 // 法線: 路面接近水平，把貼圖的切線方向擾動 (資料 x 東、y 北 -> three x、-z) 加到幾何法線上
 const ASPH_NORMAL = `{
   vec3 tn = mix(texture2D(tAsN, gUv1).rgb, texture2D(tAsN, gUv2).rgb, gMix) * 2.0 - 1.0;
-  vec3 dw = vec3(tn.x, 0.0, -tn.y) * (0.75 * (1.0 - gMark));
+  vec3 dw = vec3(tn.x, 0.0, -tn.y) * (0.75 * (1.0 - gMark)) * (1.0 - 0.9 * gPud * uWet);   // 積水處水面是平的
   normal = normalize(normal + mat3(viewMatrix) * dw);
 }`;
-const ASPH_ROUGH = `roughnessFactor = mix(mix(0.72, 0.98, mix(texture2D(tAsR, gUv1).r, texture2D(tAsR, gUv2).r, gMix)), 0.55, gMark);`;
+const ASPH_ROUGH = `roughnessFactor = mix(mix(0.72, 0.98, mix(texture2D(tAsR, gUv1).r, texture2D(tAsR, gUv2).r, gMix)), 0.55, gMark);
+  gPud = 0.0;
+  if (uWet > 0.001) {   // 下雨: 路面變暗、變光滑；低窪處 (雜訊) 積水接近鏡面
+    gPud = smoothstep(0.56, 0.68, fwyFbm(vObj * 0.11, 3)) * smoothstep(0.35, 0.9, uWet);
+    roughnessFactor = mix(roughnessFactor, mix(0.3, 0.035, gPud), uWet);
+    diffuseColor.rgb *= mix(1.0, mix(0.55, 0.32, gPud), uWet * (1.0 - 0.5 * gMark));
+  }`;
 
 // 瀝青路面 + 標線 (內側黃實線、外側白實線、車道白虛線 畫4m空6m, 線寬15cm)
 const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness: 0 }), {
@@ -814,7 +831,7 @@ function addRoad(c, w) {
     r.v(x + nx[i] * hw, y + ny[i] * hw, z); r.uv.push(0, s[i]); r.ls.push(lsT); r.ln.push(w.lanes);
     r.v(x - nx[i] * hw, y - ny[i] * hw, z); r.uv.push(w.width, s[i]); r.ls.push(lsT); r.ln.push(w.lanes);
   }
-  for (let i = 0; i < n - 1; i++) { const a = b0 + i * 2; r.q(a, a + 1, a + 3, a + 2); }
+  for (let i = 0; i < n - 1; i++) { if (w.M[i] & w.M[i + 1] & 4) continue; const a = b0 + i * 2; r.q(a, a + 1, a + 3, a + 2); }   // bit2: 匝道整段在主線路面內 (fix_clip.mjs)，不畫
   // 側面 / 梁底
   const depth = w.bridge ? 2.2 : (w.tunnel ? 0.6 : 2.0);
   const k = c.skirt, s0 = k.n;
@@ -935,6 +952,7 @@ function addGore(c, w, r) {
     const gap = side * m.lat - m.w.hw - w.hw;
     if (side * m.lat <= 0 || (prevGap != null && gap < prevGap - 1.5) || (prevM && m.w !== prevM.w && Math.abs(m.lat - prevM.lat) > 4)) break;   // 找到別條主線: 停
     prevGap = gap; prevM = m;
+    if (gap < 0.3) { prevRow = -1; continue; }   // 還疊在主線路面上: 槽化區從兩路緣分開的地方才開始
     const ex = m.px + side * m.nx * m.w.hw, ey = m.py + side * m.ny * m.w.hw, ez = m.pz;
     const lx = P[k * 3] - side * m.nx * w.hw, ly = P[k * 3 + 1] - side * m.ny * w.hw, lz = P[k * 3 + 2];
     const W = Math.max(0, Math.hypot(lx - ex, ly - ey));
@@ -1892,6 +1910,7 @@ function chooseNext(w, node, dir, signal) {
     if (dot < (w.city || o.o.city ? -0.2 : 0.3)) continue;
     let sc = dot * 2 + (o.o.ref && o.o.ref === w.ref ? 3 : 0) + (o.o.link && !w.link ? -2 : 0) + (w.link && !o.o.link ? 2 : 0)
       + (!!o.o.city !== !!w.city ? -1 : 0) + (o.o.city && o.o.cls === 5 ? -1 : 0);
+    if (HOOKS.navBias) sc += HOOKS.navBias(w, o);   // 導航路線上的下一段
     if (signal < 0 && cross > 0.3) sc += 6;
     if (signal > 0 && cross < -0.3) sc += 6;
     if (sc > bs) { bs = sc; best = o; }
@@ -1934,6 +1953,39 @@ function respawnNearest() {
   spawn(best[0], best[1], dir);
 }
 
+// ---- 變速箱: 自排 (自動換檔) / 手排 (U 升檔、J 降檔)；定速巡航 (I)
+// 六速齒比；終傳比依車種極速算 (6 檔 6000 rpm = 極速)，所以每種車的檔位速度範圍合理
+const GEAR_R = [3.6, 2.2, 1.5, 1.15, 0.92, 0.75], RPM_IDLE = 800, RPM_MAX = 6500;
+S.manual = false; S.gear = 1; S.rpm = RPM_IDLE; S.cruise = null;
+try { S.manual = localStorage.getItem('tw_manual') === '1'; } catch (_) {}
+if (params.get('manual') === '1') S.manual = true;
+const wheelR = () => (S.vt && S.vt.len > 6.5 ? 0.5 : S.vtype === 'scooter' ? 0.28 : 0.33);
+const finalDrive = () => { const vt = S.vt || { vmax: 45 }; return RPM_MAX * 0.92 / 60 * 2 * Math.PI * wheelR() / (GEAR_R[5] * vt.vmax * 1.2); };
+const rpmAt = (g, v) => Math.abs(v) / (2 * Math.PI * wheelR()) * 60 * GEAR_R[g - 1] * finalDrive();
+/** 扭力曲線 (0..1): 1000 rpm 六成、3500~4500 最大、6000 以後掉、6500 斷油 */
+const torqueAt = (rpm) => rpm >= RPM_MAX ? 0 : rpm < 3500 ? 0.55 + 0.45 * smooth01(900, 3500, rpm) : rpm < 4500 ? 1 : 1 - 0.45 * smooth01(4500, RPM_MAX, rpm);
+const toastEl = (() => { const d = document.createElement('div'); d.style.cssText = 'position:fixed;top:150px;left:50%;transform:translateX(-50%);background:rgba(10,14,12,.82);color:#fff;padding:8px 16px;border-radius:10px;font-size:15px;z-index:20;pointer-events:none;opacity:0;transition:opacity .35s;white-space:nowrap'; document.body.appendChild(d); return d; })();
+function toast(msg, ms = 1800) { toastEl.textContent = msg; toastEl.style.opacity = 1; clearTimeout(toast.t); toast.t = setTimeout(() => { toastEl.style.opacity = 0; }, ms); }
+function toggleManual() {
+  if (S.vtype === 'scooter') { toast('🛵 機車是無段變速，沒有手排'); return; }
+  S.manual = !S.manual;
+  try { localStorage.setItem('tw_manual', S.manual ? '1' : '0'); } catch (_) {}
+  toast(S.manual ? '⚙️ 手排：U 升檔、J 降檔 (搖桿 RB / LB)' : '⚙️ 自排');
+}
+function shift(d) {
+  if (!S.manual || S.vtype === 'scooter') { if (d) toast('目前是自排，按 B 切換手排'); return; }
+  const g = Math.min(6, Math.max(1, S.gear + d));
+  if (g === S.gear) return;
+  if (d < 0 && rpmAt(g, S.v) > RPM_MAX + 300) { toast('⚠ 轉速太高，不能降到 ' + g + ' 檔'); return; }
+  S.gear = g; S.shiftT = 0.18;   // 換檔瞬間離合器分離
+}
+function toggleCruise() {
+  if (S.cruise) { S.cruise = null; toast('定速巡航 關'); return; }
+  if (S.v < 20 / 3.6) { toast('定速巡航：時速 20 以上才能設定'); return; }
+  S.cruise = Math.round(S.v * 3.6) / 3.6;
+  toast('🚗 定速巡航 ' + Math.round(S.cruise * 3.6) + ' km/h (+ / - 調整，踩煞車取消)');
+}
+
 const keys = {};
 let camMode = params.get('cam') === '1' ? 1 : params.get('cam') === '2' ? 2 : 3, autopilot = params.has('demo'), mapScaleIdx = 0;
 const MAP_SCALES = [0.11, 0.055, 0.025];
@@ -1955,6 +2007,13 @@ window.addEventListener('keydown', (e) => {
   if (e.code === 'KeyH') $('help').classList.toggle('hidden');
   if (e.code === 'KeyG') setVehicle(PLAYER_TYPES[(PLAYER_TYPES.indexOf(S.vtype) + 1) % PLAYER_TYPES.length]);   // 換車
   if (e.code === 'KeyT') toggleMenu();
+  if (e.code === 'KeyB') toggleManual();
+  if (e.code === 'KeyU') shift(1);
+  if (e.code === 'KeyJ') shift(-1);
+  if (e.code === 'KeyI') toggleCruise();
+  if ((e.code === 'Equal' || e.code === 'NumpadAdd') && S.cruise) S.cruise = Math.min(S.cruise + 5 / 3.6, 160 / 3.6);
+  if ((e.code === 'Minus' || e.code === 'NumpadSubtract') && S.cruise) S.cruise = Math.max(S.cruise - 5 / 3.6, 20 / 3.6);
+  for (const f of HOOKS.key) f(e);
   if (e.code === 'KeyQ' || e.code === 'KeyE') {   // 手動方向燈 Q 左、E 右 (再按一次關)；自動駕駛時路口依方向燈轉彎
     const d = e.code === 'KeyQ' ? -1 : 1;
     S.signal = S.signal === d ? 0 : d; S.signalAuto = false; S.sigArmed = false;
@@ -2232,13 +2291,42 @@ function update(dt) {
     if (Math.abs(S.steer) > 0.1) S.sigArmed = true;
     else if (S.sigArmed && Math.abs(S.steer) < 0.02) { S.signal = 0; S.sigArmed = false; }
   }
+  // 定速巡航: 煞車 / 手煞車取消；踩油門可以暫時加速，放開回到設定速度
+  if (S.cruise && (brk > 0.05 || keys.Space || autopilot)) { S.cruise = null; toast('定速巡航 取消'); }
+  if (S.cruise && !autopilot) {
+    const e = S.cruise - S.v;
+    const ct = Math.max(0, Math.min(1, e * 0.35 + 0.12 + Math.max(0, Math.sin(S.pitch)) * 1.5));
+    thr = Math.max(thr, ct);
+    if (e < -1.2 && thr === ct) { thr = 0; brk = Math.min(0.25, (-e - 1.2) * 0.06); }
+  }
   S.thr = thr; S.brk = brk;
   // 縱向 (依車種: 加速度、極速、煞車)
   let a = 0;
   const vmax = vt.vmax * 1.2 * (boost ? 1.3 : 1);
-  if (thr) a += 5.5 * (vt.acc / 1.5) * thr * (1 - Math.max(S.v, 0) / vmax);
-  if (brk) a += S.v > 0.5 ? -(big ? 7 : 10) * brk : -3.5 * brk;
-  if (keys.Space) a += S.v > 0 ? -8 : (S.v < 0 ? 8 : 0);
+  const A0 = 5.5 * (vt.acc / 1.5);
+  const cvt = S.vtype === 'scooter';
+  S.shiftT = Math.max(0, (S.shiftT || 0) - dt);
+  if (S.manual && !cvt && !autopilot && S.v >= -0.3) {
+    // 手排: 推力 = 扭力曲線 × 齒比；低速半離合 (不會熄火)；放油門有引擎煞車；6500 rpm 斷油
+    const wr = rpmAt(S.gear, S.v), slip = wr < 1100;
+    S.rpm = slip ? Math.max(wr, RPM_IDLE + thr * 1700) : Math.max(wr, RPM_IDLE);
+    const gk = GEAR_R[S.gear - 1] / GEAR_R[0];
+    if (thr && S.shiftT <= 0) a += A0 * 1.15 * thr * torqueAt(S.rpm) * Math.pow(gk, 0.85) * (slip ? Math.min(1, 0.45 + wr / 2000) : 1) * (boost ? 1.25 : 1);
+    if (!thr && !slip && S.v > 1) a -= 0.25 + 0.9 * (S.rpm / RPM_MAX) * Math.sqrt(gk);
+    if (wr > RPM_MAX + 200 && S.v > 0) a -= (wr - RPM_MAX) / 400;   // 超轉: 引擎拖住
+  } else {
+    if (thr) a += A0 * thr * (1 - Math.max(S.v, 0) / vmax);
+    // 自排換檔點: 油門越深越晚換 (引擎聲、轉速表用)
+    if (!cvt) {
+      const up = 2600 + thr * 2400;
+      if (rpmAt(S.gear, S.v) > up && S.gear < 6) { S.gear++; S.shiftT = 0.12; }
+      else if (S.gear > 1 && rpmAt(S.gear - 1, S.v) < up * 0.62) S.gear--;
+      S.rpm = Math.max(RPM_IDLE + thr * 400, rpmAt(S.gear, S.v));
+    } else { S.gear = 1; S.rpm = Math.max(RPM_IDLE + thr * 2500, Math.min(7500, 3000 + Math.abs(S.v) * 120)); }
+  }
+  const wet = 1 - 0.22 * WEATHER.wet.value;   // 濕地煞車距離變長
+  if (brk) a += S.v > 0.5 ? -(big ? 7 : 10) * brk * wet : -3.5 * brk;
+  if (keys.Space) a += S.v > 0 ? -8 * wet : (S.v < 0 ? 8 : 0);
   a -= 0.00042 * S.v * Math.abs(S.v) + 0.12 * Math.sign(S.v);
   a -= 9.81 * Math.sin(S.pitch) * 0.9;
   S.v += a * dt;
@@ -2490,10 +2578,12 @@ window.addEventListener('resize', () => {
 });
 
 // ---- 給擴充模組 (features.js: 車流、電台、看板) 用的介面
-const HOOKS = { init: [], update: [], frame: [], minimap: [], tile: [], wayColor: null };
+const HOOKS = { init: [], update: [], frame: [], minimap: [], tile: [], key: [], wayColor: null, navBias: null };
 window.TW = { T, scene, camera, renderer, NIGHT, GLOW_TEX, landcoverAt, WAYS, wayByGid, TILES, TS, tilesNear, PT_INDEX, ptKey, S, LANE_W, roadAt, terrainAt, nextWay, buildCar, HOOKS, params,
-  laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: INDEX.origin_twd97, MOBILE,
-  get camMode() { return camMode; } };
+  laneCount, laneOffDir, nextOptions, speedLimit, setVehicle, spawn, ORIGIN: INDEX.origin_twd97, MOBILE, WEATHER, keys, tileBuf, roadLabel, toast, toggleMenu,
+  toggleManual, shift, toggleCruise, ensureArea, respawnNearest, SPAWNS: () => SPAWNS, sun,
+  get camMode() { return camMode; }, get autopilot() { return autopilot; }, set autopilot(v) { autopilot = !!v; },
+  get mapScale() { return MAP_SCALES[mapScaleIdx]; }, MAP_PX: 200 };
 
 setStatus('載入地圖分區…');
 setTimeout(async () => {
