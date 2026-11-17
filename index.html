@@ -866,9 +866,10 @@ const GLOW_TEX = (() => {
   const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; return t;
 })();
 const GLOW_LAMP_TEX_HOOK = () => { matRetroGlow.uniforms.map.value = GLOW_TEX; matRetroGlow.uniforms.uScale.value = renderer.domElement.height / (2 * Math.tan(camera.fov * Math.PI / 360)); };
-const GLOW_LAMP = new T.PointsMaterial({ map: GLOW_TEX, color: new T.Color(1, 0.8, 0.5), size: 4.5, sizeAttenuation: true, transparent: true, depthWrite: false, blending: T.AdditiveBlending, opacity: 0, toneMapped: false, fog: false });
+const HPS = [1.0, 0.3, 0.035];   // 國道路燈 = 高壓鈉燈 (約 2000 K、色度 x≈0.53 y≈0.415 → 線性 sRGB，畫面上約 #FF9535 橘色)
+const GLOW_LAMP = new T.PointsMaterial({ map: GLOW_TEX, color: new T.Color(...HPS), size: 4.5, sizeAttenuation: true, transparent: true, depthWrite: false, blending: T.AdditiveBlending, opacity: 0, toneMapped: false, fog: false });
 const matLampPole = new T.MeshStandardMaterial({ color: new T.Color(0.42, 0.44, 0.46), metalness: 0.6, roughness: 0.45 });
-const matLampHead = new T.MeshStandardMaterial({ color: new T.Color(0.08, 0.08, 0.08), emissive: new T.Color(1, 0.82, 0.55), emissiveIntensity: 0, roughness: 0.4 });
+const matLampHead = new T.MeshStandardMaterial({ color: new T.Color(0.08, 0.08, 0.08), emissive: new T.Color(...HPS), emissiveIntensity: 0, roughness: 0.4 });
 
 // ======================================================================= 材質 (移植自 Blender)
 const GLSL_NOISE = `
@@ -948,7 +949,7 @@ const matAsphalt = patch(new T.MeshStandardMaterial({ roughness: 0.85, metalness
   if (uNight > 0.01 && gTun < 0.5) {   // 夜晚: 中央分隔島路燈照在路面 (每 40 m 一盞)
     float ds = (fract((vRUv.y - 2.0) / 40.0 + 0.5) - 0.5) * 40.0, du = vRUv.x - 1.0;
     float L = exp(-(ds * ds * 0.5 + du * du * 0.7) / 90.0) + 0.01;   // 燈下一圈光，燈與燈之間是暗的
-    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.82, 0.55) * L * 1.1 * uNight;
+    totalEmissiveRadiance += diffuseColor.rgb * vec3(1.0, 0.3, 0.035) * L * 1.5 * uNight;   // 高壓鈉燈橘光
   }`,
   color: `{
     float tun = step(50.0, vLs), ls = vLs - tun * 100.0;
