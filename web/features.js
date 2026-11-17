@@ -151,8 +151,8 @@ function bakeByMaterial(root, frame, filter) {
 
 // ======================================================================= AI 車流 (多車種、國道 + 一般道路)
 const TV = window.TWV.TYPES;
-const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 50 : 140))));   // 塞車時要排得出一整排車
-const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 28 : 75))));
+const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 50 : 50))));   // 塞車時要排得出一整排車
+const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 28 : 28))));
 const COLORS = [ // 線性色彩；權重
   [[0.80, 0.80, 0.78], 24], [[0.45, 0.46, 0.48], 18], [[0.012, 0.012, 0.014], 14], [[0.09, 0.095, 0.10], 10],
   [[0.50, 0.02, 0.02], 7], [[0.03, 0.08, 0.36], 7], [[0.04, 0.17, 0.07], 4], [[0.48, 0.40, 0.28], 5], [[0.65, 0.66, 0.70], 3],
@@ -1776,7 +1776,7 @@ TW.HOOKS.init.push(() => {
 // 道路兩側 8 m 內、高架下方都不種。玩家移動 150 m 以上才重新排一次。
 const trees = (() => {
   if (TW.params.has('notrees')) return { update() {}, dirty() {} };
-  const CAP = TW.MOBILE ? 700 : 7000, R = TW.MOBILE ? 320 : 900, STEP = 18;
+  const CAP = TW.MOBILE ? 700 : 700, R = TW.MOBILE ? 320 : 320, STEP = 18;
   const crownGeo = new T.IcosahedronGeometry(1, 1);
   { // 樹冠稍微壓扁、表面不規則
     const p = crownGeo.getAttribute('position');

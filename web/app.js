@@ -211,7 +211,7 @@ function terrainAt(x, y) {
 const renderer = new T.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
 // 手機 (觸控裝置) 省電模式: 解析度、陰影降低，建築只畫附近
 const MOBILE = params.get('touch') === '1' || (params.get('touch') !== '0' && window.matchMedia && matchMedia('(pointer: coarse)').matches);
-renderer.setPixelRatio(MOBILE ? Math.min(window.devicePixelRatio, 1) : Math.min(window.devicePixelRatio, 1.5));
+renderer.setPixelRatio(MOBILE ? Math.min(window.devicePixelRatio, 1) : Math.min(window.devicePixelRatio, 1));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = T.SRGBColorSpace;
 renderer.toneMapping = T.AgXToneMapping;          // 與 Blender 相同的 AgX
@@ -292,7 +292,7 @@ scene.fog = new T.FogExp2(HORIZON.clone(), 0.000045);
 
 const sun = new T.DirectionalLight(0xffffff, 3.2);   // 與 Blender 太陽強度相同
 sun.castShadow = true;
-sun.shadow.mapSize.set(MOBILE ? 1024 : 4096, MOBILE ? 1024 : 4096);
+sun.shadow.mapSize.set(MOBILE ? 1024 : 1024, MOBILE ? 1024 : 1024);
 const SC = sun.shadow.camera; SC.left = -90; SC.right = 90; SC.top = 90; SC.bottom = -90; SC.near = 1; SC.far = 1500;
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
@@ -1262,9 +1262,9 @@ function addCityRoad(c, w) {
 
 // ======================================================================= 分區串流
 // 車子附近: 先下載資料 (DATA_R)，鄰近 8 區的資料都到了才建模型 (MESH_R)，遠了丟掉模型 (資料留著，回來不用重下載)
-const MESH_R = +(params.get('meshr') || (MOBILE ? 4200 : 7000));
+const MESH_R = +(params.get('meshr') || (MOBILE ? 4200 : 4200));
 const DATA_R = MESH_R + TS * 1.45;            // 模型區的鄰區一定已經有資料
-const TERR_R = +(params.get('terrr') || (MOBILE ? 9000 : 18000));
+const TERR_R = +(params.get('terrr') || (MOBILE ? 9000 : 9000));
 const TILES = new Map();                       // 細節分區 key -> { key, tx, ty, state, ways, piers, bld, linked, joints, group, bldChunks }
 const TERR_REC = new Map();                    // 地形分區 key -> { state, mesh }
 let inflight = 0;
@@ -1593,7 +1593,7 @@ function cullBuildings(dt) {
   bldClock -= dt;
   if (bldClock > 0) return;
   bldClock = 0.5;
-  const R = (MOBILE ? 1600 : 4500) + 700;
+  const R = (MOBILE ? 1600 : 1600) + 700;
   for (const rec of TILES.values()) for (const ch of rec.bldChunks) { const vis = Math.hypot(ch.x - S.x, ch.y - S.y) < R; for (const m of ch.meshes) m.visible = vis; }
 }
 function buildBuildings(bld, world) {
@@ -2018,7 +2018,7 @@ window.addEventListener('keydown', (e) => {
     const d = e.code === 'KeyQ' ? -1 : 1;
     S.signal = S.signal === d ? 0 : d; S.signalAuto = false; S.sigArmed = false;
   }
-  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Numpad2','Numpad4','Numpad6','Numpad8'].includes(e.code)) e.preventDefault();
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
@@ -2167,10 +2167,10 @@ function update(dt) {
   const vt = S.vt || (window.TWV && window.TWV.TYPES.sedan) || { acc: 1.5, vmax: 45, wb: 2.8, wid: 1.85 };
   const big = vt.len > 6.5;
   let thr = 0, brk = 0, str = 0;
-  if (keys.KeyW || keys.ArrowUp) thr = 1;
-  if (keys.KeyS || keys.ArrowDown) brk = 1;
-  if (keys.KeyA || keys.ArrowLeft) str += 1;
-  if (keys.KeyD || keys.ArrowRight) str -= 1;
+  if (keys.KeyW || keys.ArrowUp || keys.Numpad8) thr = 1;
+  if (keys.KeyS || keys.ArrowDown || keys.Numpad2) brk = 1;
+  if (keys.KeyA || keys.ArrowLeft || keys.Numpad4) str += 1;
+  if (keys.KeyD || keys.ArrowRight || keys.Numpad6  ) str -= 1;
   // 類比輸入 (螢幕方向盤、重力感應、實體方向盤 / 搖桿): 有在轉就取代鍵盤左右
   const analog = S.steerAxis != null && Math.abs(S.steerAxis) > 0.025;
   if (analog) str = S.steerAxis;

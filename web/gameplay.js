@@ -128,7 +128,7 @@ const weather = (() => {
     if (mode === 0 && performance.now() - liveAt > 60000) fetchLive();
   }
   // ---- 雨滴: 攝影機周圍一圈落下的線段 (相對攝影機移動拉長，車速快時往後斜)
-  const N = TW.MOBILE ? 1600 : 5200, R = 32, H = 22;
+  const N = TW.MOBILE ? 1600 : 1600, R = 32, H = 22;
   const pos = new Float32Array(N * 6), seed = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) { seed[i * 3] = (Math.random() * 2 - 1) * R; seed[i * 3 + 1] = Math.random() * H; seed[i * 3 + 2] = (Math.random() * 2 - 1) * R; }
   const geo = new T.BufferGeometry(); geo.setAttribute('position', new T.BufferAttribute(pos, 3));
