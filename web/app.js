@@ -549,28 +549,51 @@ function concreteLike(color, rough, amt, scale = 0.3) {
 }
 const matConcrete = concreteLike([0.5, 0.49, 0.46], 0.85, 0.25);
 // 風化混凝土護欄 (照街景): 灰色帶斑駁、垂直雨痕、底部較髒、每 6 m 一道接縫、每 3 m 一個底部排水孔
-const matBarrier = patch(new T.MeshStandardMaterial({ roughness: 0.92, metalness: 0, side: T.DoubleSide }), {
+// 紐澤西護欄: Poly Haven 實景掃描混凝土 (CC0) — 底層 dirty_concrete (淺灰、真實孔洞與污點)，
+// 水漬層 concrete_wall_006 (深色老舊混凝土)，照國道街景: 大片深色水漬 (下半部多)、頂部往下流的雨痕、底部最髒、頂部平台乾淨
+const BAR_U = {
+  tBD: { value: texFrom('tex-barrier_diff', true) },
+  tBS: { value: texFrom('tex-barrier_stain', true) },
+  tBN: { value: texFrom('tex-barrier_nor_gl', false) },
+};
+const matBarrier = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness: 0, side: T.DoubleSide }), {
   vert: 'attribute vec2 aUv; varying vec2 vRUv;',
   vmain: 'vRUv = aUv;',
-  frag: 'varying vec2 vRUv;',
+  frag: 'varying vec2 vRUv; uniform sampler2D tBD; uniform sampler2D tBS; uniform sampler2D tBN; vec2 gBuv; float gStain;',
+  uniforms: BAR_U,
   color: `{
+    #define STR(x) clamp(((x) - 0.5) * 2.4 + 0.5, 0.0, 1.0)
     float s = vRUv.x, h = vRUv.y;
     float fw = max(fwidth(s), 1e-4);
-    float n = fwyFbm(vec3(s * 0.9, h * 3.0, 0.0), 5);
-    float streak = fwyFbm(vec3(s * 6.0, h * 0.35, 1.7), 3);
-    vec3 c = vec3(0.2, 0.195, 0.185) * (0.78 + 0.35 * n);
-    c *= mix(1.0, 0.62, smoothstep(0.52, 0.8, streak));                                    // 垂直雨痕
-    float grime = fwyFbm(vec3(s * 0.22, h * 1.2, 4.3), 4);                                  // 大片黑色污漬 (街景上一塊一塊)
-    c *= mix(1.0, 0.42, smoothstep(0.5, 0.72, grime) * smoothstep(0.05, 0.4, h));
-    c *= mix(0.55, 1.0, smoothstep(0.0, 0.38, h));                                          // 底部被輪胎濺髒
-    float moss = smoothstep(0.55, 0.75, fwyFbm(vec3(s * 0.5, h * 2.0, 8.1), 3)) * (1.0 - smoothstep(0.05, 0.3, h));
-    c = mix(c, vec3(0.07, 0.085, 0.05), moss * 0.6);                                        // 底部青苔
-    c *= mix(1.0, 1.12, smoothstep(0.8, 0.86, h));                                          // 平頂受光較亮
-    float jd = abs(fract(s / 6.0 + 0.5) - 0.5) * 6.0;
-    c *= mix(0.35, 1.0, smoothstep(0.012, 0.012 + fw * 1.5, jd));
+    float seg = floor(s / 6.0);
+    float r1 = fract(sin(seg * 12.9898 + 4.1) * 43758.5453), r2 = fract(sin(seg * 78.233 + 1.3) * 24634.6345);
+    gBuv = vec2(s, h * 1.2) / 2.2 + vec2(r1 * 0.37, r2 * 0.61);                               // 每節各自偏移，看不出重複
+    vec3 base = texture2D(tBD, gBuv).rgb * mix(0.68, 0.92, r1);                              // 每節新舊不同
+    vec3 stain = texture2D(tBS, gBuv * 0.8 + vec2(0.31, 0.17)).rgb * mix(0.9, 1.25, r2);
+    float m1 = STR(fwyFbm(vec3(s * 0.33, h * 1.25, r2 * 7.0), 5));
+    float drip = STR(fwyFbm(vec3(s * 4.5, h * 0.38, 1.7), 3));
+    float mask = smoothstep(0.4, 0.66, m1 + 0.6 * (0.42 - h) + 0.3 * (r2 - 0.45));             // 大片水漬，越下面越多 (上半部多露出淺灰)
+    mask = max(mask, smoothstep(0.58, 0.82, drip) * smoothstep(0.86, 0.55, h) * 0.85);        // 頂部往下流的雨痕
+    mask = max(mask, 1.0 - smoothstep(0.04, 0.22, h));                                        // 底部輪胎濺起的泥污
+    gStain = clamp(mask, 0.0, 1.0);
+    vec3 c = mix(base, stain, gStain);
+    c = mix(c, base * 1.12, smoothstep(0.82, 0.865, h) * 0.65);                               // 頂部平台比較乾淨
+    float jd = abs(fract(s / 6.0 + 0.5) - 0.5) * 6.0;                                         // 到接縫的距離 (m)
+    c *= mix(0.25, 1.0, smoothstep(0.01, 0.01 + fw * 1.5, jd));                              // 接縫黑線
+    c *= mix(0.7, 1.0, smoothstep(0.03, 0.12, jd));                                           // 接縫邊角髒
     float dd = abs(fract(s / 3.0) - 0.5) * 3.0;
-    float slot = (1.0 - smoothstep(0.15, 0.15 + fw, dd)) * (1.0 - smoothstep(0.085, 0.1, h));
+    float slot = (1.0 - smoothstep(0.15, 0.15 + fw, dd)) * (1.0 - smoothstep(0.085, 0.1, h));   // 底部排水孔
     diffuseColor.rgb = mix(c, vec3(0.01), slot);
+  }`,
+  rough: 'roughnessFactor = mix(0.86, 0.98, gStain);',
+  // 法線貼圖: 護欄沒有切線，用螢幕導數算 (跟 three.js 內建 perturbNormal2Arb 同法)
+  normal: `{
+    vec3 tn = texture2D(tBN, gBuv).rgb * 2.0 - 1.0; tn.xy *= 1.1;
+    vec3 q0 = dFdx(-vViewPosition), q1 = dFdy(-vViewPosition); vec2 st0 = dFdx(gBuv), st1 = dFdy(gBuv);
+    vec3 N = normal, q1p = cross(q1, N), q0p = cross(N, q0);
+    vec3 Tg = q1p * st0.x + q0p * st1.x, Bg = q1p * st0.y + q0p * st1.y;
+    float det = max(dot(Tg, Tg), dot(Bg, Bg)), sc = det == 0.0 ? 0.0 : inversesqrt(det);
+    normal = normalize(Tg * (tn.x * sc) + Bg * (tn.y * sc) + N * tn.z);
   }`,
 });
 // 匝道槽化區: 舊瀝青 + 兩側白實線 + 斜向白色斑馬紋 (aUv.x = 沿線距離、aUv.y = 離主線路緣距離、aLs = 該處寬度)
