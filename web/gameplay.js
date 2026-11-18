@@ -94,6 +94,13 @@ const sfx = (() => {
     o.type = type; o.frequency.value = f; g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(vol, t + 0.01); g.gain.exponentialRampToValueAtTime(0.0005, t + dur);
     o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur + 0.05);
   }
+  function sweep(f0, f1, t0, dur, vol, type = 'sine') {   // 頻率滑動的音 (閃光燈充電的高音)
+    if (!ac) return;
+    const o = ac.createOscillator(), g = ac.createGain(), t = ac.currentTime + t0;
+    o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(0, t); g.gain.linearRampToValueAtTime(vol, t + 0.02); g.gain.setValueAtTime(vol, t + dur * 0.8); g.gain.linearRampToValueAtTime(0, t + dur);
+    o.connect(g); g.connect(ac.destination); o.start(t); o.stop(t + dur + 0.05);
+  }
   function noise(t0, dur, f, vol) {
     if (!ac) return;
     const s = ac.createBufferSource(); s.buffer = nb; const bp = ac.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = f; bp.Q.value = 1.2;
@@ -103,7 +110,13 @@ const sfx = (() => {
   return {
     chime() { tone(1318, 0, 0.25); tone(988, 0.18, 0.4); },            // 測速提醒「叮咚」
     warn() { tone(1760, 0, 0.09, 0.1, 'square'); tone(1760, 0.14, 0.09, 0.1, 'square'); },
-    shutter() { noise(0, 0.05, 3000, 0.5); noise(0.07, 0.08, 1800, 0.35); },
+    // 測速器的接近嗶聲: 平常是短促的「嗶」，超速時換成高音的急促雙響
+    radar(over) {
+      if (over) { tone(2093, 0, 0.05, 0.09, 'square'); tone(2093, 0.075, 0.05, 0.09, 'square'); }
+      else tone(1568, 0, 0.07, 0.07, 'triangle');
+    },
+    // 被拍: 快門「喀」→ 閃光燈充電的高音 → 第二聲「嚓」
+    shutter() { noise(0, 0.035, 3200, 0.6); noise(0.04, 0.05, 1500, 0.35); sweep(2400, 7200, 0.08, 0.35, 0.025); noise(0.46, 0.04, 2600, 0.4); },
     coin() { tone(1046, 0, 0.12, 0.1); tone(1568, 0.1, 0.35, 0.1); },
     beep() { tone(2093, 0, 0.12, 0.07, 'triangle'); },                  // ETC 車機「嗶」
     wipe(v) { noise(0, 0.12, 380, 0.09 * v); },
@@ -254,7 +267,7 @@ const cams = (() => {
   const GC = 600, grid = new Map();
   for (const c of list) { const k = Math.floor(c.x / GC) * 100003 + Math.floor(c.y / GC); let a = grid.get(k); if (!a) grid.set(k, a = []); a.push(c); }
   const near = (x, y) => { const out = [], cx = Math.floor(x / GC), cy = Math.floor(y / GC); for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) for (const c of grid.get((cx + i) * 100003 + cy + j) || []) out.push(c); return out; };
-  let on = store.get('tw_camwarn', true), tickets = store.get('tw_tickets', []), active = null, sec = null, clock = 0, odo = 0, gt = 0;
+  let on = store.get('tw_camwarn', true), tickets = store.get('tw_tickets', []), active = null, sec = null, clock = 0, odo = 0, gt = 0, camDist = 1e9, beepT = 0;
   const fineOf = (over) => over <= 20 ? 3000 : over <= 40 ? 4000 : over <= 60 ? 6000 : 12000;   // 參考: 國道超速罰鍰級距 (簡化)
   function ticket(spd, max, where) {
     const f = fineOf(spd - max);
@@ -314,6 +327,13 @@ const cams = (() => {
   }
   function frame(dt) {
     odo += Math.abs(S.v) * dt; gt += dt;
+    // 接近嗶聲 (300 m 內): 300 m 約 1.3 秒一聲、越近越密；超速時每 0.22 秒急促雙響
+    camDist -= Math.abs(S.v) * dt; beepT -= dt;
+    if (on && active && active.warned && camDist > 0 && camDist < 300 && beepT <= 0) {
+      const over = kmh() > active.max;
+      sfx.radar(over);
+      beepT = over ? 0.22 : 0.22 + (camDist / 300) * 1.1;
+    }
     clock -= dt; if (clock > 0) return; clock = 0.2;
     const fx = Math.cos(S.h), fy = Math.sin(S.h);
     let best = null, bf = 1e9;
@@ -344,10 +364,10 @@ const cams = (() => {
         const over = kmh() > best.max;
         camBox.className = over ? 'over' : '';
         camBox.innerHTML = `📷 測速照相 <b>${Math.round(bf)} m</b>限速 ${best.max}${over ? ' · 超速！' : ''}`;
-        if (over && Math.random() < 0.25) sfx.warn();
+
       }
     } else if (!sec) camBox.className = 'hidden';
-    active = best;
+    active = best; camDist = best ? bf : 1e9;
     // ---- 區間測速
     if (!sec) {
       for (const q of secs) {

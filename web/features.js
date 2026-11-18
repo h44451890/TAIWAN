@@ -257,16 +257,28 @@ function laneLatC(c, lane) {
 const laneOK = (c, lane) => lane >= 0 && lane < TW.laneCount(c.w) && !(HEAVY.has(c.type) && !c.w.city && lane < TW.laneCount(c.w) - 2);
 const distToEnd = (c) => c.dir > 0 ? wayLen(c.w) - c.s : c.s;
 
+let simT = 0;   // 車流時間 (走走停停波用)
 function desiredSpeed(c) {
   const w = c.w;
-  let lim = TW.speedLimit(w) / 3.6;
-  if (!w.city) { const t = wayTraffic[w.k]; if (t && t.speed > 0) lim = levelOf(t) <= 1 ? Math.max(t.speed, TW.speedLimit(w)) / 3.6 : t.speed / 3.6; }   // 順暢路段照限速開 (旅行速度是平均值，偏低)
-  let v = Math.min(lim * c.pers * c.mood, c.T.vmax * (HEAVY.has(c.type) ? 0.92 : 1));
+  let lim = TW.speedLimit(w) / 3.6, wave = 1, floor = 2;
+  if (!w.city) {
+    const t = wayTraffic[w.k], lv = levelOf(t);
+    if (t && t.speed > 0) lim = lv <= 1 ? Math.max(t.speed, TW.speedLimit(w)) / 3.6 : t.speed / 3.6;   // 順暢路段照限速開 (旅行速度是平均值，偏低)
+    if (lv >= 3) {
+      // 塞車不是整排等速前進，是一波一波走走停停: 波長約 350 m、以約 15 km/h 往後 (上游) 傳。
+      // 前面的車先慢下來、煞車燈一路往後亮；起伏的平均值大約還是即時旅行速度
+      const amp = lv >= 5 ? 0.95 : lv === 4 ? 0.8 : 0.5;
+      const ph = (c.s * c.dir + (w.gid % 97) * 37) / 350 + simT * 4.2 / 350;
+      wave = Math.max(0.05, 1 + amp * Math.sin(ph * 2 * Math.PI));
+      if (lv >= 4) floor = 1;   // 嚴重壅塞可以慢到快停 (卡死偵測是 0.3 m/s 以下，不會被當成卡住回收)
+    }
+  }
+  let v = Math.min(lim * c.pers * c.mood * wave, c.T.vmax * (HEAVY.has(c.type) ? 0.92 : 1));
   if (c.plan && c.plan.vturn < 50) {   // 路口轉彎前減速
     const d = Math.max(0, distToEnd(c) - 4);
     v = Math.min(v, Math.sqrt(c.plan.vturn * c.plan.vturn + 2 * 1.6 * d));
   }
-  return Math.max(2, v);
+  return Math.max(floor, v);
 }
 function densityWeight(w) {
   if (w.city) return w.cls === 5 ? 0.5 : (w.cls === 2 ? 3 : w.cls === 3 ? 2.4 : 1.6);
@@ -356,6 +368,11 @@ function trySpawn(c, pool, minR, maxR) {
     });
     if (mine.length) { pickFrom = mine; focused = true; }
   }
+  if (pool === 'fwy' && fwyLv >= 3) {
+    const hx = Math.cos(S.h), hy = Math.sin(S.h), far = Math.max(150, maxR * 0.55);
+    const hidden = pickFrom.filter((sm) => { const f = (sm[2] - S.x) * hx + (sm[3] - S.y) * hy; return f < -30 || f > far; });
+    if (hidden.length >= 12) pickFrom = hidden;   // 候選太少就不限制 (車數補滿優先，不然塞車反而車變少)
+  }
   for (let attempt = 0; attempt < 16; attempt++) {
     const sm = pickFrom[(Math.random() * pickFrom.length) | 0];
     const w = WAYS[sm[0]];
@@ -382,6 +399,7 @@ function trySpawn(c, pool, minR, maxR) {
       id: nextId++, alive: true, pool, type, T: TT, w, s: s0, dir, lane, lat, prevLat: lat, pers: pool === 'fwy' ? rand(0.95, 1.15) : rand(0.88, 1.1), mood: 1, moodT: 1, moodTimer: rand(10, 40),
       color: pick(PAINTS[type] || COLORS.map((x) => x[0])), accent: pick(ACCENTS[type] || [[0.6, 0.6, 0.6]]),
       sx: scale[0], sy: scale[1], sz: scale[2], front: TT.front * scale[0], rear: TT.rear * scale[0], wid: TT.wid * scale[2],
+      th: rand(0.8, 1.35), gapMin: rand(0.75, 1.4),   // 個人跟車習慣: 時間車距、停車間距倍數 (塞車時車距才不會整齊劃一)
       lcCool: rand(2, 8), vlat: 0, brake: false, deadEnd: false, pending: null, signal: 0, sigT: 0, plan: null, roll: 0, trail: [],
       x: POSE.x, y: POSE.y, z: POSE.z, h: Math.atan2(POSE.ty, POSE.tx) + (dir < 0 ? Math.PI : 0), pitch: 0,
     });
@@ -417,8 +435,20 @@ function syncPlayer() {
   return PLAYER;
 }
 const isChanging = (o) => o.isPlayer ? o.changing : (o.pending != null || Math.abs(o.lat - laneLatC(o, o.lane)) > 0.3);
+// 空間格子 (80 m 一格): 找前車、換道檢查只看附近 5×5 格 (半徑 ≥160 m，比 leaderFor 看的範圍大)。
+// 以前每台車都要把全部 ~215 台掃一遍 (O(n²))，國道塞車時一次更新 5 ms 以上，畫面一慢又變成每幀兩次 → 越來越卡
+const GRID_C = 80, GRID = new Map();
+const gkey = (x, y) => (Math.floor(x / GRID_C) + 4096) * 8192 + (Math.floor(y / GRID_C) + 4096);
+function buildGrid() {
+  for (const a of GRID.values()) a.length = 0;
+  for (const c of cars) if (c.alive) { const k = gkey(c.x, c.y); let a = GRID.get(k); if (!a) GRID.set(k, a = []); a.push(c); }
+}
 function eachOther(me, fn) {
-  for (const o of cars) if (o !== me && o.alive) fn(o);
+  const cx = Math.floor(me.x / GRID_C) + 4096, cy = Math.floor(me.y / GRID_C) + 4096;
+  for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) {
+    const a = GRID.get((cx + i) * 8192 + cy + j);
+    if (a) for (let n = 0; n < a.length; n++) { const o = a[n]; if (o !== me && o.alive) fn(o); }
+  }
   if (me !== PLAYER) fn(syncPlayer());
 }
 /** 前車: shift = 目標車道相對目前位置的橫向位移 (行進方向左正)；一般道路另外檢查路口橫向來車 */
@@ -432,7 +462,10 @@ function leaderFor(me, shift) {
     if (Math.abs(o.z - me.z) > 3) return;
     const dx = o.x - me.x, dy = o.y - me.y;
     if (dx * dx + dy * dy > 40000) return;
-    const d = dx * fx + dy * fy, lat = -dx * fy + dy * fx, cs = Math.cos(o.h - me.h);
+    // 提早排除 (兩個分支都只看前方 0~160 m、橫向 12 m 內): 後面的車、太遠、隔好幾個車道的不用再算角度
+    const d = dx * fx + dy * fy; if (d <= 0 || d > 160) return;
+    const lat = -dx * fy + dy * fx; if (lat < lo - 12 || lat > hi + 12) return;
+    const cs = Math.cos(o.h - me.h);
     const oCity = o.isPlayer ? !!(o.w && o.w.city) : o.pool === 'city', meCity = me.isPlayer ? !!(me.w && me.w.city) : me.pool === 'city';
     if (oCity !== meCity && Math.abs(cs) < 0.7) return;   // 不同路網的交叉 (上下穿越) 互不影響
     // 卡住太久 (互相禮讓的死結): 不再讓斜向/橫向也卡住的車，平行同車道的前車照樣跟
@@ -462,8 +495,10 @@ function laneSafeFor(me, shift) {
   const fx = Math.cos(me.h), fy = Math.sin(me.h);
   let safe = true;
   eachOther(me, (o) => {
-    if (!safe || Math.abs(o.z - me.z) > 3 || Math.cos(o.h - me.h) < 0.3) return;
-    const dx = o.x - me.x, dy = o.y - me.y, d = dx * fx + dy * fy, lat = -dx * fy + dy * fx;
+    if (!safe || Math.abs(o.z - me.z) > 3) return;
+    const dx = o.x - me.x, dy = o.y - me.y, d = dx * fx + dy * fy; if (d > 90 || d < -110) return;   // 前後太遠的不影響換道
+    if (Math.cos(o.h - me.h) < 0.3) return;
+    const lat = -dx * fy + dy * fx;
     const hw = (me.wid + o.wid) / 2 + 0.25;
     if (Math.abs(lat - shift) < hw && d > -(o.front + me.rear + 8 + Math.max(0, o.v - me.v) * 2.8) && d < me.front + o.rear + 10 + Math.max(0, me.v - o.v) * 2.2) { safe = false; return; }
     if (Math.abs(d) >= 34 || !isChanging(o)) return;
@@ -490,7 +525,7 @@ function stepCar(c, dt) {
   if (!c.plan && distToEnd(c) < 55) c.plan = choosePlan(c) || { none: true, vturn: 3 };
   c.v0 = desiredSpeed(c);
   // IDM 跟車
-  const A = c.T.acc, Bd = BIG.has(c.type) ? 1.8 : 2.3, S0 = c.type === 'scooter' ? 1.2 : 2.5, TH = BIG.has(c.type) ? 1.6 : 1.3;
+  const A = c.T.acc, Bd = BIG.has(c.type) ? 1.8 : 2.3, S0 = (c.type === 'scooter' ? 1.2 : 2.5) * (c.gapMin || 1), TH = (BIG.has(c.type) ? 1.6 : 1.3) * (c.th || 1);
   let a = A * (1 - Math.pow(c.v / c.v0, 4));
   if (gap < 1e8) {
     const ss = S0 + Math.max(0, c.v * TH + c.v * (c.v - vl) / (2 * Math.sqrt(A * Bd)));
@@ -673,14 +708,19 @@ function drawInstance(name, c, x, y, z, h, pitch, roll, sx, sy, sz, blink, flash
     else if (kind === 'flashB') im.setColorAt(i, flash ? FL_OFF : FL_B);
   }
 }
+const PROF = TW.params.has('prof') ? { step: 0, coll: 0, resp: 0, draw: 0, n: 0 } : null;   // ?prof: 測試用計時
 function updateTraffic(dt) {
   if (!INST) return;
-  const sub = dt > 1 / 45 ? 2 : 1;
-  for (let k = 0; k < sub; k++) for (const c of cars) if (c.alive) {
+  simT += dt;
+  let pt = PROF ? performance.now() : 0;
+  const sub = dt > 1 / 25 ? 2 : 1;   // 30 fps 以上一步就夠 (以前 45 fps 以下就算兩次，畫面一慢負擔加倍、越來越卡)
+  for (let k = 0; k < sub; k++) for (const c of (buildGrid(), cars)) if (c.alive) {
     stepCar(c, dt / sub);
     if (!Number.isFinite(c.x + c.y + c.z + c.h + c.s + c.v)) { stats.nan++; kill(c); }   // 防護: 座標算壞就回收
   }
+  if (PROF) { const t = performance.now(); PROF.step += t - pt; pt = t; PROF.n++; }
   collidePlayer(dt);
+  if (PROF) { const t = performance.now(); PROF.coll += t - pt; pt = t; }
   // 回收: 國道 1.8 km、一般道路 650 m 外才回收並在遠處重新生成 (不會在眼前消失)
   respawnClock -= dt;
   if (respawnClock <= 0) {
@@ -720,6 +760,7 @@ function updateTraffic(dt) {
       }
     }
   }
+  if (PROF) { const t = performance.now(); PROF.resp += t - pt; pt = t; }
   // 繪製
   const now = performance.now(), blink = (now % 666) < 333, flash = (now % 500) < 250;
   for (const k in INST) { INST[k].n = 0; for (const wg of INST[k].wheels) wg.n = 0; }
@@ -738,6 +779,7 @@ function updateTraffic(dt) {
     for (const im of INST[k].meshes) { im.count = INST[k].n; im.instanceMatrix.needsUpdate = true; if (im.instanceColor) im.instanceColor.needsUpdate = true; }
     for (const wg of INST[k].wheels) for (const im of wg.meshes) { im.count = wg.n; im.instanceMatrix.needsUpdate = true; }
   }
+  if (PROF) PROF.draw += performance.now() - pt;
 }
 // 智行地圖路況圖層 (Smart-Nav-Map /api/traffic/segments): 國道 + 臺北、桃園市區官方路況 + 手機回報，順暢的不送
 // 連得上智行地圖伺服器時，小地圖照它的顏色畫出車多、壅塞的路段 (市區道路也有)
@@ -1954,6 +1996,6 @@ function overlaps() {
   }
   return n;
 }
-window.TWX = { cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync, controls,
+window.TWX = { PROF, cars, signs, GUIDES, wayTraffic, radio, sound, stats, overlaps, gpsSync, controls,
   sign: { panelBase, drawSpaced, zhFont, enFont, textW, signMat, backMat, placeOnWay, drawShield, mergedGroup, SGN, ZH_SP, ZH_FONT, EN_FONT } };
 })();

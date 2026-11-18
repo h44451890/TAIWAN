@@ -218,7 +218,9 @@ const MOBILE = params.get('touch') === '1' || (params.get('touch') !== '0' && wi
 renderer.setPixelRatio(MOBILE ? Math.min(window.devicePixelRatio, 1) : Math.min(window.devicePixelRatio, 1.5));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = T.SRGBColorSpace;
-renderer.toneMapping = T.AgXToneMapping;          // 與 Blender 相同的 AgX
+// 色調: 預設 ACES (對比、飽和度高，白天比較鮮明)；?tone=agx 用原本與 Blender 相同的 AgX、?tone=neutral 用 Khronos 中性
+const TONE = new URLSearchParams(location.search).get('tone');
+renderer.toneMapping = TONE === 'agx' ? T.AgXToneMapping : TONE === 'neutral' ? T.NeutralToneMapping : T.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = T.PCFSoftShadowMap;
@@ -394,6 +396,34 @@ const GLOW_LAMP_TEX_HOOK = () => { matRetroGlow.uniforms.map.value = GLOW_TEX; m
 const HPS = [1.0, 0.3, 0.035];   // 國道路燈 = 高壓鈉燈 (約 2000 K、色度 x≈0.53 y≈0.415 → 線性 sRGB，畫面上約 #FF9535 橘色)
 const GLOW_LAMP = new T.PointsMaterial({ map: GLOW_TEX, color: new T.Color(...HPS), size: 4.5, sizeAttenuation: true, transparent: true, depthWrite: false, blending: T.AdditiveBlending, opacity: 0, toneMapped: false, fog: false });
 const matLampPole = new T.MeshStandardMaterial({ color: new T.Color(0.42, 0.44, 0.46), metalness: 0.6, roughness: 0.45 });
+// 隔音牆: 下半實心板 (灰綠)、上半透明壓克力 (淡青)，H 型鋼柱
+const matSoundWall = new T.MeshStandardMaterial({ color: new T.Color(0.2, 0.25, 0.22), roughness: 0.85, metalness: 0.1 });
+const matSoundGlass = new T.MeshStandardMaterial({ color: new T.Color(0.55, 0.72, 0.72), roughness: 0.12, metalness: 0.15, transparent: true, opacity: 0.32, depthWrite: false, side: T.DoubleSide });
+// 路邊廣告看板 (內容都是虛構的)：一張 3×2 格的貼圖集，每面看板取一格
+const BILLBOARD_TEX = (() => {
+  const cv = document.createElement('canvas'); cv.width = 2048; cv.height = 1024; const x = cv.getContext('2d');
+  const F = (n) => `900 ${n}px "PingFang TC","Microsoft JhengHei","Noto Sans TC",sans-serif`;
+  const ads = [
+    ['#ffd400', '#111', '廣告招租', '本看板出租・歡迎洽詢', '#c8102e'],
+    ['#0b3d2e', '#f5e6c4', '雲河苑', '近交流道・三房車位熱銷中', '#d4af37'],
+    ['#e9eef2', '#0a2a66', '汽車美容', '鍍膜・打蠟・內裝清潔', '#e4002b'],
+    ['#003a8c', '#ffffff', '疲勞勿開車', '休息一下　平安回家', '#ffd400'],
+    ['#b3001b', '#fff3d6', '夜市小吃', '下交流道 3 分鐘', '#ffd400'],
+    ['#ffffff', '#00695c', '健康檢查', '早期發現　早期治療', '#00a3a3'],
+  ];
+  ads.forEach(([bg, fg, big, small, acc], i) => {
+    const X = (i % 3) * 682, Y = Math.floor(i / 3) * 512, W = 682, H = 512;
+    x.fillStyle = bg; x.fillRect(X, Y, W, H);
+    x.fillStyle = acc; x.fillRect(X, Y + H - 70, W, 70); x.fillRect(X, Y, W, 18);
+    x.fillStyle = fg; x.textAlign = 'center'; x.textBaseline = 'middle';
+    x.font = F(150); x.fillText(big, X + W / 2, Y + 190, W - 40);
+    x.font = F(64); x.fillText(small, X + W / 2, Y + 340, W - 40);
+    x.strokeStyle = 'rgba(0,0,0,.35)'; x.lineWidth = 10; x.strokeRect(X + 5, Y + 5, W - 10, H - 10);
+  });
+  const t = new T.CanvasTexture(cv); t.colorSpace = T.SRGBColorSpace; t.anisotropy = 8; return t;
+})();
+const matBillboard = new T.MeshStandardMaterial({ map: BILLBOARD_TEX, emissiveMap: BILLBOARD_TEX, emissive: new T.Color(0.35, 0.35, 0.35), roughness: 0.6, side: T.DoubleSide });
+const matBillboardBack = new T.MeshStandardMaterial({ color: new T.Color(0.32, 0.33, 0.34), roughness: 0.7, metalness: 0.4 });
 const matLampHead = new T.MeshStandardMaterial({ color: new T.Color(0.08, 0.08, 0.08), emissive: new T.Color(...HPS), emissiveIntensity: 0, roughness: 0.4 });
 
 // ======================================================================= 材質 (移植自 Blender)
@@ -755,7 +785,7 @@ const matWater = patch(new T.MeshStandardMaterial({ roughness: 0.07, metalness: 
   }`,
 });
 // 地形: 依坡度與高度上色 — 平地是田野、草地拼塊，山坡是闊葉林 (近看有一叢叢樹冠)，陡坡露岩，高山 (2500 m 以上) 是箭竹草原
-const matTerrain = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness: 0 }), {
+const TERRAIN_SPEC = {
   vert: 'varying vec3 vTN; attribute vec4 aLc0; attribute vec4 aLc1; varying vec4 vLc0; varying vec4 vLc1;',
   vmain: 'vTN = normal; vLc0 = aLc0; vLc1 = aLc1;',
   frag: 'varying vec3 vTN; varying vec4 vLc0; varying vec4 vLc1;',
@@ -792,9 +822,18 @@ const matTerrain = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness
     vec3 cBed = vec3(0.05, 0.055, 0.045);
     c = mix(c, cBed, vLc0.x); c = mix(c, cSand, vLc0.y); c = mix(c, cGravel, vLc0.z); c = mix(c, cWet, vLc0.w);
     c = mix(c, cUrban, vLc1.x); c = mix(c, cFarm, vLc1.y); c = mix(c, forest, vLc1.z); c = mix(c, cGrass, vLc1.w);
+  #ifdef USE_MAP
+    // 國土測繪中心正射影像 (真的田、聚落、河床、山林)；近處再疊一點原本的細節雜訊，解析度不夠的地方才不會糊成一片
+    vec3 ph = texture2D(map, vMapUv).rgb;
+    ph = max(mix(vec3(dot(ph, vec3(0.3, 0.59, 0.11))), ph, 1.25), 0.0) * 0.8;   // 航照偏灰: 飽和度 +25%
+    ph *= mix(1.0, 0.8 + 0.4 * canopy, near * fw);
+    ph *= mix(1.0, 0.9 + 0.2 * n1, near);
+    c = mix(c, ph, 0.92);
+  #endif
     diffuseColor.rgb = c;
   }`,
-});
+};
+const matTerrain = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness: 0 }), TERRAIN_SPEC);
 
 // ======================================================================= 幾何建構
 class GB {
@@ -826,6 +865,67 @@ class GB {
 const BARRIER = [[-0.32, 0], [-0.3, 0.07], [-0.2, 0.16], [-0.11, 0.84], [-0.08, 0.87], [0.08, 0.87], [0.11, 0.84], [0.2, 0.16], [0.3, 0.07], [0.32, 0]];
 const BARRIER_INSET = 0.35;
 
+// GB('uv') 的貼圖座標存在 aUv (給自訂著色器)；用標準材質的 map 時要複製一份成 uv
+const withUv = (m) => { if (m) m.geometry.setAttribute('uv', m.geometry.getAttribute('aUv')); return m; };
+/** (x, y) 這個 40 m 格子裡有沒有一般道路 (判斷國道旁邊是不是市區用) */
+function cityAt(x, y) {
+  const a = GRID.get(cellKey(Math.floor(x / CELL), Math.floor(y / CELL)));
+  if (a) for (let j = 0; j < a.length; j += 2) { const w = WAYS[a[j]]; if (w && w.city) return true; }
+  return false;
+}
+/** 國道外側路邊設施: 市區段的隔音牆 (下半實心、上半壓克力、4 m 一根柱子) 與約每 1.2 km 一面廣告看板 */
+function roadside(c, w, o, inward) {
+  const { P, nx, ny, s, n, hw, M } = w, L = s[n - 1];
+  if (L < 30) return;
+  const at = (d) => { let k = 0; while (k < n - 2 && s[k + 1] < d) k++; const t = Math.min(1, Math.max(0, (d - s[k]) / ((s[k + 1] - s[k]) || 1)));
+    return { k, x: P[k * 3] + (P[k * 3 + 3] - P[k * 3]) * t, y: P[k * 3 + 1] + (P[k * 3 + 4] - P[k * 3 + 1]) * t, z: P[k * 3 + 2] + (P[k * 3 + 5] - P[k * 3 + 2]) * t }; };
+  const out = -inward;   // 外側方向 (乘在左法向上)
+  // 每 20 m 判一次旁邊是不是市區，前後各延伸 40 m (隔音牆會一路延伸過市區邊緣，不會一段一段)
+  const step = 20, ns = Math.ceil(L / step) + 1, urb = new Uint8Array(ns);
+  for (let q = 0; q < ns; q++) {
+    const p = at(q * step), ox = nx[p.k] * out, oy = ny[p.k] * out;
+    // 市區: 外側 35 / 60 / 90 m 有一般道路，或地表分類是市區 (台北盆地大部分沒有土地分類資料，只看分類會判不到)
+    let u = 0;
+    for (const dd of [35, 60, 90]) { const xx = p.x + ox * (hw + dd), yy = p.y + oy * (hw + dd); if (landcoverAt(xx, yy) === 5 || cityAt(xx, yy)) { u = 1; break; } }
+    urb[q] = u;
+  }
+  const wall = new Uint8Array(ns);
+  for (let q = 0; q < ns; q++) if (urb[q]) for (let r = Math.max(0, q - 2); r <= Math.min(ns - 1, q + 2); r++) wall[r] = 1;
+  // 隔音牆 (4 m 一片)
+  for (let d = 2; d < L - 2; d += 4) {
+    if (!wall[Math.min(ns - 1, Math.round(d / step))]) continue;
+    const p = at(d); if ((M[p.k] | M[p.k + 1]) & 2) continue;
+    const tx = ny[p.k], ty = -nx[p.k], ox = nx[p.k] * out, oy = ny[p.k] * out;
+    const cx = p.x + nx[p.k] * o + ox * 0.18, cy = p.y + ny[p.k] * o + oy * 0.18;
+    box(c.swall, cx, cy, tx, ty, 2.0, 0.07, p.z + 0.86, p.z + 2.3);
+    box(c.sglass, cx, cy, tx, ty, 1.97, 0.03, p.z + 2.3, p.z + 4.2);
+    box(c.spost, cx - tx * 2, cy - ty * 2, tx, ty, 0.09, 0.11, p.z + 0.86, p.z + 4.35);
+    box(c.spost, cx, cy, tx, ty, 2.0, 0.05, p.z + 4.2, p.z + 4.32);   // 頂部壓條
+  }
+  // 廣告看板: 市區段約每 1.2 km 一面 (位置由 gid 決定，每次載入都一樣)，立在護欄外 9 m，面向來車並往路內轉 18°
+  const first = 250 + ((w.gid * 7919) % 900);
+  for (let d = first, idx = w.gid; d < L - 60; d += 1200, idx++) {
+    if (!urb[Math.min(ns - 1, Math.round(d / step))]) continue;
+    const p = at(d); if ((M[p.k] | M[p.k + 1]) & 2) continue;
+    const tx = ny[p.k], ty = -nx[p.k], ox = nx[p.k] * out, oy = ny[p.k] * out;
+    const bx = p.x + nx[p.k] * o + ox * 9, by = p.y + ny[p.k] * o + oy * 9;
+    const gz = terrainAt(bx, by), base = Math.min(gz, p.z), top = p.z + 13, bot = top - 4.2;
+    if (p.z - gz > 25) continue;   // 高架很高的地方不放
+    box(c.bpole, bx, by, tx, ty, 0.35, 0.35, base - 0.5, bot + 0.5);
+    // 板面: 法向 = -行進方向 (面向來車) 往路內轉 18°
+    const a = 0.31, fx = -tx * Math.cos(a) - ox * Math.sin(a), fy = -ty * Math.cos(a) - oy * Math.sin(a);   // 板面朝向
+    const ux = -fy, uy = fx;   // 板面水平方向
+    const hwB = 6.0, ad = idx % 6, u0 = (ad % 3) / 3, v0 = 1 - Math.floor(ad / 3) / 2;
+    const g = c.bboard, i0 = g.n, fxo = fx * 0.12, fyo = fy * 0.12;
+    g.v(bx + fxo - ux * hwB, by + fyo - uy * hwB, bot); g.uv.push(u0 + 1 / 3, v0 - 0.5);
+    g.v(bx + fxo + ux * hwB, by + fyo + uy * hwB, bot); g.uv.push(u0, v0 - 0.5);
+    g.v(bx + fxo + ux * hwB, by + fyo + uy * hwB, top); g.uv.push(u0, v0);
+    g.v(bx + fxo - ux * hwB, by + fyo - uy * hwB, top); g.uv.push(u0 + 1 / 3, v0);
+    g.q(i0, i0 + 1, i0 + 2, i0 + 3);
+    box(c.bback, bx, by, ux, uy, hwB + 0.15, 0.1, bot - 0.15, top + 0.15);   // 背板 + 邊框
+    box(c.bpole, bx, by, ux, uy, hwB, 0.08, bot - 0.6, bot - 0.45);           // 下方維修走道
+  }
+}
 function addRoad(c, w) {
   const { P, nx, ny, s, n, hw } = w;
   // 路面
@@ -888,6 +988,8 @@ function addRoad(c, w) {
         box(c.glare, x, y, ny[k], -nx[k], 0.03, 0.03, z + 0.8, z + 0.9);   // 底座
       }
     }
+    // 隔音牆 + 廣告看板: 國道主線外側 (右邊)，旁邊 30~60 m 是市區的路段
+    if (bit === 2 && !w.link && !w.tunnel && w.oneway && !w.city && !params.has('nowall')) roadside(c, w, o, inward);
     // 路燈: 國道主線中央分隔島每 40 m 一支雙臂燈 (夜晚燈頭發光、路面有光暈)
     if (bit === 1 && !w.link && !w.tunnel && w.oneway && !params.has('nolamps')) {
       for (let d = 2; d < s[n - 1]; d += 40) {
@@ -1234,7 +1336,8 @@ function portalMesh(w, i) {
 
 const newChunk = () => ({ road: new GB('road'), city: new GB('road'), skirt: new GB(), barrier: new GB('uv'), glare: new GB(), lampPole: new GB(), lampHead: new GB(), glows: [], reflBlack: new GB(), reflFace: new GB('uv'), rglow: [], rnorm: [], reflR: new GB(), reflY: new GB(),
   gore: new GB('road'), gpost: new GB(), gband: new GB(), drum: new GB(), drumb: new GB(),
-  pier: new GB(), tunnel: new GB('uv'), tlight: new GB(), tcab: new GB(), portals: [] });
+  pier: new GB(), tunnel: new GB('uv'), tlight: new GB(), tcab: new GB(), portals: [],
+  swall: new GB(), sglass: new GB(), spost: new GB(), bboard: new GB('uv'), bback: new GB(), bpole: new GB() });
 
 /** 一般道路: 鋪在地形上的路面 (市區標線由材質依 aLs=路寬、aLanes=車道代碼 算出)；橋梁加梁身與橋墩 */
 function addCityRoad(c, w) {
@@ -1339,7 +1442,9 @@ function buildTile(rec) {
                    c.barrier.mesh(matBarrier, { cast: true }), c.glare.mesh(matGlare, { cast: true }), c.lampPole.mesh(matLampPole, { cast: true }), c.lampHead.mesh(matLampHead), c.pier.mesh(matConcrete, { cast: true }),
                    c.gore.mesh(matGore), c.gpost.mesh(matPost, { cast: true }), c.gband.mesh(matPostBand), c.drum.mesh(matDrum, { cast: true }), c.drumb.mesh(matDrumBand),
                    c.tunnel.mesh(matTunnelWall, { cast: true }), c.tlight.mesh(matTunnelLight, { receive: false }), c.tcab.mesh(matCabinet),
-                   c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false }), c.reflBlack.mesh(matReflBlack), c.reflFace.mesh(matRetro, { receive: false })]) if (m) g.add(m);
+                   c.reflR.mesh(matReflR, { receive: false }), c.reflY.mesh(matReflY, { receive: false }), c.reflBlack.mesh(matReflBlack), c.reflFace.mesh(matRetro, { receive: false }),
+                   c.swall.mesh(matSoundWall, { cast: true }), c.sglass.mesh(matSoundGlass, { receive: false }), c.spost.mesh(matLampPole, { cast: true }),
+                   withUv(c.bboard.mesh(matBillboard)), c.bback.mesh(matBillboardBack, { cast: true }), c.bpole.mesh(matLampPole, { cast: true })]) if (m) g.add(m);
   for (const [w, i] of c.portals) g.add(portalMesh(w, i));
   if (c.rglow.length && params.has('rglow')) {   // 遠方反光點: 預設關閉 (晚上遠處高架橋看不見時，光點像飄在空中)
     const rg = new T.BufferGeometry();
@@ -1359,6 +1464,75 @@ function disposeGroup(g) {
   if (g.parent) g.parent.remove(g);
   g.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
 }
+// ---- 地面正射影像 (國土測繪中心 WMTS，政府資料開放授權，畫面下方標示來源)
+// 玩家附近 (電腦 8 km、手機 5 km) 的地形分區各拼一張貼圖；全部圖磚都抓到才換上 (離線、抓不到就維持原本的地表上色)
+// 解析度分兩級: 玩家所在 / 相鄰分區 (1.5 km 內) 用高一級 (電腦 z15 ≈ 4.3 m/像素)，再遠用 z14；手機各低一級
+const ORTHO = { on: !params.has('noortho'), zNear: MOBILE ? 14 : 15, zFar: MOBILE ? 13 : 14, nearR: 1500, R: MOBILE ? 5000 : 8000, busy: 0, clock: 0 };
+const orthoUrl = (z, x, y) => `https://wmts.nlsc.gov.tw/wmts/PHOTO2/default/GoogleMapsCompatible/${z}/${y}/${x}`;
+// 地形分區有水面時是「地形 + 水面」的群組: 取出地形那塊網格
+const terrPart = (m) => (m && m !== 'none') ? (m.isMesh ? m : m.children.find((o) => o.geometry && o.geometry.attributes.aLc0)) : null;
+const merc = (lat, lon, z) => { const n = 2 ** z; return [(lon + 180) / 360 * n, (1 - Math.asinh(Math.tan(lat * Math.PI / 180)) / Math.PI) / 2 * n]; };
+function orthoApply(r, tx, ty, z) {
+  const toLL = window.TWX && TWX.gpsSync && TWX.gpsSync.toLatLon;
+  const m = r.mesh;
+  if (!toLL || !m || m === 'none') return;
+  r.ortho = 'loading'; ORTHO.busy++;
+  const x0 = tx * TC * TSTEP, y0 = ty * TC * TSTEP, x1 = x0 + TC * TSTEP, y1 = y0 + TC * TSTEP;
+  const c = [[x0, y0], [x1, y0], [x0, y1], [x1, y1]].map(([x, y]) => merc(...toLL(x, y), z));
+  const mx0 = Math.floor(Math.min(...c.map((p) => p[0]))), mx1 = Math.floor(Math.max(...c.map((p) => p[0])));
+  const my0 = Math.floor(Math.min(...c.map((p) => p[1]))), my1 = Math.floor(Math.max(...c.map((p) => p[1])));
+  const cols = mx1 - mx0 + 1, rows = my1 - my0 + 1;
+  const jobs = [];
+  for (let yy = my0; yy <= my1; yy++) for (let xx = mx0; xx <= mx1; xx++) jobs.push(new Promise((ok, no) => {
+    const im = new Image(); im.crossOrigin = 'anonymous';
+    im.onload = () => ok([im, xx - mx0, yy - my0]); im.onerror = no; im.src = orthoUrl(z, xx, yy);
+  }));
+  Promise.all(jobs).then((imgs) => {
+    ORTHO.busy--;
+    if (r.mesh !== m) { r.ortho = null; return; }   // 抓圖途中地形已經丟掉
+    const cv = document.createElement('canvas'); cv.width = cols * 256; cv.height = rows * 256;
+    const g2 = cv.getContext('2d');
+    for (const [im, i, j] of imgs) g2.drawImage(im, i * 256, j * 256);
+    const tex = new T.CanvasTexture(cv); tex.colorSpace = T.SRGBColorSpace; tex.anisotropy = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+    // 每個頂點的貼圖座標: 分區四角的 Web Mercator 座標雙線性內插 (3.84 km 內誤差 < 1 m)
+    const tm = terrPart(m); if (!tm) { r.ortho = 'fail'; return; }
+    const p = tm.geometry.attributes.position.array, uv = new Float32Array(p.length / 3 * 2);
+    for (let k = 0, q = 0; k < p.length; k += 3, q += 2) {
+      const fu = (p[k] - x0) / (x1 - x0), fv = (-p[k + 2] - y0) / (y1 - y0);
+      const mx = (c[0][0] * (1 - fu) + c[1][0] * fu) * (1 - fv) + (c[2][0] * (1 - fu) + c[3][0] * fu) * fv;
+      const my = (c[0][1] * (1 - fu) + c[1][1] * fu) * (1 - fv) + (c[2][1] * (1 - fu) + c[3][1] * fu) * fv;
+      uv[q] = (mx - mx0) / cols; uv[q + 1] = 1 - (my - my0) / rows;
+    }
+    tm.geometry.setAttribute('uv', new T.BufferAttribute(uv, 2));
+    const mat = patch(new T.MeshStandardMaterial({ roughness: 0.95, metalness: 0, map: tex }), TERRAIN_SPEC);
+    if (r.prevOrtho) { r.prevOrtho.tex.dispose(); r.prevOrtho.mat.dispose(); r.prevOrtho = null; }   // 換解析度: 新的換上後才丟舊的 (不會閃回原本地表)
+    tm.material = mat; r.ortho = { tex, mat, z };
+  }).catch((e) => { ORTHO.busy--; r.ortho = r.prevOrtho || 'fail'; r.prevOrtho = null; if ((ORTHO.warned = (ORTHO.warned || 0) + 1) <= 3) console.warn('[ortho] 抓不到正射影像，維持原本地表', e && (e.message || e.type || e)); });   // 抓不到 (離線): 維持原本的地表上色
+}
+function orthoDrop(r) {
+  if (r.prevOrtho) { r.prevOrtho.tex.dispose(); r.prevOrtho.mat.dispose(); r.prevOrtho = null; }
+  if (r.ortho && r.ortho.tex) { const tm = terrPart(r.mesh); if (tm) tm.material = matTerrain; r.ortho.tex.dispose(); r.ortho.mat.dispose(); }
+  r.ortho = null;
+}
+function orthoFrame(dt) {
+  if (!ORTHO.on || (ORTHO.clock -= dt) > 0) return;
+  ORTHO.clock = 0.4;
+  let pick = null, pd = 1e9;   // 一次處理一塊: 挑最近、需要換的
+  for (const [key, r] of TERR_REC) {
+    if (!r.mesh || r.mesh === 'none') continue;
+    const [tx, ty] = key.split('_').map(Number);
+    const d = tileDist(tx, ty, S.x, S.y);
+    if (d > ORTHO.R + 3000) { if (r.ortho && r.ortho !== 'loading') orthoDrop(r); continue; }
+    if (d >= ORTHO.R || r.ortho === 'loading' || r.ortho === 'fail') continue;
+    const want = d < ORTHO.nearR ? ORTHO.zNear : (r.ortho && r.ortho.z === ORTHO.zNear && d < ORTHO.nearR + 1500) ? ORTHO.zNear : ORTHO.zFar;   // 遲滯: 離開 3 km 才降級
+    if ((!r.ortho || r.ortho.z !== want) && d < pd) { pd = d; pick = [r, tx, ty, want]; }
+  }
+  if (!pick || ORTHO.busy >= 2) return;
+  const [r, tx, ty, want] = pick;
+  if (r.ortho) r.prevOrtho = r.ortho;   // 換解析度: 新的換上前先用舊的
+  orthoApply(r, tx, ty, want);
+}
+
 /** 地形分區 (法向由含外框的高度場計算，分區之間沒有接縫) */
 function buildTerrainMesh(key, tx, ty) {
   const a = TERR.get(key);
@@ -1458,7 +1632,7 @@ function streamTick(opts = {}) {
   for (const rec of TILES.values()) if (rec.group && tileDist(rec.tx, rec.ty, x, y) > MESH_R + 1500) { disposeGroup(rec.group); rec.group = null; rec.bldChunks = []; }
   for (const [key, r] of TERR_REC) if (r.mesh && r.mesh !== 'none') {
     const [tx, ty] = key.split('_').map(Number);
-    if (tileDist(tx, ty, x, y) > TERR_R + 2500) { disposeGroup(r.mesh); r.mesh = null; }
+    if (tileDist(tx, ty, x, y) > TERR_R + 2500) { orthoDrop(r); disposeGroup(r.mesh); r.mesh = null; }
   }
   return proms;
 }
@@ -2662,7 +2836,7 @@ window.TW = { T, scene, camera, renderer, NIGHT, GLOW_TEX, landcoverAt, WAYS, wa
 
 setStatus('載入地圖分區…');
 setTimeout(async () => {
-  HOOKS.frame.push(streamFrame, cullBuildings);
+  HOOKS.frame.push(streamFrame, cullBuildings, orthoFrame);
   // 傳送地點 (tile_web.py 依 live.json 起點與 city_web.py SPOTS 產生，附座標)
   for (const [name, gid, idx, dir, x, y] of INDEX.spawns || []) SPAWNS.push({ name, gid, idx, dir, x, y });
   // 起點: 國1 南下 0K (基隆端)；網址 ?spawn=路段gid,點 或 ?at=x,y 可覆寫
@@ -2722,6 +2896,12 @@ setTimeout(async () => {
         if (i % 300 === 0) console.log('[lc]', (i / 30).toFixed(0) + 's', r ? (r.w.name || r.w.k) : '-', 'v', (S.v * 3.6).toFixed(0), 'on', S.lcOn, 'lane', S.lcLane, 'err', r && S.lcLane != null ? (laneOffDir(r.w, S.lcLane, S.lcDir || 1) - r.lat).toFixed(2) : '-');
       }
       update(1 / 30); for (const f of HOOKS.update) f(1 / 30);
+      if (params.has('jamdbg') && i % 60 === 0 && window.TWX) {   // 測試用: 前方 300 m 同方向車的車速 (看塞車有沒有走走停停)
+        const hx = Math.cos(S.h), hy = Math.sin(S.h), ahead = [];
+        for (const c of TWX.cars) if (c.alive && c.pool === 'fwy' && Math.cos(c.h - S.h) > 0.8) { const f = (c.x - S.x) * hx + (c.y - S.y) * hy; if (f > 0 && f < 300) ahead.push([f, c.v * 3.6, c.brake]); }
+        ahead.sort((a, b) => a[0] - b[0]);
+        console.log('[jam]', (i / 30).toFixed(0) + 's', 'me', (S.v * 3.6).toFixed(0), 'n', ahead.length, 'brake', ahead.filter((a) => a[2]).length, ahead.slice(0, 14).map((a) => a[0].toFixed(0) + ':' + a[1].toFixed(0)).join(' '));
+      }
       if (params.has('trace') && i % 150 === 0 && S.rt) console.log('[trace]', (i / 30).toFixed(0) + 's', S.rt.w.k, S.rt.w.ref, S.rt.w.name, S.rt.w.link ? 'link' : '', 'dir', S.rt.dir, 'i', S.rt.i, '/', S.rt.w.n, 'v', (S.v * 3.6).toFixed(0), 'pos', S.x.toFixed(0) + ',' + S.y.toFixed(0), 'road', S.road ? S.road.w.k : '-', 'unst', S.apUnstick || 0, 'thr', (S.thr || 0).toFixed(2), 'brk', (S.brk || 0).toFixed(2), 'apSt', (S.apStuck || 0).toFixed(1), 'lat', S.rt.lat != null ? S.rt.lat.toFixed(1) : '-', 'lc[', S.apDbg || '', ']', 'shift', S.apShift != null ? S.apShift.toFixed(2) : '-', 'pend', S.apPending, 'cool', (S.apCool || 0).toFixed(1),
         HOOKS.leader ? (() => { const l = HOOKS.leader(0); return l.gap < 1e8 ? `lead gap=${l.gap.toFixed(1)} ${l.why === 2 ? 'YIELD' : 'follow'} ${l.who ? l.who.type + '#' + l.who.id + ' v=' + (l.who.v * 3.6).toFixed(0) + ' stuck=' + (l.who.stuck || 0).toFixed(0) + ' dh=' + Math.round(((l.who.h - S.h) * 180 / Math.PI) % 360) : ''}` : 'lead -'; })() : '',
         window.TWX ? (() => { let b = null, bd = 1e9; for (const c of TWX.cars) if (c.alive) { const d = Math.hypot(c.x - S.x, c.y - S.y); if (d < bd) { bd = d; b = c; } }
