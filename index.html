@@ -690,7 +690,7 @@ function terrainAt(x, y) {
 const renderer = new T.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true, powerPreference: 'high-performance' });
 // 手機 (觸控裝置) 省電模式: 解析度、陰影降低，建築只畫附近
 const MOBILE = params.get('touch') === '1' || (params.get('touch') !== '0' && window.matchMedia && matchMedia('(pointer: coarse)').matches);
-renderer.setPixelRatio(MOBILE ? Math.min(window.devicePixelRatio, 1) : Math.min(window.devicePixelRatio, 1.5));
+renderer.setPixelRatio(MOBILE ? Math.min(window.devicePixelRatio, 1) : Math.min(window.devicePixelRatio, 1));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.outputColorSpace = T.SRGBColorSpace;
 renderer.toneMapping = T.AgXToneMapping;          // 與 Blender 相同的 AgX
@@ -771,7 +771,7 @@ scene.fog = new T.FogExp2(HORIZON.clone(), 0.000045);
 
 const sun = new T.DirectionalLight(0xffffff, 3.2);   // 與 Blender 太陽強度相同
 sun.castShadow = true;
-sun.shadow.mapSize.set(MOBILE ? 1024 : 4096, MOBILE ? 1024 : 4096);
+sun.shadow.mapSize.set(MOBILE ? 1024 : 1024, MOBILE ? 1024 : 1024);
 const SC = sun.shadow.camera; SC.left = -90; SC.right = 90; SC.top = 90; SC.bottom = -90; SC.near = 1; SC.far = 1500;
 sun.shadow.bias = -0.0004; sun.shadow.normalBias = 0.04;
 scene.add(sun, sun.target);
@@ -1741,9 +1741,9 @@ function addCityRoad(c, w) {
 
 // ======================================================================= 分區串流
 // 車子附近: 先下載資料 (DATA_R)，鄰近 8 區的資料都到了才建模型 (MESH_R)，遠了丟掉模型 (資料留著，回來不用重下載)
-const MESH_R = +(params.get('meshr') || (MOBILE ? 4200 : 7000));
+const MESH_R = +(params.get('meshr') || (MOBILE ? 4200 : 4200));
 const DATA_R = MESH_R + TS * 1.45;            // 模型區的鄰區一定已經有資料
-const TERR_R = +(params.get('terrr') || (MOBILE ? 9000 : 18000));
+const TERR_R = +(params.get('terrr') || (MOBILE ? 9000 : 9000));
 const TILES = new Map();                       // 細節分區 key -> { key, tx, ty, state, ways, piers, bld, linked, joints, group, bldChunks }
 const TERR_REC = new Map();                    // 地形分區 key -> { state, mesh }
 let inflight = 0;
@@ -2072,7 +2072,7 @@ function cullBuildings(dt) {
   bldClock -= dt;
   if (bldClock > 0) return;
   bldClock = 0.5;
-  const R = (MOBILE ? 1600 : 4500) + 700;
+  const R = (MOBILE ? 1600 : 1600) + 700;
   for (const rec of TILES.values()) for (const ch of rec.bldChunks) { const vis = Math.hypot(ch.x - S.x, ch.y - S.y) < R; for (const m of ch.meshes) m.visible = vis; }
 }
 function buildBuildings(bld, world) {
@@ -2497,7 +2497,7 @@ window.addEventListener('keydown', (e) => {
     const d = e.code === 'KeyQ' ? -1 : 1;
     S.signal = S.signal === d ? 0 : d; S.signalAuto = false; S.sigArmed = false;
   }
-  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(e.code)) e.preventDefault();
+  if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space', 'Numpad2','Numpad4','Numpad6','Numpad8'].includes(e.code)) e.preventDefault();
 });
 window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
@@ -2646,10 +2646,10 @@ function update(dt) {
   const vt = S.vt || (window.TWV && window.TWV.TYPES.sedan) || { acc: 1.5, vmax: 45, wb: 2.8, wid: 1.85 };
   const big = vt.len > 6.5;
   let thr = 0, brk = 0, str = 0;
-  if (keys.KeyW || keys.ArrowUp) thr = 1;
-  if (keys.KeyS || keys.ArrowDown) brk = 1;
-  if (keys.KeyA || keys.ArrowLeft) str += 1;
-  if (keys.KeyD || keys.ArrowRight) str -= 1;
+  if (keys.KeyW || keys.ArrowUp || keys.Numpad8) thr = 1;
+  if (keys.KeyS || keys.ArrowDown || keys.Numpad2) brk = 1;
+  if (keys.KeyA || keys.ArrowLeft || keys.Numpad4) str += 1;
+  if (keys.KeyD || keys.ArrowRight || keys.Numpad6  ) str -= 1;
   // 類比輸入 (螢幕方向盤、重力感應、實體方向盤 / 搖桿): 有在轉就取代鍵盤左右
   const analog = S.steerAxis != null && Math.abs(S.steerAxis) > 0.025;
   if (analog) str = S.steerAxis;
@@ -3139,9 +3139,12 @@ setTimeout(async () => {
   if (params.has('t')) await ensureArea(S.x, S.y);
   syncCar(0); updateCamera(1); updateDayNight(0);
   $('loading').classList.add('hidden');
-  let last = performance.now(), frame = 0;
+  const frame_interval = 1000/30
+  let last = 0, frame = 0;
   function loop(now) {
-    const dt = Math.min((now - last) / 1000, params.has("realtime") ? 1.0 : 0.05); last = now;   // realtime: 背景展示用，依真實時間推進
+    const elapsed = now - last;
+    if (elapsed < frame_interval) { requestAnimationFrame(loop); return; }
+    const dt = Math.min(elapsed / 1000, params.has("realtime") ? 1.0 : 0.05); last = now;   // realtime: 背景展示用，依真實時間推進
     const sub = Math.max(1, Math.ceil(dt / (1 / 120)));
     for (let i = 0; i < sub; i++) update(dt / sub);
     for (const f of HOOKS.update) f(dt);
@@ -3309,8 +3312,8 @@ function bakeByMaterial(root, frame, filter) {
 
 // ======================================================================= AI 車流 (多車種、國道 + 一般道路)
 const TV = window.TWV.TYPES;
-const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 50 : 140))));   // 塞車時要排得出一整排車
-const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 28 : 75))));
+const MAX_FWY = Math.max(0, Math.min(220, +(TW.params.get('cars') || (TW.MOBILE ? 50 : 50))));   // 塞車時要排得出一整排車
+const MAX_CITY = Math.max(0, Math.min(200, +(TW.params.get('citycars') || (TW.MOBILE ? 28 : 28))));
 const COLORS = [ // 線性色彩；權重
   [[0.80, 0.80, 0.78], 24], [[0.45, 0.46, 0.48], 18], [[0.012, 0.012, 0.014], 14], [[0.09, 0.095, 0.10], 10],
   [[0.50, 0.02, 0.02], 7], [[0.03, 0.08, 0.36], 7], [[0.04, 0.17, 0.07], 4], [[0.48, 0.40, 0.28], 5], [[0.65, 0.66, 0.70], 3],
@@ -4934,7 +4937,7 @@ TW.HOOKS.init.push(() => {
 // 道路兩側 8 m 內、高架下方都不種。玩家移動 150 m 以上才重新排一次。
 const trees = (() => {
   if (TW.params.has('notrees')) return { update() {}, dirty() {} };
-  const CAP = TW.MOBILE ? 700 : 7000, R = TW.MOBILE ? 320 : 900, STEP = 18;
+  const CAP = TW.MOBILE ? 700 : 700, R = TW.MOBILE ? 320 : 320, STEP = 18;
   const crownGeo = new T.IcosahedronGeometry(1, 1);
   { // 樹冠稍微壓扁、表面不規則
     const p = crownGeo.getAttribute('position');
@@ -5214,7 +5217,7 @@ const weather = (() => {
     if (mode === 0 && performance.now() - liveAt > 60000) fetchLive();
   }
   // ---- 雨滴: 攝影機周圍一圈落下的線段 (相對攝影機移動拉長，車速快時往後斜)
-  const N = TW.MOBILE ? 1600 : 5200, R = 32, H = 22;
+  const N = TW.MOBILE ? 1600 : 1600, R = 32, H = 22;
   const pos = new Float32Array(N * 6), seed = new Float32Array(N * 3);
   for (let i = 0; i < N; i++) { seed[i * 3] = (Math.random() * 2 - 1) * R; seed[i * 3 + 1] = Math.random() * H; seed[i * 3 + 2] = (Math.random() * 2 - 1) * R; }
   const geo = new T.BufferGeometry(); geo.setAttribute('position', new T.BufferAttribute(pos, 3));

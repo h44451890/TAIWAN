@@ -2660,9 +2660,12 @@ setTimeout(async () => {
   if (params.has('t')) await ensureArea(S.x, S.y);
   syncCar(0); updateCamera(1); updateDayNight(0);
   $('loading').classList.add('hidden');
-  let last = performance.now(), frame = 0;
+  const frame_interval = 1000/30
+  let last = 0, frame = 0;
   function loop(now) {
-    const dt = Math.min((now - last) / 1000, params.has("realtime") ? 1.0 : 0.05); last = now;   // realtime: 背景展示用，依真實時間推進
+    const elapsed = now - last;
+    if (elapsed < frame_interval) { requestAnimationFrame(loop); return; }
+    const dt = Math.min(elapsed / 1000, params.has("realtime") ? 1.0 : 0.05); last = now;   // realtime: 背景展示用，依真實時間推進
     const sub = Math.max(1, Math.ceil(dt / (1 / 120)));
     for (let i = 0; i < sub; i++) update(dt / sub);
     for (const f of HOOKS.update) f(dt);
